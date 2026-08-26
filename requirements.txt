@@ -1,0 +1,21 @@
+# Lumielle Academic Assistant 依赖清单
+# 安装命令：pip install -r requirements.txt
+
+streamlit>=1.30
+openai>=1.10,<3
+python-docx>=1.1
+PyPDF2>=3.0
+matplotlib>=3.7
+numpy>=1.24
+pandas>=2.0
+lxml>=4.9
+
+# ============================================================
+# 可选依赖（默认不安装）：
+# 本地 AIGC 检测模型需要 transformers + torch，体积巨大（数GB）。
+# 工具默认使用 LLM 检测引擎（deepseek 等），无需本地模型即可完整体验。
+# 如需启用本地模型检测，取消下面两行注释后安装：
+# transformers>=4.30
+# torch>=2.0
+# 并将 models/aigc_detector/ 放入模型文件（config.json、pytorch_model.bin 等）
+# ============================================================
