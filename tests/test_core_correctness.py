@@ -416,15 +416,127 @@ class ChartSupportTests(unittest.TestCase):
         )
         self.assertTrue(result["data_note"])
 
+    def test_chinese_illustrative_permission_requires_explicit_data_authorization(self):
+        chart = self.load_chart_support()
+        permitted = (
+            "请使用示例数据绘图",
+            "可以生成一组假设数据",
+            "允许使用示意数值",
+            "没有真实数据，可以自行生成演示数据",
+            "示例数据即可",
+            "假设数据即可",
+        )
+        for instruction in permitted:
+            with self.subTest(instruction=instruction):
+                self.assertTrue(chart.is_illustrative_request(instruction))
+
     def test_negative_illustrative_wording_does_not_allow_fabricated_values(self):
         chart = self.load_chart_support()
         for instruction in (
+            "不要使用示例数据",
+            "不使用示例数据",
+            "不采用假设数据",
+            "别用示意数据",
+            "请勿使用示例数据",
+            "禁止使用演示数据",
+            "不能生成假设数字",
+            "不得采用示例数值",
+            "避免使用假设数据",
+            "不可生成假设数字",
             "Compare values, but do not use illustrative data",
             "No hypothetical numbers; use only my research data",
             "不要使用示例数据，请使用我提供的数值",
         ):
             with self.subTest(instruction=instruction):
                 self.assertFalse(chart.is_illustrative_request(instruction))
+
+    def test_example_and_hypothetical_mentions_without_data_permission_are_not_allowed(self):
+        chart = self.load_chart_support()
+        mentions = (
+            "参考示例图的样式绘制",
+            "按照示例格式绘制",
+            "这是一个假设场景，但请使用我的真实数据",
+            "请仿照示例图布局",
+            "示例格式如下",
+            "讨论一个假设案例",
+            "Follow the example chart's style.",
+            "Use the sample figure layout.",
+            "This is a hypothetical scenario, but use my real data.",
+            "Use the example formatting.",
+        )
+        for instruction in mentions:
+            with self.subTest(instruction=instruction):
+                self.assertFalse(chart.is_illustrative_request(instruction))
+
+    def test_english_illustrative_permission_and_negation_semantics(self):
+        chart = self.load_chart_support()
+        permitted = (
+            "Use illustrative data.",
+            "Generate hypothetical values for this example.",
+            "Sample data is fine.",
+            "You may make up example values for demonstration.",
+            "Use hypothetical numbers.",
+        )
+        denied = (
+            "Do not use illustrative data.",
+            "Don't generate hypothetical values.",
+            "No sample data.",
+            "Without example values.",
+            "Never make up illustrative numbers.",
+        )
+        for instruction in permitted:
+            with self.subTest(permitted=instruction):
+                self.assertTrue(chart.is_illustrative_request(instruction))
+        for instruction in denied:
+            with self.subTest(denied=instruction):
+                self.assertFalse(chart.is_illustrative_request(instruction))
+
+    def test_separate_explicit_permission_clause_is_still_allowed(self):
+        chart = self.load_chart_support()
+        self.assertTrue(chart.is_illustrative_request(
+            "不要用第一组示例数据；第二张图可以使用假设数据。"
+        ))
+
+    def test_negated_illustrative_request_needs_data_without_calling_llm_or_creating_png(self):
+        chart = self.load_chart_support()
+        calls = []
+
+        def unexpected_llm_call(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "must not be called"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "chart.png"
+            result = chart.generate_chart_image(
+                "不使用示例数据，请画三个组的比较图", str(output), unexpected_llm_call, locale="zh"
+            )
+            self.assertEqual(result["status"], "needs_data")
+            self.assertFalse(calls)
+            self.assertFalse(output.exists())
+
+    def test_explicit_illustrative_permission_enters_chart_spec_flow(self):
+        chart = self.load_chart_support()
+        calls = []
+        response = json.dumps({
+            "status": "ok", "chart_type": "bar", "title": "演示比较",
+            "x_label": "组别", "y_label": "数值", "categories": ["A", "B", "C"],
+            "series": [{"name": "示意组", "values": [10, 20, 30]}],
+        })
+
+        def llm_call(prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            return response
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "chart.png"
+            result = chart.generate_chart_image(
+                "请使用假设数据画三个组的演示柱状图", str(output), llm_call, locale="zh"
+            )
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0][1]["json_mode"])
+            self.assertEqual(result["spec"]["data_note"], "示例数据（假设）")
+            self.assertTrue(chart.chart_png_is_valid(str(output)))
 
     def test_year_only_request_returns_needs_data_without_calling_llm(self):
         chart = self.load_chart_support()

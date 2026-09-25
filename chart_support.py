@@ -22,14 +22,43 @@ _NUMBER_PATTERN = re.compile(
     r"(?<![\w.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?%?"
     r"|(?<![\w.])[-+]?\.\d+(?:[eE][-+]?\d+)?%?"
 )
-_ILLUSTRATIVE_PATTERN = re.compile(
-    r"\b(?:illustrative|hypothetical|example data|sample data)\b|示例|假设|演示|示意",
+_ILLUSTRATIVE_EN_MARKER = r"(?:illustrative|hypothetical|example|sample|demonstration|demo)"
+_ILLUSTRATIVE_ZH_MARKER = r"(?:示例|假设|演示|示意)"
+_DATA_EN_NOUN = r"(?:data|values?|numbers?)"
+_DATA_ZH_NOUN = r"(?:数据|数值|数字)"
+_EN_ILLUSTRATIVE_NEGATION = re.compile(
+    rf"\b(?:do\s+not|don't|does\s+not|doesn't|did\s+not|didn't|never|no|without|avoid|not)\b"
+    rf".{{0,40}}?\b{_ILLUSTRATIVE_EN_MARKER}\b.{{0,20}}?\b{_DATA_EN_NOUN}\b",
     re.IGNORECASE,
 )
-_NEGATED_ILLUSTRATIVE_PATTERN = re.compile(
-    r"\b(?:do\s+not|don't|does\s+not|did\s+not|never|no|without|avoid|not)"
-    r"(?:\s+\w+){0,3}\s+(?:illustrative|hypothetical|example\s+data|sample\s+data)\b"
-    r"|(?:不要|不需要|不用|禁止|避免|不得|不能)\s*(?:使用|采用|生成|提供|任何)?\s*(?:示例|假设|演示|示意)",
+_ZH_ILLUSTRATIVE_NEGATION = re.compile(
+    rf"(?:不要|不需要|不用|不使用|不采用|不生成|不提供|不允许|别(?:用|使用|采用|生成|提供)?|"
+    rf"请勿(?:用|使用|采用|生成|提供)?|禁止(?:用|使用|采用|生成|提供)?|避免(?:用|使用|采用|生成|提供)?|"
+    rf"不得(?:用|使用|采用|生成|提供)?|不能(?:用|使用|采用|生成|提供)?|不可(?:用|使用|采用|生成|提供)?)"
+    rf"[^，,。.!！？?；;\n]{{0,10}}?{_ILLUSTRATIVE_ZH_MARKER}"
+    rf"[^，,。.!！？?；;\n]{{0,8}}?{_DATA_ZH_NOUN}",
+    re.IGNORECASE,
+)
+_EN_ILLUSTRATIVE_PERMISSION = re.compile(
+    rf"\b(?:(?:please\s+)?(?:use|generate|create|make\s+up|invent|provide|supply)|"
+    rf"(?:you\s+)?(?:may|can)\s+(?:use|generate|create|make\s+up|invent|provide|supply))\b"
+    rf".{{0,40}}?\b{_ILLUSTRATIVE_EN_MARKER}\b.{{0,20}}?\b{_DATA_EN_NOUN}\b",
+    re.IGNORECASE,
+)
+_EN_ILLUSTRATIVE_ACCEPTANCE = re.compile(
+    rf"\b{_ILLUSTRATIVE_EN_MARKER}\s+\b{_DATA_EN_NOUN}\b\s+"
+    r"(?:(?:is|are)\s+)?(?:fine|okay|acceptable|allowed|permitted)\b",
+    re.IGNORECASE,
+)
+_ZH_ILLUSTRATIVE_PERMISSION = re.compile(
+    rf"(?:可以|可|允许|请(?:你)?|自行)?\s*(?:自行)?(?:使用|采用|用|生成|提供)"
+    rf"\s*[一二三四五六七八九十几若干些个组套份批只]{{0,6}}"
+    rf"{_ILLUSTRATIVE_ZH_MARKER}(?:的)?\s*{_DATA_ZH_NOUN}",
+    re.IGNORECASE,
+)
+_ZH_ILLUSTRATIVE_ACCEPTANCE = re.compile(
+    rf"^\s*{_ILLUSTRATIVE_ZH_MARKER}{_DATA_ZH_NOUN}"
+    r"(?:即可|就可以|就行|也行|就好)\s*$",
     re.IGNORECASE,
 )
 _VALUE_CUE_PATTERN = re.compile(
@@ -47,17 +76,23 @@ class ChartRenderError(RuntimeError):
 
 
 def is_illustrative_request(instruction):
-    """Return whether the user explicitly requested illustrative/hypothetical data."""
+    """Return whether a clause explicitly permits made-up illustrative data."""
     if not isinstance(instruction, str):
         return False
-    # Check each clause independently so a negation applies to the term it
-    # governs without suppressing a separate explicit permission later.
-    clauses = re.split(r"[.!?;；,，。！？\n]+", instruction)
-    return any(
-        _ILLUSTRATIVE_PATTERN.search(clause)
-        and not _NEGATED_ILLUSTRATIVE_PATTERN.search(clause)
-        for clause in clauses
-    )
+    # Clause-local handling lets a later explicit permission stand on its own,
+    # while negation takes priority over any permission in the same clause.
+    clauses = re.split(r"[.!?;；,，。！？\n]+|\bbut\b|\bhowever\b|但是|不过|但", instruction, flags=re.I)
+    for clause in clauses:
+        if _EN_ILLUSTRATIVE_NEGATION.search(clause) or _ZH_ILLUSTRATIVE_NEGATION.search(clause):
+            continue
+        if (
+            _EN_ILLUSTRATIVE_PERMISSION.search(clause)
+            or _EN_ILLUSTRATIVE_ACCEPTANCE.search(clause)
+            or _ZH_ILLUSTRATIVE_PERMISSION.search(clause)
+            or _ZH_ILLUSTRATIVE_ACCEPTANCE.search(clause)
+        ):
+            return True
+    return False
 
 
 def _source_numbers(instruction):
