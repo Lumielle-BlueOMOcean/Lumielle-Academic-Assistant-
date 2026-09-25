@@ -123,11 +123,115 @@ class CoreCorrectnessTests(unittest.TestCase):
         version = load_project_module(self, "version")
         self.assertEqual(version.__version__, "1.0.1")
 
-    def test_readme_marks_v101_unreleased_and_keeps_v100_history(self):
+    def test_readme_matches_canonical_unreleased_version_and_keeps_v100_history(self):
+        version = load_project_module(self, "version")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("v1.0.1 — Unreleased", readme)
+        self.assertIn(f"v{version.__version__}", readme)
+        self.assertRegex(
+            readme,
+            rf"(?m)^### v{re.escape(version.__version__)} — Unreleased$",
+        )
         self.assertIn("v1.0.0", readme)
         self.assertIn("Changelog", readme)
+
+    def test_global_reference_registry_uses_snapshots_and_deduplicates(self):
+        support = load_project_module(self, "writing_support")
+        tree = [
+            {"id": "chapter-a", "references": ["A", "B"], "children": []},
+            # Current binding changed after this draft's snapshot was established.
+            {"id": "chapter-b", "references": ["A"], "children": []},
+        ]
+        drafts = {"chapter-a": "A text", "chapter-b": "B text"}
+        snapshots = {"chapter-b": ["B", "C"]}
+        literatures = [{"id": rid, "title": rid} for rid in ("A", "B", "C")]
+
+        ordered, number_by_id, literature_by_id = support.collect_global_reference_registry(
+            tree, drafts, snapshots, literatures
+        )
+
+        self.assertEqual(ordered, ["A", "B", "C"])
+        self.assertEqual(number_by_id, {"A": 1, "B": 2, "C": 3})
+        self.assertEqual(set(literature_by_id), {"A", "B", "C"})
+
+    def test_citations_are_remapped_from_local_to_global_numbers(self):
+        support = load_project_module(self, "writing_support")
+        # Chapter A binds [A, B], while chapter B binds only [B].
+        tree = [
+            {"id": "chapter-a", "references": ["A", "B"], "children": []},
+            {"id": "chapter-b", "references": ["B"], "children": []},
+        ]
+        drafts = {"chapter-a": "First", "chapter-b": "Evidence [1]."}
+        ordered, number_by_id, _ = support.collect_global_reference_registry(
+            tree, drafts, {}, [{"id": "A"}, {"id": "B"}]
+        )
+        self.assertEqual(ordered, ["A", "B"])
+        self.assertEqual(
+            support.remap_local_citations(drafts["chapter-b"], ["B"], number_by_id),
+            "Evidence [2].",
+        )
+
+    def test_multiple_citations_and_unknown_numbers_are_preserved_correctly(self):
+        support = load_project_module(self, "writing_support")
+        self.assertEqual(
+            support.remap_local_citations(
+                "Evidence [1][2]. Unknown [99] and year [2024].",
+                ["B", "C"],
+                {"A": 1, "B": 2, "C": 3},
+            ),
+            "Evidence [2][3]. Unknown [99] and year [2024].",
+        )
+
+    def test_citation_remapping_preserves_markdown_links_and_plain_brackets(self):
+        support = load_project_module(self, "writing_support")
+        source = "See [1](https://example.test) and [1][source] and [Author, 2024]; cite [1] (as shown).\n[1]: https://example.test/ref"
+        self.assertEqual(
+            support.remap_local_citations(source, ["B"], {"B": 2}),
+            "See [1](https://example.test) and [1][source] and [Author, 2024]; cite [2] (as shown).\n[1]: https://example.test/ref",
+        )
+
+    def test_legacy_reference_registry_falls_back_to_tree_bindings(self):
+        support = load_project_module(self, "writing_support")
+        tree = [{"id": "legacy", "references": ["B", "A", "B"], "children": []}]
+        ordered, numbers, _ = support.collect_global_reference_registry(
+            tree,
+            {"legacy": "Legacy draft [1]."},
+            {},
+            [{"id": "A"}, {"id": "B"}],
+        )
+        self.assertEqual(ordered, ["B", "A"])
+        self.assertEqual(numbers, {"B": 1, "A": 2})
+
+    def test_llm_failures_are_rejected_but_normal_prose_is_accepted(self):
+        support = load_project_module(self, "writing_support")
+        for failure in (
+            None,
+            "",
+            "   \n\t",
+            "API key missing. Add a key.",
+            "API call failed repeatedly: timeout",
+            "OpenAI client initialization error: bad config",
+            "No LLM configured. Please add one.",
+            "No valid LLM configuration found.",
+        ):
+            with self.subTest(failure=failure):
+                self.assertTrue(support.get_llm_failure_reason(failure))
+                with self.assertRaises(support.LLMOutputError):
+                    support.require_valid_llm_output(failure)
+
+        prose = "The study compares API access policies across three research groups."
+        self.assertIsNone(support.get_llm_failure_reason(prose))
+        self.assertEqual(support.require_valid_llm_output(prose), prose)
+        quoted_error = "The paper analyzes the interface message 'API key missing' as an example."
+        self.assertIsNone(support.get_llm_failure_reason(quoted_error))
+
+    def test_failed_generation_does_not_change_draft_or_reference_snapshot(self):
+        support = load_project_module(self, "writing_support")
+        drafts = {"chapter": "Old body"}
+        snapshots = {"chapter": ["old-reference"]}
+        with self.assertRaises(support.LLMOutputError):
+            support.record_generated_draft(drafts, snapshots, "chapter", "", ["new-reference"])
+        self.assertEqual(drafts, {"chapter": "Old body"})
+        self.assertEqual(snapshots, {"chapter": ["old-reference"]})
 
 
 if __name__ == "__main__":

@@ -3,6 +3,132 @@
 import re
 
 
+class LLMOutputError(RuntimeError):
+    """Raised when an LLM response is empty or contains a known failure message."""
+
+
+_LLM_FAILURE_MARKERS = (
+    "api key missing",
+    "api call failed repeatedly",
+    "openai client initialization error",
+    "no llm configured",
+    "no valid llm configuration found",
+)
+
+
+def get_llm_failure_reason(text):
+    """Return a short failure reason for known LLM error prefixes or empty responses."""
+    if text is None:
+        return "The model returned no response."
+    if not isinstance(text, str):
+        return "The model returned an invalid response."
+    stripped = text.strip()
+    if not stripped:
+        return "The model returned an empty response."
+    folded = stripped.casefold()
+    for marker in _LLM_FAILURE_MARKERS:
+        if folded.startswith(marker):
+            return stripped[:240]
+    return None
+
+
+def require_valid_llm_output(text):
+    """Return a usable LLM text response or raise before callers persist it."""
+    reason = get_llm_failure_reason(text)
+    if reason:
+        raise LLMOutputError(reason)
+    return text
+
+
+def record_generated_draft(drafts, draft_reference_maps, node_id, text, reference_ids):
+    """Validate generated text before changing either in-memory draft mapping."""
+    valid_text = require_valid_llm_output(text)
+    drafts[node_id] = valid_text
+    draft_reference_maps[node_id] = list(reference_ids or [])
+    return valid_text
+
+
+def reference_ids_for_node(node, draft_reference_maps):
+    """Use a draft's saved local citation map, falling back for legacy drafts."""
+    node_id = node.get("id")
+    snapshots = draft_reference_maps or {}
+    key = node_id if node_id in snapshots else str(node_id)
+    if key in snapshots:
+        ids = snapshots[key]
+    else:
+        ids = node.get("references", [])
+    return list(ids) if isinstance(ids, (list, tuple)) else []
+
+
+def collect_global_reference_registry(tree, drafts, draft_reference_maps, literatures):
+    """Build one deduplicated export order from draft snapshots in tree order."""
+    literature_by_id = {
+        literature.get("id"): literature
+        for literature in (literatures or [])
+        if isinstance(literature, dict) and literature.get("id") is not None
+    }
+    ordered = []
+    seen = set()
+
+    def visit(nodes):
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get("id")
+            draft_key = node_id if node_id in (drafts or {}) else str(node_id)
+            body = (drafts or {}).get(draft_key, "")
+            if isinstance(body, str) and body.strip():
+                for reference_id in reference_ids_for_node(node, draft_reference_maps):
+                    if reference_id in literature_by_id and reference_id not in seen:
+                        seen.add(reference_id)
+                        ordered.append(reference_id)
+            visit(node.get("children", []))
+
+    visit(tree)
+    number_by_id = {reference_id: index for index, reference_id in enumerate(ordered, 1)}
+    return ordered, number_by_id, literature_by_id
+
+
+_MARKDOWN_LINK_RE = re.compile(
+    r"!?\[[^\]\n]+\]\([^\)\n]*\)"
+    r"|!?\[[^\]\n]+\]\[(?!\d+\])[^\]\n]+\]"
+    r"|^[ \t]*\[[^\]\n]+\]:[^\n]*",
+    re.MULTILINE,
+)
+_NUMERIC_CITATION_CHAIN_RE = re.compile(r"(?:\[\d+\])+")
+
+
+def remap_local_citations(text, local_reference_ids, global_number_by_id):
+    """Translate known [n] citations while preserving links and unknown brackets."""
+    if not isinstance(text, str) or not text:
+        return text
+    local_ids = list(local_reference_ids or [])
+    global_number_by_id = global_number_by_id or {}
+
+    def remap_plain_text(plain_text):
+        def replace_chain(match):
+            def replace_token(token_match):
+                local_index = int(token_match.group(1))
+                if local_index < 1 or local_index > len(local_ids):
+                    return token_match.group(0)
+                reference_id = local_ids[local_index - 1]
+                global_number = global_number_by_id.get(reference_id)
+                return f"[{global_number}]" if global_number else token_match.group(0)
+
+            return re.sub(r"\[(\d+)\]", replace_token, match.group(0))
+
+        return _NUMERIC_CITATION_CHAIN_RE.sub(replace_chain, plain_text)
+
+    pieces = []
+    last_end = 0
+    for link_match in _MARKDOWN_LINK_RE.finditer(text):
+        pieces.append(remap_plain_text(text[last_end:link_match.start()]))
+        pieces.append(link_match.group(0))
+        last_end = link_match.end()
+    pieces.append(remap_plain_text(text[last_end:]))
+    return "".join(pieces)
+
+
 ENGLISH_DEFAULT_PROMPTS = {'style_prompt': '[Role]\n'
                  'You are an academic paper writing engine. The following rules are the '
                  'highest-priority constraints and must never be violated.\n'

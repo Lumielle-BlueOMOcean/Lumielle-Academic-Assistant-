@@ -15,8 +15,14 @@ Lumielle Academic Assistant —— 学术论文写作助手
 import streamlit as st
 from version import __version__
 from writing_support import (
+    LLMOutputError,
     build_chapter_prompt as assemble_chapter_prompt,
+    collect_global_reference_registry,
     count_chinese_chars,
+    record_generated_draft,
+    reference_ids_for_node,
+    remap_local_citations,
+    require_valid_llm_output,
 )
 import json
 import os
@@ -67,6 +73,7 @@ default_files = {
     "literatures.json": [],
     "logic_tree.json": [],
     "drafts.json": {},
+    "draft_reference_maps.json": {},
     "drafts_summary.json": {},
     "drafts_charts.json": {},
     "drafts_images.json": {},
@@ -1923,7 +1930,9 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
     correction_note = None
     last_res = ""
     for attempt in range(max_attempts):
-        res = dispatch_llm_call(build_chapter_prompt(sandwich, prompts, correction_note), max_tokens=4000)
+        res = require_valid_llm_output(
+            dispatch_llm_call(build_chapter_prompt(sandwich, prompts, correction_note), max_tokens=4000)
+        )
         last_res = res
         if target <= 0:
             return res, None  # 未分配字数，不纠偏
@@ -1948,16 +1957,18 @@ def compress_memory(text):
         "语言连贯成段，不要分点罗列；不要输出任何前缀、引号或解释，只输出记忆正文本身。\n\n"
         f"原文：\n{text[:3000]}"
     )
-    res = dispatch_llm_call(prompt, max_tokens=500).strip().strip('"').strip("“”").strip()
+    res = require_valid_llm_output(dispatch_llm_call(prompt, max_tokens=500))
+    res = res.strip().strip('"').strip("“”").strip()
     # 净化思考痕迹与提示词残渣（推理型模型可能把压缩指令本身混进输出）
-    res = purge_thinking_text(res)
+    res = require_valid_llm_output(purge_thinking_text(res))
     # 长度校验：目标150-200字，宽容到120-280，不合格自动重试一次
     if not (120 <= len(res) <= 280):
-        retry = dispatch_llm_call(
+        retry = require_valid_llm_output(dispatch_llm_call(
             f"上一轮压缩不符合字数要求（当前约{len(res)}字）。请重新输出，严格控制为150-200个汉字，只输出记忆正文本身：\n{text[:3000]}",
             max_tokens=500
-        ).strip().strip('"').strip("“”").strip()
-        retry = purge_thinking_text(retry)
+        ))
+        retry = retry.strip().strip('"').strip("“”").strip()
+        retry = require_valid_llm_output(purge_thinking_text(retry))
         if 120 <= len(retry) <= 280:
             return retry
         return res if res else retry
@@ -2043,18 +2054,30 @@ def render_single_chapter_editor(tree):
         content_ver = st.session_state.get(f"content_ver_{sel_id}", 0)
         current_text = drafts.get(sel_id, "")
         new_text = st.text_area("正文编辑区（支持 Markdown）", value=current_text, height=400, key=f"draft_{sel_id}_v{content_ver}")
+        for level, message in st.session_state.pop(f"writing_notice_{sel_id}", []):
+            getattr(st, level)(message)
 
         c_save, c_gen = st.columns(2)
         with c_save:
             if st.button("💾 手动保存并凝练记忆", key=f"save_{sel_id}"):
                 drafts[sel_id] = new_text
                 save_json_file("drafts.json", drafts)
-                with st.spinner("正在压缩章节记忆 (150-200字)..."):
-                    sum_res = compress_memory(new_text)
+                reference_maps = load_json_file("draft_reference_maps.json", {})
+                if sel_id not in reference_maps:
+                    bound_literatures = get_literatures_by_ids(node.get("references", []) or [])
+                    reference_maps[sel_id] = [lit.get("id") for lit in bound_literatures if lit.get("id") is not None]
+                save_json_file("draft_reference_maps.json", reference_maps)
+                notices = [("success", "正文已保存。")]
+                try:
+                    with st.spinner("正在压缩章节记忆 (150-200字)..."):
+                        sum_res = compress_memory(new_text)
                     ds = load_json_file("drafts_summary.json", {})
                     ds[sel_id] = sum_res
                     save_json_file("drafts_summary.json", ds)
-                    st.success(f"已保存并更新记忆池！（本章记忆 {len(sum_res)} 字）")
+                    notices.append(("success", f"记忆池已更新（本章记忆 {len(sum_res)} 字）。"))
+                except LLMOutputError as exc:
+                    notices.append(("warning", f"正文已保存，但记忆凝练失败；之后可再次保存重试。({exc})"))
+                st.session_state[f"writing_notice_{sel_id}"] = notices
                 st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
                 st.rerun()
         with c_gen:
@@ -2064,21 +2087,39 @@ def render_single_chapter_editor(tree):
                     st.warning("该章节为父节点（章节容器），请对其叶子子节点分别生成正文，父节点不单独生成。")
                 else:
                     with st.spinner("AI 生成中（自动纠偏）..."):
-                        res, wc_info = generate_chapter_with_correction(sandwich, prompts)
-                        drafts[sel_id] = res
-                        save_json_file("drafts.json", drafts)
-                        sum_res = compress_memory(res)
-                        ds = load_json_file("drafts_summary.json", {})
-                        ds[sel_id] = sum_res
-                        save_json_file("drafts_summary.json", ds)
-                        # 版本号+1 → rerun 后板块五/六 text_area 以新 key 重新从 drafts 读取，全局同步
-                        st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
-                        if wc_info:
-                            st.success(f"本章生成完毕！实际 {wc_info['actual']}字/目标{wc_info['target']}字（纠偏{wc_info['attempts']}次），记忆 {len(sum_res)} 字")
+                        try:
+                            res, wc_info = generate_chapter_with_correction(sandwich, prompts)
+                        except LLMOutputError as exc:
+                            st.error(f"章节生成失败，请检查模型/API 配置后重试。（{exc}）")
                         else:
-                            actual = count_chinese_chars(res)
-                            st.success(f"本章生成完毕！实际 {actual}字（未分配目标字数），记忆 {len(sum_res)} 字")
-                        st.rerun()
+                            reference_maps = load_json_file("draft_reference_maps.json", {})
+                            bound_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
+                            record_generated_draft(
+                                drafts,
+                                reference_maps,
+                                sel_id,
+                                res,
+                                [lit.get("id") for lit in bound_literatures if lit.get("id") is not None],
+                            )
+                            save_json_file("drafts.json", drafts)
+                            save_json_file("draft_reference_maps.json", reference_maps)
+                            if wc_info:
+                                generated_message = f"本章生成完毕！实际 {wc_info['actual']}字/目标{wc_info['target']}字（纠偏{wc_info['attempts']}次）。"
+                            else:
+                                generated_message = f"本章生成完毕！实际 {count_chinese_chars(res)}字（未分配目标字数）。"
+                            notices = [("success", generated_message)]
+                            try:
+                                sum_res = compress_memory(res)
+                            except LLMOutputError as exc:
+                                notices.append(("warning", f"正文已保存，但记忆凝练失败；之后可再次保存重试。({exc})"))
+                            else:
+                                ds = load_json_file("drafts_summary.json", {})
+                                ds[sel_id] = sum_res
+                                save_json_file("drafts_summary.json", ds)
+                                notices.append(("success", f"记忆池已更新（本章记忆 {len(sum_res)} 字）。"))
+                            st.session_state[f"writing_notice_{sel_id}"] = notices
+                            st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
+                            st.rerun()
 
         # ---- 图表 ----
         st.markdown("---")
@@ -2257,29 +2298,56 @@ def render_batch_workbench():
             else:
                 drafts = load_json_file("drafts.json", {})
                 ds = load_json_file("drafts_summary.json", {})
+                reference_maps = load_json_file("draft_reference_maps.json", {})
                 progress_bar = st.progress(0)
                 status = st.empty()
                 results_note = []
+                failed_chapters = []
+                memory_warnings = []
                 for k, nid in enumerate(leaf_ids):
                     node = get_node_by_id(tree, nid)
                     status.info(f"📝 正在生成第 {k+1}/{len(leaf_ids)} 章：{node.get('title','')} ...")
                     sandwich = build_context_sandwich(nid)
-                    res, wc_info = generate_chapter_with_correction(sandwich, prompts)
-                    drafts[nid] = res
+                    try:
+                        res, wc_info = generate_chapter_with_correction(sandwich, prompts)
+                    except LLMOutputError as exc:
+                        failed_chapters.append(f"{node.get('title','未命名')}: {exc}")
+                        progress_bar.progress((k + 1) / len(leaf_ids))
+                        continue
+                    bound_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
+                    record_generated_draft(
+                        drafts,
+                        reference_maps,
+                        nid,
+                        res,
+                        [lit.get("id") for lit in bound_literatures if lit.get("id") is not None],
+                    )
                     save_json_file("drafts.json", drafts)
-                    sum_res = compress_memory(res)
-                    ds[nid] = sum_res
-                    save_json_file("drafts_summary.json", ds)
+                    save_json_file("draft_reference_maps.json", reference_maps)
                     if wc_info:
                         results_note.append(f"{node.get('title','')}: {wc_info['actual']}字/目标{wc_info['target']}字（纠偏{wc_info['attempts']}次）")
                     else:
                         results_note.append(f"{node.get('title','')}: {count_chinese_chars(res)}字（无目标）")
+                    try:
+                        sum_res = compress_memory(res)
+                    except LLMOutputError as exc:
+                        memory_warnings.append(f"{node.get('title','未命名')}: {exc}")
+                    else:
+                        ds[nid] = sum_res
+                        save_json_file("drafts_summary.json", ds)
                     progress_bar.progress((k + 1) / len(leaf_ids))
-                msg = f"✅ 全部 {len(leaf_ids)} 个叶子章节生成完成！\n" + "\n".join(results_note)
+                msg = f"批量生成结束：成功 {len(results_note)} 章，失败 {len(failed_chapters)} 章。"
+                if results_note:
+                    msg += "\n" + "\n".join(results_note)
                 if skipped:
                     msg += f"\n\n（已跳过 {len(skipped)} 个父节点容器：{'、'.join(skipped[:5])}）"
-                status.success(msg)
-                st.rerun()
+                if failed_chapters:
+                    status.warning(msg)
+                    st.error("生成失败的章节：\n" + "\n".join(failed_chapters))
+                else:
+                    status.success(msg)
+                if memory_warnings:
+                    st.warning("正文已保存，但以下章节的记忆凝练失败：\n" + "\n".join(memory_warnings))
 
     # ---- 批量生成图表（独立选项，走图表绘制队列） ----
     if st.button("📊 批量生成图表"):
@@ -2643,14 +2711,14 @@ def adversarial_rewrite(text, rewrite_prompt, max_attempts=3):
         temp_val = 0.85 + (attempt * 0.1)
         # 根据原文长度动态调整输出预算：正文约原文1.2倍token + 思考余量
         out_tokens = max(8000, int(len(text) * 1.8) + 4000)
-        rewritten = dispatch_llm_call(
+        rewritten = require_valid_llm_output(dispatch_llm_call(
             prompt,
             system_prompt="你是极其克制的顶级学术校对员，只输出重写后的正文，绝不输出任何思考过程。",
             max_tokens=out_tokens,
             temp=temp_val
-        )
-        # 净化兜底：剥掉思考痕迹/解说性套话/截断残渣
-        rewritten = purge_thinking_text(rewritten)
+        ))
+        # 清理后再次验证，避免空结果进入检测或保存流程。
+        rewritten = require_valid_llm_output(purge_thinking_text(rewritten))
         score_dict = detect_aigc(rewritten)
         final_score = score_dict["score"]
         if score_dict["score"] < 40.0:
@@ -2741,18 +2809,15 @@ def apply_paragraph_format(p, params):
         pass
 
 
-def collect_references_for_export(tree):
-    """遍历逻辑树，按节点 references 首次出现顺序汇总去重文献，返回 (列表, 节点引用映射)"""
-    literatures = load_json_file("literatures.json", [])
-    lit_map = {l.get("id"): l for l in literatures}
-    ordered = []      # 去重后的文献 ID 列表（导出顺序即全文编号）
-    seen = set()
-    for node, depth in flatten_tree_nodes(tree):
-        for rid in node.get("references", []) or []:
-            if rid in lit_map and rid not in seen:
-                seen.add(rid)
-                ordered.append(rid)
-    return ordered, lit_map
+def collect_references_for_export(tree, drafts=None, draft_reference_maps=None, literatures=None):
+    """建立正文引用与参考文献表共同使用的全局编号注册表。"""
+    if drafts is None:
+        drafts = load_json_file("drafts.json", {})
+    if draft_reference_maps is None:
+        draft_reference_maps = load_json_file("draft_reference_maps.json", {})
+    if literatures is None:
+        literatures = load_json_file("literatures.json", [])
+    return collect_global_reference_registry(tree, drafts, draft_reference_maps, literatures)
 
 
 def is_garbled_text(text, threshold=0.05):
@@ -2960,8 +3025,12 @@ def build_final_document(template_name, params):
     """装配终稿 Word 文档，返回 BytesIO"""
     tree = load_json_file("logic_tree.json", [])
     drafts = load_json_file("drafts.json", {})
+    draft_reference_maps = load_json_file("draft_reference_maps.json", {})
     drafts_charts = load_json_file("drafts_charts.json", {})
     drafts_images = load_json_file("drafts_images.json", {})
+    ordered, global_number_by_id, lit_map = collect_references_for_export(
+        tree, drafts, draft_reference_maps
+    )
 
     # 依据模板：打开模板继承页边距/页眉/样式；否则新建空白文档
     doc = None
@@ -2995,7 +3064,9 @@ def build_final_document(template_name, params):
 
         text = drafts.get(nid, "")
         if text:
-            cleaned = clean_markdown_text(text)
+            local_reference_ids = reference_ids_for_node(node, draft_reference_maps)
+            export_text = remap_local_citations(text, local_reference_ids, global_number_by_id)
+            cleaned = clean_markdown_text(export_text)
             # 连续表格行聚合为 Word 表格
             buf = []
             for para in cleaned:
@@ -3034,16 +3105,15 @@ def build_final_document(template_name, params):
                     pass
 
     # 参考文献表
-    ordered, lit_map = collect_references_for_export(tree)
     if ordered:
         doc.add_page_break()
         doc.add_heading("参考文献", level=1)
-        for i, rid in enumerate(ordered, 1):
+        for rid in ordered:
             lit = lit_map[rid]
             title = lit.get("title", "未命名")
             cat = lit.get("category", "")
             findings = str(lit.get("analysis", {}).get("key_findings", ""))[:100]
-            ref_p = doc.add_paragraph(f"[{i}] {title}（{cat}）")
+            ref_p = doc.add_paragraph(f"[{global_number_by_id[rid]}] {title}（{cat}）")
             apply_paragraph_format(ref_p, {**params, "first_line_indent": 0})
             if findings:
                 ref_p2 = doc.add_paragraph(f"    核心发现：{findings}")
@@ -3175,21 +3245,25 @@ def module6_aigc():
                                 bak_d = load_json_file("drafts_rewrite_backup.json", {})
                                 bak_d[sel_id] = drafts.get(sel_id, "")
                                 save_json_file("drafts_rewrite_backup.json", bak_d)
-                                rewritten, ok, rounds, score = adversarial_rewrite(edited_text, rewrite_prompt)
-                                # 输出防护：异常重写结果不覆盖原文
-                                abnormal, abn_reasons = is_suspicious_rewrite(edited_text, rewritten)
-                                if abnormal:
-                                    drafts[sel_id] = edited_text
-                                    save_json_file("drafts.json", drafts)
-                                    st.warning(f"⚠️ 去味结果异常（{'、'.join(abn_reasons)}），已保留原文，未写入。")
-                                    st.session_state[f"rew_fb_{sel_id}"] = (False, 0, "异常已拦截")
+                                try:
+                                    rewritten, ok, rounds, score = adversarial_rewrite(edited_text, rewrite_prompt)
+                                except LLMOutputError as exc:
+                                    st.error(f"去味失败，原有正文已保留。请检查模型/API 配置后重试。（{exc}）")
                                 else:
-                                    drafts[sel_id] = rewritten
-                                    save_json_file("drafts.json", drafts)
-                                    st.session_state[f"rew_fb_{sel_id}"] = (ok, rounds, score)
-                                # 版本号+1 → rerun 后 text_area 以新 key 重新从 drafts 读取，全局同步
-                                st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
-                                st.rerun()
+                                    # 输出防护：异常重写结果不覆盖原文
+                                    abnormal, abn_reasons = is_suspicious_rewrite(edited_text, rewritten)
+                                    if abnormal:
+                                        drafts[sel_id] = edited_text
+                                        save_json_file("drafts.json", drafts)
+                                        st.warning(f"⚠️ 去味结果异常（{'、'.join(abn_reasons)}），已保留原文，未写入。")
+                                        st.session_state[f"rew_fb_{sel_id}"] = (False, 0, "异常已拦截")
+                                    else:
+                                        drafts[sel_id] = rewritten
+                                        save_json_file("drafts.json", drafts)
+                                        st.session_state[f"rew_fb_{sel_id}"] = (ok, rounds, score)
+                                    # 版本号+1 → rerun 后 text_area 以新 key 重新从 drafts 读取，全局同步
+                                    st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
+                                    st.rerun()
 
     # ---- 全文 ----
     with tabs[1]:
@@ -3222,19 +3296,27 @@ def module6_aigc():
                 bar = st.progress(0)
                 status = st.empty()
                 ok_count = 0
+                failed_rewrites = []
                 for k, nid in enumerate(ordered):
                     node = get_node_by_id(tree, nid)
                     text = drafts.get(nid, "")
                     if text:
                         status.info(f"正在去味：{node.get('title','')} ...")
-                        rewritten, ok, _, _ = adversarial_rewrite(text, rewrite_prompt)
-                        drafts[nid] = rewritten
-                        save_json_file("drafts.json", drafts)
-                        if ok:
-                            ok_count += 1
+                        try:
+                            rewritten, ok, _, _ = adversarial_rewrite(text, rewrite_prompt)
+                        except LLMOutputError as exc:
+                            failed_rewrites.append(f"{node.get('title','未命名')}: {exc}")
+                        else:
+                            drafts[nid] = rewritten
+                            save_json_file("drafts.json", drafts)
+                            if ok:
+                                ok_count += 1
                     bar.progress((k + 1) / len(ordered))
-                status.success(f"✅ 全文去味完成！达标章节 {ok_count} 篇。")
-                st.rerun()
+                if failed_rewrites:
+                    status.warning(f"全文去味结束：{ok_count} 章达标，{len(failed_rewrites)} 章失败。")
+                    st.warning("以下章节的去味失败，原文已保留：\n" + "\n".join(failed_rewrites))
+                else:
+                    status.success(f"✅ 全文去味完成！达标章节 {ok_count} 篇。")
 
     # ---- 外部文档处理 ----
     with tabs[2]:

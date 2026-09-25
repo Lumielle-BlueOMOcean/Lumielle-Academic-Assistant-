@@ -106,6 +106,10 @@ This design lets the AI focus on writing **one chapter at a time**, while the to
 - Custom writing-style prompts are interpolated into chapter-generation prompts.
 - English chapter word counts now count word tokens, including generation correction, UI results, batch results, and structure review.
 - English default prompts now initialize under `prompts.json`.
+- Word exports now remap chapter-local citations through one deduplicated global reference order, preserving each draft's saved reference mapping and falling back to current bindings for legacy drafts.
+- Empty responses and known LLM configuration/API failure messages are rejected before saving chapter text or memory; a failed memory distillation keeps the saved draft and prior summary.
+- Batch chapter generation now reports per-chapter failures and continues with the remaining chapters.
+- English memory status now reports word counts instead of character counts.
 
 #### Changed / 变更
 
