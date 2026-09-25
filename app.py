@@ -16,6 +16,7 @@ Lumielle Academic Assistant —— 学术论文写作助手
 
 import streamlit as st
 from version import __version__
+from chart_support import chart_result_message, generate_chart_image
 from writing_support import (
     LLMOutputError,
     apply_english_prompt_defaults,
@@ -36,7 +37,6 @@ import PyPDF2
 import docx
 import re
 import io
-import struct
 import platform
 import subprocess
 import pandas as pd
@@ -1803,118 +1803,42 @@ def module4_logic():
 # ============================================================
 # 11. 板块五：正文写作
 # ============================================================
-def _clean_python_code(raw_code):
-    """清洗 LLM 生成的 Python 代码：去围栏、去解释文字、全角转半角、去注释行"""
-    code = re.sub(r"```(?:python)?\s*", "", raw_code)
-    code = re.sub(r"\s*```", "", code)
-    # 全角字符转半角（LLM 常输出全角逗号/括号/引号导致语法错误）
-    full_to_half = str.maketrans(
-        "，。；：（）【】“”‘’！？、",
-        ",.;:()[]\"\"''!?、"
-    )
-    code = code.translate(full_to_half)
-    # 去掉行首非代码的解释性文字（如 "以下是代码："）
-    lines = code.split("\n")
-    code_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        # 跳过明显是中文解释的行（含中文但不在字符串内的判断较难，这里只跳过行首无代码特征的短句）
-        code_lines.append(line)
-    return "\n".join(code_lines).strip()
-
-
-def _chart_size_ok(path, max_pixels=20_000_000, max_dim=20000):
-    """校验图表 PNG 尺寸是否合理：读文件头取宽高，防超高/超宽异常图。
-    返回 True 表示尺寸正常（或非 PNG/读取失败时不阻塞）。"""
-    try:
-        with open(path, "rb") as f:
-            head = f.read(33)
-        if len(head) < 24 or not head.startswith(b"\x89PNG"):
-            return True
-        w, h = struct.unpack(">II", head[16:24])
-        if w <= 0 or h <= 0:
-            return False
-        if w * h > max_pixels or w > max_dim or h > max_dim:
-            return False
-        return True
-    except Exception:
-        return True
-
-
 def generate_chart_for_node(node_id, instruction, max_attempts=3):
-    """根据指令生成图表并挂载到节点，返回 (成功, 路径或错误信息)。
-    带自动纠错：代码执行失败时把错误信息反馈给 LLM 重写，最多重试 max_attempts 次。"""
-    base_prompt = (
-        "Write a Python script that draws a chart with matplotlib. Requirements: set the font via plt.rcParams['font.sans-serif']=['Arial Unicode MS','SimHei','PingFang SC']. "
-        "The script MUST end with plt.savefig(CHART_PATH, dpi=150, bbox_inches='tight'), where CHART_PATH is a pre-defined variable. "
-        f"Drawing request: {instruction}. Make the chart polished, with grid lines. "
-        "[HARD SIZE CONSTRAINTS] The figure size must be reasonable: figsize width 6-16, height 4-12 inches; "
-        "axis ranges (ylim/xlim) must NOT be set to absurdly large values; elements must NOT spread infinitely in any direction; "
-        "if there is too much content, group it or use subplots, ensuring the final image has a normal aspect ratio and total pixels under 20 million. "
-        "Output only pure Python code; no Markdown fences, no commentary, no comments, no non-ASCII punctuation."
+    """Generate a validated chart image and persist its compatible record only on success."""
+    safe_node_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(node_id))[:64] or "chapter"
+    chart_path = os.path.join(
+        CHART_DIR, f"chart_{safe_node_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
     )
-    chart_path = os.path.join(CHART_DIR, f"chart_{node_id}_{int(time.time())}.png")
-    last_error = ""
-    for attempt in range(max_attempts):
-        prompt = base_prompt
-        if last_error:
-            prompt = (
-                "The code you generated in the previous round failed to execute. Error message:\n"
-                f"{last_error}\n\n"
-                "Regenerate complete, runnable Python code that fixes the error. "
-                "Strictly: use only half-width punctuation (, . ( ) [ ] ' \"); no Chinese punctuation; "
-                "no Markdown fences; no comments; output only the code itself. "
-                f"Drawing request: {instruction}"
-            )
-        code_res = dispatch_llm_call(
-            prompt,
-            system_prompt="You are a professional matplotlib plotting engineer. Output only runnable pure Python code.",
-            max_tokens=1800,
-            temp=0.3 if last_error else 0.7
-        )
-        cleaned_code = _clean_python_code(code_res)
-        # 快速语法预检（不执行）
-        try:
-            compile(cleaned_code, "<chart>", "exec")
-        except SyntaxError as se:
-            last_error = f"SyntaxError: {se}"
-            continue
-        try:
-            plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'PingFang SC']
-            plt.rcParams['axes.unicode_minus'] = False
-            local_vars = {"plt": plt, "pd": pd, "np": np, "CHART_PATH": chart_path}
-            exec(cleaned_code, local_vars)
-            # 兜底：代码可能用了 plt.show() 而非 savefig，检测到画布有内容则强制保存
-            if not os.path.exists(chart_path):
-                try:
-                    # 若代码关闭了 figure 则无法补救；否则强制保存当前画布
-                    if plt.get_fignums():
-                        plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-                        plt.close('all')
-                except Exception:
-                    pass
-            if os.path.exists(chart_path):
-                # 尺寸校验：读取 PNG 头获得宽高，超限则反馈给 LLM 重新设计（防超高/超宽图）
-                if not _chart_size_ok(chart_path):
-                    last_error = (
-                        "The generated image is abnormally large (width/height too long, or total pixels over limit) and cannot be displayed properly. "
-                        "Redesign the chart: control the axis ranges (ylim/xlim) and element layout so elements do not spread infinitely; "
-                        "if there is too much content, group it with subplots to ensure a normal aspect ratio and total pixels under 20 million."
-                    )
-                    plt.close('all')
-                    continue
-                dc = load_json_file("drafts_charts.json", {})
-                dc.setdefault(node_id, []).append({"path": chart_path, "instruction": instruction})
-                save_json_file("drafts_charts.json", dc)
-                return True, chart_path
-            last_error = "No chart file was generated after code execution (canvas empty or closed)."
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
-            plt.close('all')
-    return False, f"Failed after multiple attempts: {last_error}"
+    result = generate_chart_image(
+        instruction,
+        chart_path,
+        dispatch_llm_call,
+        locale="en",
+        max_attempts=max_attempts,
+    )
+    if result["status"] != "ok":
+        return result
 
+    charts = load_json_file("drafts_charts.json", {})
+    if not isinstance(charts, dict):
+        try:
+            os.remove(chart_path)
+        except OSError:
+            pass
+        return {"status": "error", "message": chart_result_message("error", "en")}
+    charts.setdefault(str(node_id), []).append({
+        "path": chart_path,
+        "instruction": instruction,
+        "chart_type": result["spec"]["chart_type"],
+        "data_note": result["spec"].get("data_note", ""),
+    })
+    if not save_json_file("drafts_charts.json", charts):
+        try:
+            os.remove(chart_path)
+        except OSError:
+            pass
+        return {"status": "error", "message": chart_result_message("error", "en")}
+    return result
 
 
 
@@ -2130,18 +2054,25 @@ def render_single_chapter_editor(tree):
         # ---- 图表 ----
         st.markdown("---")
         st.markdown("### 📊 Charts for This Chapter")
-        chart_prompt = st.text_input("Chart drawing requirements (LLM draws accordingly)", value=node.get("chart_instruction", ""), key=f"chartin_{sel_id}")
+        chart_prompt = st.text_input(
+            "Chart drawing requirements",
+            value=node.get("chart_instruction", ""),
+            help="Example: Create a bar chart comparing A=35, B=42, C=28.",
+            key=f"chartin_{sel_id}",
+        )
         if st.button("🎨 Generate Chart & Mount to This Chapter", key=f"genchart_{sel_id}"):
             if not chart_prompt.strip():
                 st.warning("Please enter chart drawing requirements.")
             else:
-                with st.spinner("AI is writing and running chart code..."):
-                    ok, result = generate_chart_for_node(sel_id, chart_prompt)
-                    if ok:
+                with st.spinner("AI is preparing your chart..."):
+                    result = generate_chart_for_node(sel_id, chart_prompt)
+                    if result["status"] == "ok":
                         st.success("Chart generated and mounted!")
                         st.rerun()
+                    elif result["status"] == "needs_data":
+                        st.info(result["message"])
                     else:
-                        st.error(result)
+                        st.error(result["message"])
 
         dc = load_json_file("drafts_charts.json", {})
         charts = dc.get(sel_id, [])
@@ -2364,17 +2295,35 @@ def render_batch_workbench():
             progress_bar = st.progress(0)
             status = st.empty()
             ok_count = 0
+            needs_data_chapters = []
+            failed_chapters = []
             for k, nid in enumerate(sel_ids):
                 node = get_node_by_id(tree, nid)
                 instruction = per_node_chart.get(nid, "") or node.get("chart_instruction", "")
                 if instruction.strip():
                     status.info(f"📊 Generating chart for \"{node.get('title','')}\" ...")
-                    ok, _ = generate_chart_for_node(nid, instruction)
-                    if ok:
+                    result = generate_chart_for_node(nid, instruction)
+                    if result["status"] == "ok":
                         ok_count += 1
+                    elif result["status"] == "needs_data":
+                        needs_data_chapters.append(node.get("title", "Untitled chapter"))
+                    else:
+                        failed_chapters.append(node.get("title", "Untitled chapter"))
                 progress_bar.progress((k + 1) / len(sel_ids))
-            status.success(f"✅ Chart batch generation complete: {ok_count} succeeded.")
+            st.session_state["chart_batch_notice"] = {
+                "ok_count": ok_count,
+                "needs_data": needs_data_chapters,
+                "failed": failed_chapters,
+            }
             st.rerun()
+
+    chart_batch_notice = st.session_state.pop("chart_batch_notice", None)
+    if chart_batch_notice:
+        st.success(f"✅ Chart batch generation complete: {chart_batch_notice['ok_count']} succeeded.")
+        if chart_batch_notice["needs_data"]:
+            st.info(chart_result_message("needs_data", "en") + " Chapters: " + ", ".join(chart_batch_notice["needs_data"]))
+        if chart_batch_notice["failed"]:
+            st.warning("Chart generation failed for: " + ", ".join(chart_batch_notice["failed"]))
 
     # ---- 批量挂载图片 ----
     if per_node_img and st.button("🖼️ Batch Mount Uploaded Images"):

@@ -25,7 +25,7 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Compile application and tests
-        run: python -m compileall app.py app_zh.py version.py writing_support.py tests
+        run: python -m compileall app.py app_zh.py version.py writing_support.py chart_support.py tests
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v

@@ -110,6 +110,8 @@ This design lets the AI focus on writing **one chapter at a time**, while the to
 - Empty responses and known LLM configuration/API failure messages are rejected before saving chapter text or memory; a failed memory distillation keeps the saved draft and prior summary.
 - Batch chapter generation now reports per-chapter failures and continues with the remaining chapters.
 - English memory status now reports word counts instead of character counts.
+- Replaced executable LLM-generated chart scripts with validated bar, line, scatter, and pie chart data rendered by trusted local code.
+- Chart requests without usable values now ask the user for data; explicitly illustrative charts are labeled as illustrative.
 
 #### Changed / 变更
 

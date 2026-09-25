@@ -1,5 +1,8 @@
 import importlib.util
+import json
 import re
+import struct
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -232,6 +235,324 @@ class CoreCorrectnessTests(unittest.TestCase):
             support.record_generated_draft(drafts, snapshots, "chapter", "", ["new-reference"])
         self.assertEqual(drafts, {"chapter": "Old body"})
         self.assertEqual(snapshots, {"chapter": ["old-reference"]})
+
+
+class ChartSupportTests(unittest.TestCase):
+    def setUp(self):
+        self.chart = load_project_module(self, "chart_support")
+
+    def load_chart_support(self):
+        return self.chart
+
+    def parse(self, spec, instruction="A=10, B=20", **kwargs):
+        chart = self.load_chart_support()
+        return chart.parse_chart_spec(json.dumps(spec), instruction=instruction, **kwargs)
+
+    def test_valid_grouped_bar_chart_spec_is_accepted(self):
+        spec = self.parse({
+            "status": "ok",
+            "chart_type": "bar",
+            "title": "Comparison",
+            "x_label": "Category",
+            "y_label": "Value",
+            "categories": ["A", "B"],
+            "series": [
+                {"name": "Group 1", "values": [10, 20]},
+                {"name": "Group 2", "values": [5, 8]},
+            ],
+        }, instruction="A=10, B=20; Group 2 has A=5 and B=8")
+        self.assertEqual(spec["status"], "ok")
+        self.assertEqual(spec["chart_type"], "bar")
+        self.assertEqual(len(spec["series"]), 2)
+
+    def test_bar_series_length_must_match_categories(self):
+        chart = self.load_chart_support()
+        with self.assertRaises(chart.ChartSpecError):
+            self.parse({
+                "status": "ok", "chart_type": "bar", "title": "T",
+                "x_label": "X", "y_label": "Y", "categories": ["A", "B"],
+                "series": [{"name": "S", "values": [10]}],
+            })
+
+    def test_valid_line_chart_requires_matching_x_and_series_values(self):
+        spec = self.parse({
+            "status": "ok", "chart_type": "line", "title": "Trend",
+            "x_label": "Year", "y_label": "Value", "x": ["2020", "2021"],
+            "series": [{"name": "A", "values": [10, 20]}],
+        }, instruction="In 2020 value was 10; in 2021 value was 20")
+        self.assertEqual(spec["chart_type"], "line")
+
+    def test_line_series_length_mismatch_is_rejected(self):
+        chart = self.load_chart_support()
+        with self.assertRaises(chart.ChartSpecError):
+            self.parse({
+                "status": "ok", "chart_type": "line", "title": "T",
+                "x_label": "X", "y_label": "Y", "x": ["2020", "2021"],
+                "series": [{"name": "S", "values": [10]}],
+            }, instruction="2020=10, 2021=20")
+
+    def test_scatter_x_and_y_length_mismatch_is_rejected(self):
+        chart = self.load_chart_support()
+        with self.assertRaises(chart.ChartSpecError):
+            self.parse({
+                "status": "ok", "chart_type": "scatter", "title": "T",
+                "x_label": "X", "y_label": "Y",
+                "series": [{"name": "S", "x": [1, 2], "y": [3]}],
+            }, instruction="(1,3), (2,4)")
+
+    def test_pie_rejects_negative_values_and_zero_total(self):
+        chart = self.load_chart_support()
+        base = {"status": "ok", "chart_type": "pie", "title": "T", "labels": ["A", "B"]}
+        for values in ([-1, 2], [0, 0]):
+            with self.subTest(values=values), self.assertRaises(chart.ChartSpecError):
+                self.parse({**base, "values": values}, instruction="A=-1, B=2")
+
+    def test_non_finite_json_numbers_are_rejected(self):
+        chart = self.load_chart_support()
+        for token in ("NaN", "Infinity", "-Infinity"):
+            raw = (
+                '{"status":"ok","chart_type":"bar","title":"T",'
+                '"x_label":"X","y_label":"Y","categories":["A"],'
+                f'"series":[{{"name":"S","values":[{token}]}}]}}'
+            )
+            with self.subTest(token=token), self.assertRaises(chart.ChartSpecError):
+                chart.parse_chart_spec(raw, instruction="A=10")
+
+    def test_boolean_is_not_accepted_as_a_number(self):
+        chart = self.load_chart_support()
+        with self.assertRaises(chart.ChartSpecError):
+            self.parse({
+                "status": "ok", "chart_type": "bar", "title": "T",
+                "x_label": "X", "y_label": "Y", "categories": ["A"],
+                "series": [{"name": "S", "values": [True]}],
+            }, instruction="A=1")
+
+    def test_unsupported_chart_types_and_llm_code_fields_are_rejected(self):
+        chart = self.load_chart_support()
+        valid = {
+            "status": "ok", "chart_type": "python", "title": "T",
+            "x_label": "X", "y_label": "Y", "categories": ["A"],
+            "series": [{"name": "S", "values": [10]}],
+        }
+        for unsupported in ("python", [], {}):
+            with self.subTest(chart_type=unsupported), self.assertRaises(chart.ChartSpecError):
+                self.parse({**valid, "chart_type": unsupported})
+        valid["chart_type"] = "bar"
+        valid["code"] = "import os; os.remove('data')"
+        with self.assertRaises(chart.ChartSpecError):
+            self.parse(valid)
+
+    def test_needs_data_is_returned_as_a_non_renderable_result(self):
+        chart = self.load_chart_support()
+        result = chart.parse_chart_spec(
+            '{"status":"needs_data","message":"Please provide values."}',
+            instruction="Compare the three groups",
+        )
+        self.assertEqual(result["status"], "needs_data")
+
+    def test_model_needs_data_result_is_translated_without_rendering(self):
+        chart = self.load_chart_support()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "chart.png"
+            result = chart.generate_chart_image(
+                "Compare A=10 and B=20",
+                str(output),
+                lambda *args, **kwargs: '{"status":"needs_data","message":"Need another value."}',
+            )
+            self.assertEqual(result["status"], "needs_data")
+            self.assertIn("More data is needed", result["message"])
+            self.assertFalse(output.exists())
+
+    def test_invalid_spec_retry_uses_json_mode_and_validation_feedback(self):
+        chart = self.load_chart_support()
+        responses = iter((
+            '{"status":"ok","chart_type":"unsupported"}',
+            '{"status":"needs_data","message":"Please provide values."}',
+        ))
+        calls = []
+
+        def llm_call(prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            return next(responses)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "chart.png"
+            result = chart.generate_chart_image("Compare A=10 and B=20", str(output), llm_call)
+            self.assertEqual(result["status"], "needs_data")
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(call[1]["json_mode"] for call in calls))
+            self.assertIn("previous JSON was invalid", calls[1][0])
+            self.assertFalse(output.exists())
+
+    def test_factual_values_must_come_from_the_user_instruction(self):
+        chart = self.load_chart_support()
+        spec = {
+            "status": "ok", "chart_type": "bar", "title": "T",
+            "x_label": "X", "y_label": "Y", "categories": ["A", "B"],
+            "series": [{"name": "S", "values": [10, 99]}],
+        }
+        with self.assertRaises(chart.ChartSpecError):
+            chart.parse_chart_spec(json.dumps(spec), instruction="A=10, B=20")
+
+    def test_line_numeric_axis_labels_must_come_from_the_user_instruction(self):
+        chart = self.load_chart_support()
+        spec = {
+            "status": "ok", "chart_type": "line", "title": "Trend",
+            "x_label": "Year", "y_label": "Value", "x": ["1990", "1991"],
+            "series": [{"name": "S", "values": [10, 20]}],
+        }
+        with self.assertRaises(chart.ChartSpecError):
+            chart.parse_chart_spec(json.dumps(spec), instruction="2020=10, 2021=20")
+
+    def test_illustrative_request_is_allowed_and_marked(self):
+        chart = self.load_chart_support()
+        spec = {
+            "status": "ok", "chart_type": "bar", "title": "Example",
+            "x_label": "X", "y_label": "Y", "categories": ["A", "B"],
+            "series": [{"name": "S", "values": [10, 20]}],
+        }
+        result = chart.parse_chart_spec(
+            json.dumps(spec), instruction="Use hypothetical illustrative data for A and B"
+        )
+        self.assertTrue(result["data_note"])
+
+    def test_negative_illustrative_wording_does_not_allow_fabricated_values(self):
+        chart = self.load_chart_support()
+        for instruction in (
+            "Compare values, but do not use illustrative data",
+            "No hypothetical numbers; use only my research data",
+            "不要使用示例数据，请使用我提供的数值",
+        ):
+            with self.subTest(instruction=instruction):
+                self.assertFalse(chart.is_illustrative_request(instruction))
+
+    def test_year_only_request_returns_needs_data_without_calling_llm(self):
+        chart = self.load_chart_support()
+        no_data_requests = (
+            "Plot the trend from 2020 to 2024",
+            "Use data from 2020 to 2024",
+            "Draw a 3D chart with 2 series",
+        )
+        self.assertTrue(chart.has_usable_numeric_data("The average score was 3.14"))
+        self.assertTrue(chart.has_usable_numeric_data("A=2024"))
+        for index, instruction in enumerate(no_data_requests):
+            with self.subTest(instruction=instruction), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / f"chart-{index}.png"
+                calls = []
+
+                def unexpected_llm_call(*args, **kwargs):
+                    calls.append((args, kwargs))
+                    return "should not be called"
+
+                result = chart.generate_chart_image(instruction, str(output), unexpected_llm_call)
+                self.assertEqual(result["status"], "needs_data")
+                self.assertFalse(calls)
+                self.assertFalse(output.exists())
+
+    def test_prompt_requests_json_and_forbids_invented_factual_values(self):
+        chart = self.load_chart_support()
+        prompt = chart.build_chart_spec_prompt("Compare A=10 and B=20", locale="en")
+        self.assertIn("bar", prompt)
+        self.assertIn("scatter", prompt)
+        self.assertIn("pie", prompt)
+        self.assertIn("needs_data", prompt)
+        self.assertIn("A=10 and B=20", prompt)
+        self.assertRegex(prompt.lower(), r"never (?:invent|infer)")
+        self.assertNotIn("python script", prompt.lower())
+        self.assertNotIn("python code", prompt.lower())
+        self.assertNotIn("Output only pure Python code", prompt)
+
+    def test_renderer_writes_valid_bar_and_line_pngs(self):
+        chart = self.load_chart_support()
+        fixtures = [
+            (
+                "bar", "A=10 and B=20",
+                {"status": "ok", "chart_type": "bar", "title": "Bars",
+                 "x_label": "Category", "y_label": "Value", "categories": ["A", "B"],
+                 "series": [{"name": "S", "values": [10, 20]}]},
+            ),
+            (
+                "line", "2020=10 and 2021=20",
+                {"status": "ok", "chart_type": "line", "title": "Trend",
+                 "x_label": "Year", "y_label": "Value", "x": ["2020", "2021"],
+                 "series": [{"name": "S", "values": [10, 20]}]},
+            ),
+            (
+                "scatter", "x=1 y=4, x=2 y=6",
+                {"status": "ok", "chart_type": "scatter", "title": "Relationship",
+                 "x_label": "X", "y_label": "Y",
+                 "series": [{"name": "S", "x": [1, 2], "y": [4, 6]}]},
+            ),
+            (
+                "pie", "A=30, B=45, C=25",
+                {"status": "ok", "chart_type": "pie", "title": "Composition",
+                 "labels": ["A", "B", "C"], "values": [30, 45, 25]},
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, instruction, raw_spec in fixtures:
+                with self.subTest(chart=name):
+                    spec = chart.parse_chart_spec(json.dumps(raw_spec), instruction=instruction)
+                    path = Path(tmp) / f"{name}.png"
+                    chart.render_chart_spec(spec, str(path))
+                    payload = path.read_bytes()
+                    self.assertTrue(payload.startswith(b"\x89PNG\r\n\x1a\n"))
+                    self.assertGreater(len(payload), 32)
+                    width, height = struct.unpack(">II", payload[16:24])
+                    self.assertGreater(width, 0)
+                    self.assertGreater(height, 0)
+                    self.assertLessEqual(width * height, chart.MAX_CHART_PIXELS)
+
+    def test_illustrative_chart_is_rendered_with_a_visible_data_note(self):
+        chart = self.load_chart_support()
+        raw_spec = {
+            "status": "ok", "chart_type": "bar", "title": "Illustration",
+            "x_label": "Category", "y_label": "Value", "categories": ["A", "B"],
+            "series": [{"name": "S", "values": [10, 20]}],
+        }
+        spec = chart.parse_chart_spec(
+            json.dumps(raw_spec), instruction="Use hypothetical illustrative data for A and B"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "illustrative.png"
+            chart.render_chart_spec(spec, str(path))
+            self.assertTrue(chart.chart_png_is_valid(str(path)))
+
+    def test_llm_failure_and_invalid_specs_do_not_create_chart_files(self):
+        chart = self.load_chart_support()
+        with tempfile.TemporaryDirectory() as tmp:
+            for response, expected_status in (
+                ("API call failed repeatedly: timeout", "error"),
+                ('{"status":"ok","chart_type":"python"}', "error"),
+            ):
+                with self.subTest(expected_status=expected_status), tempfile.TemporaryDirectory(dir=tmp) as case_dir:
+                    output = Path(case_dir) / "chart.png"
+                    result = chart.generate_chart_image(
+                        "Compare A=10 and B=20", str(output), lambda *args, **kwargs: response
+                    )
+                    self.assertEqual(result["status"], expected_status)
+                    self.assertFalse(output.exists())
+
+    def test_both_apps_have_no_llm_python_execution_path(self):
+        for name in ("app.py", "app_zh.py"):
+            with self.subTest(app=name):
+                source = (ROOT / name).read_text(encoding="utf-8")
+                self.assertFalse("_clean_python_code" in source, "legacy executable chart cleaner remains")
+                self.assertFalse(re.search(r"\bcompile\s*\(\s*cleaned_code", source), "chart code is still compiled")
+                self.assertFalse(re.search(r"\bexec\s*\(\s*cleaned_code", source), "chart code is still executed")
+                self.assertTrue("generate_chart_image" in source, "shared structured chart flow is not used")
+                self.assertFalse(re.search(r"(?:Output only|只输出).{0,30}Python code", source), "chart prompt still requests Python")
+                chart_flow = source.split("def generate_chart_for_node", 1)[1].split("def build_chapter_prompt", 1)[0]
+                self.assertNotRegex(chart_flow.lower(), r"\bpython\b", "chart generation still contains a Python-code instruction")
+                self.assertLess(
+                    chart_flow.index('if result["status"] != "ok":'),
+                    chart_flow.index('load_json_file("drafts_charts.json", {})'),
+                    "chart persistence must happen only after successful validation and rendering",
+                )
+                self.assertIn("generate_chart_for_node(nid, instruction)", source, "batch chart generation bypasses the shared safe flow")
+        chart_source = (ROOT / "chart_support.py").read_text(encoding="utf-8")
+        self.assertTrue("json_mode=True" in chart_source, "chart LLM call does not request JSON mode")
+        self.assertFalse(re.search(r"(?<![.\w])(?:exec|eval|compile)\s*\(", chart_source), "chart helper executes code")
 
 
 if __name__ == "__main__":
