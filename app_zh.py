@@ -13,6 +13,11 @@ Lumielle Academic Assistant —— 学术论文写作助手
 # ============================================================
 
 import streamlit as st
+from version import __version__
+from writing_support import (
+    build_chapter_prompt as assemble_chapter_prompt,
+    count_chinese_chars,
+)
 import json
 import os
 import time
@@ -576,6 +581,7 @@ def render_global_sidebar():
         "交流反馈：QQ 群聊 **1029688024**  \n"
         "仅供个人学习使用，禁止倒卖牟利。"
     )
+    st.sidebar.caption(f"v{__version__}")
 
     return nav_choice
 
@@ -1897,60 +1903,18 @@ def generate_chart_for_node(node_id, instruction, max_attempts=3):
     return False, f"多次尝试后仍失败: {last_error}"
 
 
-def count_chinese_chars(text):
-    """统计中文字符数（不含空白与标点计数可切换；此处统计所有非空白字符作为篇幅参考）"""
-    if not text:
-        return 0
-    return len(re.sub(r"\s", "", text))
 
 
 def build_chapter_prompt(sandwich, prompts, correction_note=None):
-    """根据三明治与全局提示词构造单章生成 prompt，支持纠偏反馈与文献引用约束"""
-    node_wc = sandwich.get("current_word_count", 0)
-    if node_wc:
-        wc_constraint = f"本章目标字数：{node_wc}字（请尽量贴合此篇幅，正负偏差允许在50%以内）。"
-    else:
-        wc_constraint = "本章未指定字数，请依据全局字数规划合理控制篇幅。"
-    extra = ""
-    if correction_note:
-        extra = f"\n\n【⚠️ 篇幅纠偏反馈】\n{correction_note}\n请据此重新输出，务必修正篇幅，其他内容可适当保留。"
-
-    # ---- 文献引用约束（防编造数据与结论） ----
-    ref_ids = sandwich.get("current_refs", []) or []
-    ref_lits = get_literatures_by_ids(ref_ids)
-    if ref_lits:
-        ref_lines = []
-        for i, lit in enumerate(ref_lits):
-            title = lit.get("title", "未命名")
-            findings = str(lit.get("analysis", {}).get("key_findings", ""))[:200]
-            ref_lines.append(f"[{i+1}] {title} —— 核心发现：{findings}")
-        ref_section = (
-            "\n\n【本章可引用文献（仅限以下文献，禁止引用任何未列出的来源）】\n"
-            + "\n".join(ref_lines)
-            + "\n\n【引用规则】\n"
-            "1. 正文中所有引用外部文献的观点、数据或结论，必须在句末用 [编号] 形式标注，如 [1][2]。\n"
-            "2. 只能引用上方列出的文献，编号必须与之对应，禁止编造文献、数据与结论。\n"
-            "3. 若某数据/结论无对应文献支撑，则必须明确写出【数据来源：本章实验/估算】或直接省略，严禁虚构。"
-        )
-    else:
-        ref_section = "\n\n【本章未绑定参考文献】禁止编造任何文献引用。涉及他人观点、数据时必须如实标注来源或注明无法核实。"
-
-    # 注入文章生成风格提示词（若未配置则用默认学术风格）
-    style_prompt = prompts.get("style_prompt", "") or "学术严谨、客观陈述、逻辑清晰、用词准确。"
-    # 硬性排版约束：普通文本禁止 markdown，但表格允许并强制标准格式（装配层可转换为 Word 表格）
-    format_rule = (
-        "\n\n【排版格式硬性要求】\n"
-        "1. 普通正文段落为纯文本，禁止使用任何 Markdown 标记（禁止 #、##、### 标题、**加粗**、*斜体*、- 列表、> 引用、--- 分隔线）。\n"
-        "2. 需要小标题时，使用纯文本编号形式，如「一、」「1.」「（1）」等，不要加任何符号装饰。\n"
-        "3. 每段独立成行，段与段之间用单个换行分隔，不要空行。\n"
-        "4. 若正文确实需要展示表格数据（如对比、统计、清单等），必须使用标准 Markdown 表格格式：首行为表头（各列以 | 分隔，行首行尾均有 |），第二行为 |---| 分隔行（列数与表头一致），后续为数据行；单元格内禁止嵌套任何其他 Markdown 标记，禁止使用中文全角竖线｜。\n"
-        "5. 表格前后各空一行与正文分隔。\n"
-        "6. 全文风格遵循：{style_prompt}"
+    """Build the Chinese chapter prompt with its bound reference metadata."""
+    reference_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
+    return assemble_chapter_prompt(
+        sandwich,
+        prompts,
+        reference_literatures,
+        locale="zh",
+        correction_note=correction_note,
     )
-    return f"""全局研究课题：《{sandwich['global_topic']}》
-预期总字数：{sandwich['target_word_count']}
-当前章节：《{sandwich['current_title']}》（内容约束：{sandwich['current_desc']}）
-{wc_constraint}{ref_section}{format_rule}{extra}"""
 
 
 def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, tolerance=0.5):

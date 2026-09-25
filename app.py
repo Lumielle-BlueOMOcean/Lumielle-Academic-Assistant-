@@ -15,6 +15,12 @@ Lumielle Academic Assistant —— 学术论文写作助手
 # ============================================================
 
 import streamlit as st
+from version import __version__
+from writing_support import (
+    apply_english_prompt_defaults,
+    build_chapter_prompt as assemble_chapter_prompt,
+    count_english_words,
+)
 import json
 import os
 import time
@@ -87,10 +93,7 @@ default_files = {
 }
 
 # ---- English default prompts (open-source edition) ----
-default_files["style_prompt"] = '[Role]\nYou are an academic paper writing engine. The following rules are the highest-priority constraints and must never be violated.\n\nI. GENERAL STYLE\n1. Academically rigorous, objective and restrained, yet natural and fluent. No AI-template tone.\n2. Each chapter must have a clear argumentative thread with logical progression between paragraphs. Avoid fragmented piling of statements.\n\nII. SENTENCE LEVEL\n1. Vary sentence length: alternate long sentences (30+ words) with short ones (under 15 words). No more than three consecutive sentences of the same length.\n2. Use dashes, parenthetical insertions and hedges where natural, mimicking human academic writing.\n3. Do not open consecutive paragraphs with the same pattern (e.g., repeating "First... Second... Finally...").\n\nIII. PARAGRAPH STRUCTURE\n1. Keep paragraphs between 80-200 words; a single paragraph should not exceed 250 words.\n2. Avoid identical structures across adjacent paragraphs. Do not chain multiple paragraphs of "claim + example + mini-conclusion".\n3. Connect claims and evidence with explicit logical relations, not filler connectors.\n\nIV. FORBIDDEN EXPRESSIONS (HARD)\n1. Clichéd connectors: in conclusion, in summary, to sum up, it is worth noting that, not surprisingly, it is obvious that, as we all know, etc.\n2. AI buzzwords and empty phrases: leverage, granularity, paradigm-shifting, game-changer, seamless, vague "robust", in today\'s fast-paced world, plays an important role, etc.\n3. Mechanical parallelism: do not deliberately craft parallel or antithetical sentences.\n\nV. EVIDENCE\n1. Every claim must be supported by data, literature, case evidence or logical derivation. No hollow assertions.\n2. When citing specific numbers, state the source or explicitly mark them as estimates.\n3. When referring to others\' views, cite with [1][2] bracket numbers.\n\nVI. TABLE OUTPUT (HARD)\n1. When the text needs to present tabular data (comparison, statistics, lists, workflows), use standard Markdown tables.\n2. Standard format: first row = header (columns separated by |, with leading and trailing |); second row = separator (|---|, same column count); following rows = data.\n3. No Markdown nesting inside cells (no **, *, [], links).\n4. No full-width vertical bars.\n5. Leave one blank line before and after a table.\n6. Outside tables, no Markdown at all (#, *, -, >, --- are forbidden).\n\nVII. OUTPUT FORMAT\n1. Plain text only; no heading markers, no list bullets.\n2. For subheadings use plain-text numbering such as "1.", "1.1", "(1)".\n3. One paragraph per line; separate paragraphs with a single newline; no blank lines between paragraphs.'
-default_files["format_prompt"] = 'I. PAGE SETUP\n1. Paper: A4; top/bottom margins 2.54cm; left/right margins 3.17cm.\n2. Page number: bottom center, 10.5pt.\n\nII. PARAGRAPH FORMAT\n1. First-line indent of 2 characters for body text.\n2. Line spacing 1.5.\n3. 6pt space before and after paragraphs.\n4. Justified alignment for body text.\n\nIII. FONT SPECIFICATIONS\n1. Body: Times New Roman, 12pt.\n2. Heading 1: Bold, 16pt, centered.\n3. Heading 2: Bold, 14pt, left-aligned.\n4. Heading 3: Bold, 12pt, left-aligned.\n5. Table/figure captions: 10.5pt, bold.\n6. One blank line between headings and body text.\n\nIV. TABLE SPECIFICATIONS\n1. Use the three-line (booktabs) style: top rule 1.5pt, bottom rule 1.5pt, header rule 0.75pt.\n2. Table captions centered above the table, e.g., "Table 1-1 Caption Text".\n3. Text inside tables: 10.5pt.\n\nV. FIGURE SPECIFICATIONS\n1. Figure captions centered below the figure, e.g., "Figure 1-1 Caption Text".\n2. Figure width must not exceed the text width.\n3. Keep one blank line between figures and body text.\n\nVI. CHAPTER NUMBERING\n1. Level-1 headings: "Chapter 1" or "1, 2, 3".\n2. Level-2 headings: "1.1, 1.2" or "1.1.1".\n3. The numbering system must be consistent throughout the document; never mix styles.'
-default_files["aigc_rewrite_prompt"] = '[Task]\nRewrite the following academic text in a more human, natural academic style. Remove the mechanical feel of LLM generation. The rewrite must preserve all content.\n\nI. CONTENT FIDELITY (HARD)\n1. Keep all arguments, evidence, data and conclusions. Do not add or remove substantive content.\n2. Keep citation numbers [1][2] exactly as they are.\n3. Do not arbitrarily replace technical terms.\n\nII. SYNTACTIC RESTRUCTURING (HARD)\n1. Use passive constructions liberally (e.g., "The data were validated before..." instead of "We validated the data...").\n2. Nominalize verbs where natural (e.g., "an analysis of X was conducted" instead of "we analyzed X").\n3. Change the core sentence structure. Do not merely swap words while keeping the original skeleton.\n4. Deliberately break neat parallel and symmetrical structures.\n5. Vary sentence length; allow natural pauses, insertions and dashes.\n\nIII. FORBIDDEN EXPRESSIONS (HARD)\nAvoid: in conclusion, in summary, obviously, moreover, additionally, crucially, it goes without saying, it is worth noting that, it is not hard to see that, through the analysis of, with the deepening of, in the context of, plays an important role.\n\nIV. LEXICAL DIVERSITY\n1. Do not express the same concept with identical sentence patterns within one paragraph.\n2. Vary connectors; avoid relying on only one or two types throughout.\n\nV. OUTPUT FORMAT\n1. Plain text only.\n2. No Markdown markers (#, *, -, >, ---).\n3. Exception: if the original contains tables, keep them as standard Markdown tables.\n4. Output only the rewritten text. No prefixes, explanations or commentary.'
-default_files["aigc_detect_prompt"] = '[Task]\nYou are an AIGC text detection expert. Determine whether the following text was generated by AI.\n\nI. OUTPUT REQUIREMENTS (HARD)\n1. Output ONLY one JSON object with this exact format:\n{"ai_probability": integer from 0 to 100, "judgment": "AI generated" or "Human written" or "Likely mixed", "reasons": "reasoning, under 50 words"}\n2. ai_probability: 0-100 integer; higher means more likely AI-generated.\n3. judgment: exactly one of the three specified values.\n4. reasons: concise, 1-2 key pieces of evidence.\n5. Output nothing outside the JSON: no code fences, no explanations, no thinking process, no prefix/suffix text.\n\nII. JUDGMENT CRITERIA (reference)\n1. Are sentences too uniform and heavily parallel?\n2. Is there overuse of template connectors (in conclusion, first/second, moreover)?\n3. Is the expression hollow, lacking concrete evidence?\n4. Is the vocabulary mechanically repetitive?\n\nIII. INPUT\nText to detect: {text}'
+apply_english_prompt_defaults(default_files)
 
 def load_json_file(filename, default_val):
     """安全读取本地 JSON 文件，带损坏回滚机制"""
@@ -584,6 +587,7 @@ def render_global_sidebar():
         "Official channel: QQ Group **1029688024**  \n"
         "For personal learning use only. Resale for profit is prohibited."
     )
+    st.sidebar.caption(f"v{__version__}")
 
     return nav_choice
 
@@ -1905,60 +1909,18 @@ def generate_chart_for_node(node_id, instruction, max_attempts=3):
     return False, f"Failed after multiple attempts: {last_error}"
 
 
-def count_chinese_chars(text):
-    """统计中文字符数（不含空白与标点计数可切换；此处统计所有非空白字符作为篇幅参考）"""
-    if not text:
-        return 0
-    return len(re.sub(r"\s", "", text))
 
 
 def build_chapter_prompt(sandwich, prompts, correction_note=None):
-    """根据三明治与全局提示词构造单章生成 prompt，支持纠偏反馈与文献引用约束"""
-    node_wc = sandwich.get("current_word_count", 0)
-    if node_wc:
-        wc_constraint = f"This chapter's target length: {node_wc} words (match it as closely as possible; a +/-50% deviation is acceptable)."
-    else:
-        wc_constraint = "No target length assigned to this chapter; control the length reasonably according to the global word plan."
-    extra = ""
-    if correction_note:
-        extra = f"\n\n[LENGTH CORRECTION FEEDBACK]\n{correction_note}\nPlease rewrite accordingly and fix the length. Other content may be retained as appropriate."
-
-    # ---- 文献引用约束（防编造数据与结论） ----
-    ref_ids = sandwich.get("current_refs", []) or []
-    ref_lits = get_literatures_by_ids(ref_ids)
-    if ref_lits:
-        ref_lines = []
-        for i, lit in enumerate(ref_lits):
-            title = lit.get("title", "Untitled")
-            findings = str(lit.get("analysis", {}).get("key_findings", ""))[:200]
-            ref_lines.append(f"[{i+1}] {title} - Key findings: {findings}")
-        ref_section = (
-            "\n\n[CITABLE REFERENCES FOR THIS CHAPTER (ONLY the sources listed below; citing any unlisted source is forbidden)]\n"
-            + "\n".join(ref_lines)
-            + "\n\n[CITATION RULES]\n"
-            "1. Every view, datum or conclusion drawn from external literature must be marked with [n] at the end of the sentence, e.g. [1][2].\n"
-            "2. Only cite the references listed above; the numbers must match. Fabricating references, data or conclusions is forbidden.\n"
-            "3. If a datum/conclusion has no supporting reference, either explicitly write [Source: this chapter's experiment/estimate] or omit it. Never fabricate."
-        )
-    else:
-        ref_section = "\n\n[NO REFERENCES BOUND TO THIS CHAPTER] Fabricating any citation is forbidden. When mentioning others' views or data, state the source truthfully or note that it cannot be verified."
-
-    # 注入文章生成风格提示词（若未配置则用默认学术风格）
-    style_prompt = prompts.get("style_prompt", "") or "Academically rigorous, objective, logically clear, and precise in wording."
-    # 硬性排版约束：普通文本禁止 markdown，但表格允许并强制标准格式（装配层可转换为 Word 表格）
-    format_rule = (
-        "\n\n[HARD FORMATTING REQUIREMENTS]\n"
-        "1. Body paragraphs must be plain text. No Markdown at all (#, ##, ### headings, **bold**, *italics*, - lists, > quotes, --- rules).\n"
-        "2. For subheadings use plain-text numbering such as \"1.\", \"1.1\", \"(1)\" without symbolic decoration.\n"
-        "3. One paragraph per line; separate paragraphs with a single newline; no blank lines.\n"
-        "4. If the text really needs a table (comparison, statistics, checklist, workflow), use standard Markdown table format: first row = header (columns separated by |, with leading and trailing |), second row = |---| separator (same column count), then data rows; no Markdown nesting inside cells; no full-width vertical bars.\n"
-        "5. Leave one blank line before and after tables.\n"
-        "6. Overall style must follow: {style_prompt}"
+    """Build the English chapter prompt with its bound reference metadata."""
+    reference_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
+    return assemble_chapter_prompt(
+        sandwich,
+        prompts,
+        reference_literatures,
+        locale="en",
+        correction_note=correction_note,
     )
-    return f"""Global research topic: {sandwich['global_topic']}
-Target total length: {sandwich['target_word_count']} words
-Current chapter: {sandwich['current_title']} (content constraints: {sandwich['current_desc']})
-{wc_constraint}{ref_section}{format_rule}{extra}"""
 
 
 def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, tolerance=0.5):
@@ -1971,7 +1933,7 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
         last_res = res
         if target <= 0:
             return res, None  # 未分配字数，不纠偏
-        actual = count_chinese_chars(res)
+        actual = count_english_words(res)
         deviation = abs(actual - target) / target
         if deviation <= tolerance:
             return res, {"attempts": attempt + 1, "actual": actual, "target": target, "deviation": deviation}
@@ -1979,7 +1941,7 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
             f"The previous round produced about {actual} words; target is {target} words. Deviation {deviation:.0%} exceeds the allowed range ({tolerance:.0%})."
             f"This is rewrite {attempt + 1}/{max_attempts}. Adjust the length: if too short, add argumentation and detail; if too long, trim redundancy."
         )
-    return last_res, {"attempts": max_attempts, "actual": count_chinese_chars(last_res), "target": target, "deviation": abs(count_chinese_chars(last_res) - target) / target if target else None}
+    return last_res, {"attempts": max_attempts, "actual": count_english_words(last_res), "target": target, "deviation": abs(count_english_words(last_res) - target) / target if target else None}
 
 
 def compress_memory(text):
@@ -1995,14 +1957,14 @@ def compress_memory(text):
     res = dispatch_llm_call(prompt, max_tokens=500).strip().strip('"').strip("“”").strip()
     # 净化思考痕迹与提示词残渣（推理型模型可能把压缩指令本身混进输出）
     res = purge_thinking_text(res)
-    # 长度校验：目标150-200字，宽容到120-280，不合格自动重试一次
-    if not (120 <= len(res) <= 280):
+    # Length validation: target 150-200 words; tolerate 120-280 before one retry.
+    if not (120 <= count_english_words(res) <= 280):
         retry = dispatch_llm_call(
-            f"The previous compression did not meet the length requirement (currently about {len(res)} characters). Please re-output, strictly 150-200 words, only the memory text itself:\n{text[:3000]}",
+            f"The previous compression did not meet the length requirement (currently about {count_english_words(res)} words). Please re-output, strictly 150-200 words, only the memory text itself:\n{text[:3000]}",
             max_tokens=500
         ).strip().strip('"').strip("“”").strip()
         retry = purge_thinking_text(retry)
-        if 120 <= len(retry) <= 280:
+        if 120 <= count_english_words(retry) <= 280:
             return retry
         return res if res else retry
     return res
@@ -2093,7 +2055,7 @@ def render_single_chapter_editor(tree):
             if st.button("💾 Save Manually & Distill Memory", key=f"save_{sel_id}"):
                 drafts[sel_id] = new_text
                 save_json_file("drafts.json", drafts)
-                with st.spinner("Compressing chapter memory (150-200 chars)..."):
+                with st.spinner("Compressing chapter memory (150-200 words)..."):
                     sum_res = compress_memory(new_text)
                     ds = load_json_file("drafts_summary.json", {})
                     ds[sel_id] = sum_res
@@ -2120,7 +2082,7 @@ def render_single_chapter_editor(tree):
                         if wc_info:
                             st.success(f"Chapter generated! Actual {wc_info['actual']} words / target {wc_info['target']} words (corrected {wc_info['attempts']}x), memory {len(sum_res)} chars")
                         else:
-                            actual = count_chinese_chars(res)
+                            actual = count_english_words(res)
                             st.success(f"Chapter generated! Actual {actual} words (no target assigned), memory {len(sum_res)} chars")
                         st.rerun()
 
@@ -2317,7 +2279,7 @@ def render_batch_workbench():
                     if wc_info:
                         results_note.append(f"{node.get('title','')}: {wc_info['actual']} words / target {wc_info['target']} (corrected {wc_info['attempts']}x)")
                     else:
-                        results_note.append(f"{node.get('title','')}: {count_chinese_chars(res)} chars (no target)")
+                        results_note.append(f"{node.get('title','')}: {count_english_words(res)} words (no target)")
                     progress_bar.progress((k + 1) / len(leaf_ids))
                 msg = f"✅ All {len(leaf_ids)} leaf chapters generated!\n" + "\n".join(results_note)
                 if skipped:
@@ -2445,10 +2407,10 @@ def _scan_structure_issues(tree, drafts, target_wc):
         wc = node.get("word_count", 0) or 0
         text = drafts.get(nid, "")
         if wc > 0 and text:
-            actual = count_chinese_chars(text)
+            actual = count_english_words(text)
             dev = abs(actual - wc) / wc
             if dev > 0.5:
-                issues.append({"level": "🟡", "where": f"{title}", "problem": f"Draft {actual} chars vs planned {wc} chars; deviation {dev:.0%} (beyond +/-50% tolerance)"})
+                issues.append({"level": "🟡", "where": f"{title}", "problem": f"Draft {actual} words vs planned {wc} words; deviation {dev:.0%} (beyond +/-50% tolerance)"})
     # 7) 孤章节：叶子节点既无文献引用又无图表指令又无图片建议
     for nid, title, depth, node in leaf_ids:
         refs = node.get("references") or []

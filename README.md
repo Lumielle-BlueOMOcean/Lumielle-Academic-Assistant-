@@ -7,16 +7,18 @@
 
 A Streamlit-based local academic paper writing assistant: logic outline generation, chapter writing, AIGC detection & de-smelling, and final Word export.
 
+**Current development version / 当前开发版本：v1.0.1 (Unreleased / 未发布)**
+
 ---
 
 ## 📦 版本下载 / Downloads
 
 | 版本 Version | 语言 Language | 平台 Platform | 目录 Folder |
 |---|---|---|---|
-| v1.0 | 🇨🇳 中文 | macOS | `微光v1.0_中文版_MacOS/` |
-| v1.0 | 🇨🇳 中文 | Windows | `微光v1.0_中文版_Windows/` |
-| v1.0 | 🇬🇧 English | macOS | `微光v1.0_英文版_MacOS/` |
-| v1.0 | 🇬🇧 English | Windows | `微光v1.0_英文版_Windows/` |
+| v1.0.0 | 🇨🇳 中文 | macOS | `微光v1.0_中文版_MacOS/` |
+| v1.0.0 | 🇨🇳 中文 | Windows | `微光v1.0_中文版_Windows/` |
+| v1.0.0 | 🇬🇧 English | macOS | `微光v1.0_英文版_MacOS/` |
+| v1.0.0 | 🇬🇧 English | Windows | `微光v1.0_英文版_Windows/` |
 
 选择对应平台的文件夹，解压后双击启动脚本即可使用。
 
@@ -93,6 +95,28 @@ This design lets the AI focus on writing **one chapter at a time**, while the to
 
 - **macOS**: 内置 Python 3.12 运行时（arm64），无需手动安装 Python；Intel 芯片会自动下载匹配版本。Bundled Python 3.12 (arm64); Intel Macs auto-download a matching build.
 - **Windows**: 内置嵌入式 Python + 离线依赖包，首次安装无需联网。Bundled embedded Python + offline wheels; first install needs no internet.
+
+## Changelog / 更新日志
+
+### v1.0.1 — Unreleased
+
+#### Fixed / 修复
+
+- Chapter-generation prompts now include the global outline, upstream context, and downstream written content or boundaries.
+- Custom writing-style prompts are interpolated into chapter-generation prompts.
+- English chapter word counts now count word tokens, including generation correction, UI results, batch results, and structure review.
+- English default prompts now initialize under `prompts.json`.
+
+#### Changed / 变更
+
+- Added `version.py` as the canonical SemVer version source and display the version in both app sidebars.
+- Added focused `unittest` coverage and a Python 3.12 GitHub Actions CI workflow.
+
+### v1.0.0 — 2026-08-26
+
+#### Added / 新增
+
+- Initial published release with Chinese and English packages for macOS and Windows.
 
 ## 📄 开源许可 / License
 
