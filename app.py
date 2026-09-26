@@ -16,6 +16,7 @@ Lumielle Academic Assistant —— 学术论文写作助手
 
 import streamlit as st
 from version import __version__
+from document_support import is_document_parse_error, parse_document_in_chunks
 from chart_support import chart_result_message, generate_chart_image
 from writing_support import (
     LLMOutputError,
@@ -1025,74 +1026,40 @@ def _log_parse_failure(doc_text, res):
 
 
 def ai_parse_doc_to_modules(doc_text, section_desc):
-    """把导入文档交给 LLM 解析为模块化文本/表格结构。
-    v4flash 偶发输出中文键名/嵌套结构/思考草稿，本函数通过：
-    1) 中文键名归一化 + 嵌套结构提取
-    2) 失败自动重试（更严格提示词）
-    3) 失败记录原始返回到 parse_fail_log.json
-    来保证解析稳定性。"""
-    prompt = (
-        "You are a structured parser for the research foundation. Parse the following document into a modular structure for the researcher to reference and edit later.\n"
-        f"Document purpose: {section_desc}\n"
-        "Output ONLY a JSON array. Each element has the format:\n"
-        '{"title": "module title", "type": "text or table", '
-        '"content": "text content (only when type=text)", '
-        '"columns": ["col1","col2",...] (only when type=table), '
-        '"data": [["r1c1","r1c2"],...] (only when type=table)}\n'
-        "Parse tabular data as type=table; everything else as type=text.\n"
-        "Output only the pure JSON array; no Markdown fences; no explanation.\n"
-        "Output the complete content; never truncate, omit or use ellipses.\n"
-        "Document content:\n" + doc_text[:6000]
+    """Parse every document chunk, returning modules only after atomic success."""
+    def normalize_modules(parsed_modules):
+        cleaned = []
+        for module in parsed_modules:
+            if not isinstance(module, dict):
+                continue
+            module_type = str(module.get("type", "text")).strip().lower()
+            if module_type == "table":
+                data = module.get("data") or [[]]
+                if not isinstance(data, list) or not data:
+                    data = [[]]
+                columns = module.get("columns") or [f"Col {i + 1}" for i in range(len(data[0]))]
+                cleaned.append({
+                    "id": str(uuid.uuid4()), "type": "table",
+                    "title": str(module.get("title", "Table module")),
+                    "columns": [str(column) for column in columns], "data": data,
+                })
+            else:
+                cleaned.append({
+                    "id": str(uuid.uuid4()), "type": "text",
+                    "title": str(module.get("title", "Text module")),
+                    "content": str(module.get("content", "")),
+                })
+        return cleaned
+
+    return parse_document_in_chunks(
+        doc_text,
+        section_desc,
+        dispatch_llm_call,
+        parse_response=_extract_json_array,
+        normalize_modules=normalize_modules,
+        locale="en",
+        on_parse_failure=_log_parse_failure,
     )
-    # max_tokens 必须给足：v4flash 是推理模型，思考过程会占用大量输出预算，
-    # 4000 不够会导致正文 JSON 被硬截断（日志中多次出现 llm_res_len 为 0/29/34/截断JSON）。
-    # 按文档长度动态分配，确保思考+完整 JSON 都能装下。
-    out_tokens = max(8000, int(len(doc_text) * 2.5) + 3000)
-    res = dispatch_llm_call(prompt, system_prompt="You are a rigorous structured parser. Output only JSON.", max_tokens=out_tokens)
-    # LLM 调用层面报错时直接透传，让上层显示真实原因
-    if res.startswith("API key missing") or res.startswith("API call failed repeatedly") or res.startswith("OpenAI client initialization error") or res.startswith("未配置"):
-        return {"llm_error": res}
-    modules = _extract_json_array(res)
-
-    # 第一次失败：换更严格的提示词自动重试一次
-    if not modules:
-        retry_prompt = (
-            "Rewrite the following document content as a JSON array.\n"
-            "Each element must be an object with exactly these four keys: title (string), "
-            "type (only \"text\" or \"table\"), content (text content, filled when type=text), "
-            "data (2D array, filled when type=table).\n"
-            "Output nothing else: no text, no comments, no explanation, no Markdown fences.\n"
-            "Document:\n" + doc_text[:5000]
-        )
-        res2 = dispatch_llm_call(retry_prompt, system_prompt="Output only a valid JSON array.", max_tokens=out_tokens, temp=0.3)
-        if res2 and not res2.startswith("API"):
-            modules = _extract_json_array(res2)
-
-    if not modules:
-        _log_parse_failure(doc_text, res)
-        return []
-    cleaned = []
-    for m in modules:
-        if not isinstance(m, dict):
-            continue
-        mtype = str(m.get("type", "text")).strip().lower()
-        if mtype == "table":
-            data = m.get("data") or [[]]
-            if not isinstance(data, list) or not data:
-                data = [[]]
-            cols = m.get("columns") or [f"Col {i+1}" for i in range(len(data[0]))]
-            cleaned.append({
-                "id": str(uuid.uuid4()), "type": "table",
-                "title": str(m.get("title", "Table module")),
-                "columns": [str(c) for c in cols], "data": data
-            })
-        else:
-            cleaned.append({
-                "id": str(uuid.uuid4()), "type": "text",
-                "title": str(m.get("title", "Text module")),
-                "content": str(m.get("content", ""))
-            })
-    return cleaned
 
 
 def get_research_context_text():
@@ -1151,33 +1118,25 @@ def render_research_section(section_key, section_title, section_desc):
         up_doc = st.file_uploader(f"Upload document (auto-parse into {section_title} modules)", type=["pdf", "docx", "txt"], key=f"up_{section_key}")
         if up_doc:
             if st.button("🔍 Parse & Generate Modules", key=f"parse_{section_key}"):
-                with st.spinner("AI is parsing the document structure..."):
+                with st.spinner("AI is parsing the complete document..."):
                     doc_text = parse_uploaded_doc_to_text(up_doc)
-                    if doc_text.startswith("解析失败"):
+                    if is_document_parse_error(doc_text):
                         st.error(doc_text)
-                    elif len(doc_text.strip()) < 50:
-                        st.warning("Document content is too short (extraction may be incomplete). Trying to parse anyway...")
-                        new_modules = ai_parse_doc_to_modules(doc_text, section_desc)
-                        if isinstance(new_modules, dict) and "llm_error" in new_modules:
-                            st.error(f"LLM call failed: {new_modules['llm_error']}")
-                        elif new_modules:
-                            modules.extend(new_modules)
-                            save_json_file("research_base.json", rb)
-                            st.success(f"Parsing complete, added {len(new_modules)} modules!")
-                            st.rerun()
-                        else:
-                            st.error("Failed to parse valid modules from the document (content too short). Word or plain-text files are recommended.")
                     else:
-                        new_modules = ai_parse_doc_to_modules(doc_text, section_desc)
-                        if isinstance(new_modules, dict) and "llm_error" in new_modules:
-                            st.error(f"LLM call failed: {new_modules['llm_error']}")
-                        elif new_modules:
+                        if len(doc_text.strip()) < 50:
+                            st.warning("Document content is very short; attempting to parse the available text...")
+                        parse_result = ai_parse_doc_to_modules(doc_text, section_desc)
+                        if parse_result["status"] == "ok":
+                            new_modules = parse_result["modules"]
                             modules.extend(new_modules)
                             save_json_file("research_base.json", rb)
-                            st.success(f"Parsing complete, added {len(new_modules)} modules!")
+                            if parse_result["chunks_total"] > 1:
+                                st.success(f"Parsing complete. The full document was processed in {parse_result['chunks_total']} parts and {len(new_modules)} modules were added.")
+                            else:
+                                st.success(f"Parsing complete, added {len(new_modules)} modules!")
                             st.rerun()
                         else:
-                            st.error("Failed to parse valid modules. Test the LLM configuration in Module 1 first to confirm the API Key and model work.")
+                            st.error(parse_result["message"])
 
     st.markdown("---")
     # ---- 已有模块渲染 ----
@@ -1314,7 +1273,7 @@ def module3_literature():
             for i, uf in enumerate(up_files):
                 with st.spinner(f"Parsing \"{uf.name}\"..."):
                     text = parse_uploaded_doc_to_text(uf)
-                    if text.startswith("解析失败"):
+                    if is_document_parse_error(text):
                         st.warning(f"{uf.name}: {text}")
                         bar.progress((i + 1) / len(up_files))
                         continue

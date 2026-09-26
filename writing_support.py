@@ -13,6 +13,11 @@ _LLM_FAILURE_MARKERS = (
     "openai client initialization error",
     "no llm configured",
     "no valid llm configuration found",
+    "api 密钥缺失",
+    "api 连续调用失败",
+    "openai 客户端构造异常",
+    "未配置任何 llm",
+    "未找到有效的 llm 配置",
 )
 
 

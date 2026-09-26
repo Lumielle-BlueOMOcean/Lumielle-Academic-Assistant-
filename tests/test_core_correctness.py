@@ -215,6 +215,11 @@ class CoreCorrectnessTests(unittest.TestCase):
             "OpenAI client initialization error: bad config",
             "No LLM configured. Please add one.",
             "No valid LLM configuration found.",
+            "API 密钥缺失，请在基础配置中补全。",
+            "API 连续调用失败: timeout",
+            "OpenAI 客户端构造异常: invalid URL",
+            "未配置任何 LLM，请先添加。",
+            "未找到有效的 LLM 配置。",
         ):
             with self.subTest(failure=failure):
                 self.assertTrue(support.get_llm_failure_reason(failure))
@@ -235,6 +240,178 @@ class CoreCorrectnessTests(unittest.TestCase):
             support.record_generated_draft(drafts, snapshots, "chapter", "", ["new-reference"])
         self.assertEqual(drafts, {"chapter": "Old body"})
         self.assertEqual(snapshots, {"chapter": ["old-reference"]})
+
+
+class DocumentSupportTests(unittest.TestCase):
+    def setUp(self):
+        self.support = load_project_module(self, "document_support")
+
+    def test_chunks_cover_long_document_without_loss_or_overlap(self):
+        source = ("Paragraph one.\n\n" + "x" * 6200 + "\n\nParagraph three.\n") * 2
+        chunks = self.support.chunk_document_text(source, max_chars=5500)
+
+        self.assertGreater(len(chunks), 2)
+        self.assertEqual("".join(chunks), source)
+        self.assertTrue(all(0 < len(chunk) <= 5500 for chunk in chunks))
+
+    def test_short_and_empty_documents_have_predictable_chunks(self):
+        self.assertEqual(self.support.chunk_document_text("short text"), ["short text"])
+        self.assertEqual(self.support.chunk_document_text(""), [])
+        whitespace = "  \n\t"
+        self.assertEqual("".join(self.support.chunk_document_text(whitespace)), whitespace)
+
+    def test_parse_error_detection_covers_both_locales(self):
+        for error in (
+            "Parse failed: unreadable file",
+            "  Parse failed: scanned PDF",
+            "解析失败: 文件无法读取",
+        ):
+            with self.subTest(error=error):
+                self.assertTrue(self.support.is_document_parse_error(error))
+        self.assertFalse(self.support.is_document_parse_error("The paper starts with Parse failed as a phrase."))
+        self.assertFalse(self.support.is_document_parse_error("正常提取的研究内容"))
+
+    def test_all_chunks_reach_llm_in_order_and_last_sentinel_is_not_truncated(self):
+        source = "A" * 6100 + "\n\nMIDDLE_SENTINEL\n\n" + "B" * 6100 + "\n\nEND_SENTINEL_456"
+        prompts = []
+
+        def llm_call(prompt, **kwargs):
+            prompts.append((prompt, kwargs))
+            part = re.search(r"DOCUMENT PART (\d+)/(\d+)", prompt)
+            self.assertIsNotNone(part)
+            return json.dumps([{"title": f"Part {part.group(1)}", "content": f"body-{part.group(1)}"}])
+
+        result = self.support.parse_document_in_chunks(
+            source,
+            "research content",
+            llm_call,
+            parse_response=json.loads,
+            normalize_modules=lambda values: values,
+            locale="en",
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["chunks_total"], 3)
+        self.assertEqual([module["title"] for module in result["modules"]], [f"Part {i}" for i in range(1, 4)])
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("END_SENTINEL_456", prompts[-1][0])
+        self.assertTrue(all(call[1]["max_tokens"] <= 8000 for call in prompts))
+
+    def test_chinese_prompt_identifies_part_and_forbids_inference(self):
+        prompts = []
+
+        def llm_call(prompt, **kwargs):
+            prompts.append(prompt)
+            return '[{"title":"研究要求","content":"只包含本块内容"}]'
+
+        result = self.support.parse_document_in_chunks(
+            "中文文档末尾内容",
+            "研究要求",
+            llm_call,
+            parse_response=json.loads,
+            normalize_modules=lambda values: values,
+            locale="zh",
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["modules"][0]["title"], "研究要求")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("DOCUMENT PART 1/1", prompts[0])
+        self.assertIn("不得推断", prompts[0])
+        self.assertIn("中文文档末尾内容", prompts[0])
+
+    def test_retries_only_the_failed_chunk_once_and_preserves_module_order(self):
+        source = "A" * 5500 + "\n\n" + "B" * 5500 + "\n\n" + "C" * 100
+        calls = []
+        prompts = []
+        attempts_by_part = {}
+
+        def llm_call(prompt, **kwargs):
+            part = int(re.search(r"DOCUMENT PART (\d+)/(\d+)", prompt).group(1))
+            calls.append(part)
+            prompts.append(prompt)
+            attempts_by_part[part] = attempts_by_part.get(part, 0) + 1
+            if part == 2 and attempts_by_part[part] == 1:
+                return "not json"
+            return json.dumps([{"title": f"Part {part}", "content": str(part)}])
+
+        result = self.support.parse_document_in_chunks(
+            source,
+            "background",
+            llm_call,
+            parse_response=json.loads,
+            normalize_modules=lambda values: values,
+            locale="en",
+        )
+
+        self.assertEqual(calls, [1, 2, 2, 3])
+        self.assertEqual(prompts[1], prompts[2].replace("Your previous response was not a valid non-empty module JSON array. Correct it and output only valid JSON.\n", ""))
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual([module["title"] for module in result["modules"]], ["Part 1", "Part 2", "Part 3"])
+
+    def test_exhausted_chunk_failure_returns_no_partial_modules(self):
+        source = "A" * 5500 + "\n\n" + "B" * 5500 + "\n\n" + "C" * 100
+        calls = []
+        logged_failures = []
+
+        def llm_call(prompt, **kwargs):
+            part = int(re.search(r"DOCUMENT PART (\d+)/(\d+)", prompt).group(1))
+            calls.append(part)
+            return json.dumps([{"title": "first"}]) if part == 1 else "not json"
+
+        result = self.support.parse_document_in_chunks(
+            source,
+            "requirements",
+            llm_call,
+            parse_response=lambda raw: json.loads(raw) if raw.startswith("[") else None,
+            normalize_modules=lambda values: values,
+            on_parse_failure=lambda chunk, response: logged_failures.append((chunk, response)),
+            locale="en",
+        )
+
+        self.assertEqual(calls, [1, 2, 2])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["modules"], [])
+        self.assertEqual(result["error_type"], "parse")
+        self.assertIn("no partial content was imported", result["message"])
+        self.assertEqual(len(logged_failures), 1)
+        self.assertTrue(logged_failures[0][0].lstrip().startswith("B"))
+
+    def test_llm_failure_returns_no_partial_modules_and_does_not_retry(self):
+        source = "A" * 5500 + "\n\n" + "B" * 100
+        calls = []
+
+        def llm_call(prompt, **kwargs):
+            part = int(re.search(r"DOCUMENT PART (\d+)/(\d+)", prompt).group(1))
+            calls.append(part)
+            if part == 1:
+                return json.dumps([{"title": "first"}])
+            return "API call failed repeatedly: timeout"
+
+        result = self.support.parse_document_in_chunks(
+            source,
+            "requirements",
+            llm_call,
+            parse_response=json.loads,
+            normalize_modules=lambda values: values,
+            locale="en",
+        )
+
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["modules"], [])
+        self.assertEqual(result["error_type"], "llm")
+        self.assertIn("no partial content was imported", result["message"])
+
+    def test_applications_delegate_full_document_and_use_shared_parse_error_check(self):
+        for app_name in ("app.py", "app_zh.py"):
+            source = (ROOT / app_name).read_text(encoding="utf-8")
+            with self.subTest(app=app_name):
+                self.assertIn("parse_document_in_chunks(", source)
+                self.assertIn('parse_result["status"] == "ok"', source)
+                self.assertGreaterEqual(source.count("is_document_parse_error("), 2)
+                self.assertNotIn("doc_text[:6000]", source)
+                self.assertNotIn("doc_text[:5000]", source)
 
 
 class ChartSupportTests(unittest.TestCase):

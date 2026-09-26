@@ -14,6 +14,7 @@ Lumielle Academic Assistant —— 学术论文写作助手
 
 import streamlit as st
 from version import __version__
+from document_support import is_document_parse_error, parse_document_in_chunks
 from chart_support import chart_result_message, generate_chart_image
 from writing_support import (
     LLMOutputError,
@@ -1019,74 +1020,40 @@ def _log_parse_failure(doc_text, res):
 
 
 def ai_parse_doc_to_modules(doc_text, section_desc):
-    """把导入文档交给 LLM 解析为模块化文本/表格结构。
-    v4flash 偶发输出中文键名/嵌套结构/思考草稿，本函数通过：
-    1) 中文键名归一化 + 嵌套结构提取
-    2) 失败自动重试（更严格提示词）
-    3) 失败记录原始返回到 parse_fail_log.json
-    来保证解析稳定性。"""
-    prompt = (
-        "你是科研基座结构化解析器。请将以下文档内容解析为模块化结构，便于研究者后续引用与编辑。\n"
-        f"文档用途：{section_desc}\n"
-        "严格输出 JSON 数组，每个元素格式为：\n"
-        '{"title": "模块标题", "type": "text 或 table", '
-        '"content": "文本内容(仅 type=text 时填写)", '
-        '"columns": ["列1","列2",...](仅 type=table 时填写), '
-        '"data": [["行1列1","行1列2"],...](仅 type=table 时填写)}\n'
-        "若文档含表格数据请解析为 table 类型，其余为 text 类型。\n"
-        "只输出纯 JSON 数组，禁止 Markdown 代码块，禁止任何解释。\n"
-        "必须输出完整内容，禁止截断、省略或用省略号。\n"
-        "文档内容：\n" + doc_text[:6000]
+    """按顺序解析全部文档分块，只有整体成功后才返回模块。"""
+    def normalize_modules(parsed_modules):
+        cleaned = []
+        for module in parsed_modules:
+            if not isinstance(module, dict):
+                continue
+            module_type = str(module.get("type", "text")).strip().lower()
+            if module_type == "table":
+                data = module.get("data") or [[]]
+                if not isinstance(data, list) or not data:
+                    data = [[]]
+                columns = module.get("columns") or [f"列{i + 1}" for i in range(len(data[0]))]
+                cleaned.append({
+                    "id": str(uuid.uuid4()), "type": "table",
+                    "title": str(module.get("title", "表格模块")),
+                    "columns": [str(column) for column in columns], "data": data,
+                })
+            else:
+                cleaned.append({
+                    "id": str(uuid.uuid4()), "type": "text",
+                    "title": str(module.get("title", "文本模块")),
+                    "content": str(module.get("content", "")),
+                })
+        return cleaned
+
+    return parse_document_in_chunks(
+        doc_text,
+        section_desc,
+        dispatch_llm_call,
+        parse_response=_extract_json_array,
+        normalize_modules=normalize_modules,
+        locale="zh",
+        on_parse_failure=_log_parse_failure,
     )
-    # max_tokens 必须给足：v4flash 是推理模型，思考过程会占用大量输出预算，
-    # 4000 不够会导致正文 JSON 被硬截断（日志中多次出现 llm_res_len 为 0/29/34/截断JSON）。
-    # 按文档长度动态分配，确保思考+完整 JSON 都能装下。
-    out_tokens = max(8000, int(len(doc_text) * 2.5) + 3000)
-    res = dispatch_llm_call(prompt, system_prompt="你是一个严谨的结构化解析器，只输出 JSON。", max_tokens=out_tokens)
-    # LLM 调用层面报错时直接透传，让上层显示真实原因
-    if res.startswith("API 密钥缺失") or res.startswith("API 连续调用失败") or res.startswith("OpenAI 客户端构造异常") or res.startswith("未配置"):
-        return {"llm_error": res}
-    modules = _extract_json_array(res)
-
-    # 第一次失败：换更严格的提示词自动重试一次
-    if not modules:
-        retry_prompt = (
-            "把下面文档的内容改写成 JSON 数组。\n"
-            "数组的每个元素必须是对象，只允许这四个键：title(字符串标题)、"
-            "type(只能是 text 或 table)、content(文本内容，type=text 时填)、"
-            "data(二维数组，type=table 时填)。\n"
-            "不要输出其他任何文字、注释或解释，不要用 Markdown 代码块。\n"
-            "文档：\n" + doc_text[:5000]
-        )
-        res2 = dispatch_llm_call(retry_prompt, system_prompt="只输出合法 JSON 数组。", max_tokens=out_tokens, temp=0.3)
-        if res2 and not res2.startswith("API"):
-            modules = _extract_json_array(res2)
-
-    if not modules:
-        _log_parse_failure(doc_text, res)
-        return []
-    cleaned = []
-    for m in modules:
-        if not isinstance(m, dict):
-            continue
-        mtype = str(m.get("type", "text")).strip().lower()
-        if mtype == "table":
-            data = m.get("data") or [[]]
-            if not isinstance(data, list) or not data:
-                data = [[]]
-            cols = m.get("columns") or [f"列{i+1}" for i in range(len(data[0]))]
-            cleaned.append({
-                "id": str(uuid.uuid4()), "type": "table",
-                "title": str(m.get("title", "表格模块")),
-                "columns": [str(c) for c in cols], "data": data
-            })
-        else:
-            cleaned.append({
-                "id": str(uuid.uuid4()), "type": "text",
-                "title": str(m.get("title", "文本模块")),
-                "content": str(m.get("content", ""))
-            })
-    return cleaned
 
 
 def get_research_context_text():
@@ -1145,33 +1112,25 @@ def render_research_section(section_key, section_title, section_desc):
         up_doc = st.file_uploader(f"上传文档（自动解析为{section_title}模块）", type=["pdf", "docx", "txt"], key=f"up_{section_key}")
         if up_doc:
             if st.button("🔍 解析并生成模块", key=f"parse_{section_key}"):
-                with st.spinner("AI 正在解析文档结构..."):
+                with st.spinner("AI 正在完整解析文档..."):
                     doc_text = parse_uploaded_doc_to_text(up_doc)
-                    if doc_text.startswith("解析失败"):
+                    if is_document_parse_error(doc_text):
                         st.error(doc_text)
-                    elif len(doc_text.strip()) < 50:
-                        st.warning("文档内容过短（可能提取不完整），请检查文档是否正常。尝试解析中...")
-                        new_modules = ai_parse_doc_to_modules(doc_text, section_desc)
-                        if isinstance(new_modules, dict) and "llm_error" in new_modules:
-                            st.error(f"LLM 调用失败：{new_modules['llm_error']}")
-                        elif new_modules:
-                            modules.extend(new_modules)
-                            save_json_file("research_base.json", rb)
-                            st.success(f"解析完成，新增 {len(new_modules)} 个模块！")
-                            st.rerun()
-                        else:
-                            st.error("未能从文档中解析出有效模块（文档内容过短）。建议使用 Word 或文本文件。")
                     else:
-                        new_modules = ai_parse_doc_to_modules(doc_text, section_desc)
-                        if isinstance(new_modules, dict) and "llm_error" in new_modules:
-                            st.error(f"LLM 调用失败：{new_modules['llm_error']}")
-                        elif new_modules:
+                        if len(doc_text.strip()) < 50:
+                            st.warning("文档内容较短，将尝试解析已提取的文字。")
+                        parse_result = ai_parse_doc_to_modules(doc_text, section_desc)
+                        if parse_result["status"] == "ok":
+                            new_modules = parse_result["modules"]
                             modules.extend(new_modules)
                             save_json_file("research_base.json", rb)
-                            st.success(f"解析完成，新增 {len(new_modules)} 个模块！")
+                            if parse_result["chunks_total"] > 1:
+                                st.success(f"完整文档已按顺序解析为 {parse_result['chunks_total']} 个部分，新增 {len(new_modules)} 个模块。")
+                            else:
+                                st.success(f"解析完成，新增 {len(new_modules)} 个模块！")
                             st.rerun()
                         else:
-                            st.error("未能从文档中解析出有效模块。可先在板块一测试 LLM 配置，确认 API Key 与模型是否可用。")
+                            st.error(parse_result["message"])
 
     st.markdown("---")
     # ---- 已有模块渲染 ----
@@ -1308,7 +1267,7 @@ def module3_literature():
             for i, uf in enumerate(up_files):
                 with st.spinner(f"解析《{uf.name}》..."):
                     text = parse_uploaded_doc_to_text(uf)
-                    if text.startswith("解析失败"):
+                    if is_document_parse_error(text):
                         st.warning(f"{uf.name}: {text}")
                         bar.progress((i + 1) / len(up_files))
                         continue
