@@ -108,21 +108,28 @@ default_files = {
     }
 }
 
+UNREADABLE_JSON_FILES = set()
+
+
 def load_json_file(filename, default_val):
-    """安全读取本地 JSON 文件，带损坏回滚机制"""
+    """读取本地 JSON；初始化缺失文件并保留无法读取的现有文件。"""
     path = os.path.join(DATA_DIR, filename)
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception:
-            pass
+            UNREADABLE_JSON_FILES.add(filename)
+            return default_val
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(default_val, f, ensure_ascii=False, indent=2)
     return default_val
 
 def save_json_file(filename, data):
     """安全写入本地 JSON 文件"""
+    if filename in UNREADABLE_JSON_FILES:
+        st.error(f"无法读取“{filename}”；为保护数据，已保留原文件并禁用对该文件的保存。")
+        return False
     path = os.path.join(DATA_DIR, filename)
     try:
         with open(path, 'w', encoding='utf-8') as f:
@@ -559,6 +566,11 @@ def render_global_sidebar():
 
     # ================= 全局数据管理（清除） =================
     st.sidebar.markdown("---")
+    for filename in sorted(UNREADABLE_JSON_FILES):
+        st.sidebar.warning(
+            f"现有文件“{filename}”无法读取。原文件已保留，为保护其中的数据，当前已禁用对此文件的保存。"
+        )
+
     with st.sidebar.expander("🗑️ 数据管理（全局清除）", expanded=False):
         st.caption("选择性清除或清空项目数据（不可恢复，请谨慎操作）")
         clear_map = {

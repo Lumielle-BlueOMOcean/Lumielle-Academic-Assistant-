@@ -2,6 +2,7 @@ import ast
 import io
 import importlib.util
 import json
+import os
 import re
 import struct
 import tempfile
@@ -77,6 +78,38 @@ class CoreCorrectnessTests(unittest.TestCase):
         app_source = (ROOT / "app.py").read_text(encoding="utf-8")
         self.assertIn("apply_english_prompt_defaults(default_files)", app_source)
         self.assertIsNone(re.search(r'default_files\["(?:style_prompt|format_prompt|aigc_rewrite_prompt|aigc_detect_prompt)"\]', app_source))
+
+    def test_corrupt_user_json_is_preserved_and_subsequent_saves_are_blocked(self):
+        class ErrorUI:
+            def __init__(self):
+                self.errors = []
+
+            def error(self, message):
+                self.errors.append(message)
+
+        for app_name in ("app.py", "app_zh.py"):
+            with self.subTest(app=app_name), tempfile.TemporaryDirectory() as data_dir:
+                filename = "logic_tree.json"
+                original_bytes = b'{"title":"KEEP_USER_DATA_SENTINEL",'
+                target = Path(data_dir) / filename
+                target.write_bytes(original_bytes)
+                ui = ErrorUI()
+                namespace = {
+                    "os": os,
+                    "json": json,
+                    "DATA_DIR": data_dir,
+                    "UNREADABLE_JSON_FILES": set(),
+                    "st": ui,
+                }
+                load_json_file = load_app_function(self, app_name, "load_json_file", namespace)
+                save_json_file = load_app_function(self, app_name, "save_json_file", namespace)
+
+                self.assertEqual(load_json_file(filename, []), [])
+                self.assertEqual(target.read_bytes(), original_bytes)
+                self.assertIn(filename, namespace["UNREADABLE_JSON_FILES"])
+                self.assertFalse(save_json_file(filename, []))
+                self.assertEqual(target.read_bytes(), original_bytes)
+                self.assertTrue(ui.errors)
 
     def test_context_layers_are_in_chapter_prompts_in_both_locales(self):
         support = load_project_module(self, "writing_support")

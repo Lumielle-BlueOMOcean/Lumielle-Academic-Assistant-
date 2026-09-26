@@ -114,21 +114,28 @@ default_files = {
 # ---- English default prompts (open-source edition) ----
 apply_english_prompt_defaults(default_files)
 
+UNREADABLE_JSON_FILES = set()
+
+
 def load_json_file(filename, default_val):
-    """安全读取本地 JSON 文件，带损坏回滚机制"""
+    """Read local JSON, initialize missing files, and preserve unreadable files."""
     path = os.path.join(DATA_DIR, filename)
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception:
-            pass
+            UNREADABLE_JSON_FILES.add(filename)
+            return default_val
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(default_val, f, ensure_ascii=False, indent=2)
     return default_val
 
 def save_json_file(filename, data):
     """安全写入本地 JSON 文件"""
+    if filename in UNREADABLE_JSON_FILES:
+        st.error(f"'{filename}' could not be read; the original file was kept unchanged and saving is disabled to protect its data.")
+        return False
     path = os.path.join(DATA_DIR, filename)
     try:
         with open(path, 'w', encoding='utf-8') as f:
@@ -565,6 +572,11 @@ def render_global_sidebar():
 
     # ================= 全局数据管理（清除） =================
     st.sidebar.markdown("---")
+    for filename in sorted(UNREADABLE_JSON_FILES):
+        st.sidebar.warning(
+            f"The existing {filename} could not be read. It has been left unchanged, and saving to it is disabled to protect its data."
+        )
+
     with st.sidebar.expander("🗑️ Data Management (Global Clear)", expanded=False):
         st.caption("Selectively clear or reset project data (irreversible, use with caution)")
         clear_map = {
