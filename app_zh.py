@@ -14,7 +14,12 @@ Lumielle Academic Assistant —— 学术论文写作助手
 
 import streamlit as st
 from version import __version__
-from document_support import is_document_parse_error, parse_document_in_chunks
+from document_support import DEFAULT_CHUNK_CHARS, is_document_parse_error, parse_document_in_chunks
+from outline_support import (
+    extract_docx_manuscript_text,
+    persist_reverse_outline_result,
+    reverse_engineer_manuscript,
+)
 from chart_support import chart_result_message, generate_chart_image
 from writing_support import (
     LLMOutputError,
@@ -861,36 +866,45 @@ def multi_model_discussion_tab():
 
 def ast_reverse_tab():
     st.subheader("📄 文稿逆向工程（AST 拆解）")
-    
     up_doc = st.file_uploader("上传已有的 .docx 文档提取大纲", type=["docx"], key="ast_up")
-    if up_doc:
-        try:
-            doc = docx.Document(io.BytesIO(up_doc.read()))
-            extracted_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-            st.info(f"成功读取文档，纯文本字符数: {len(extracted_text)}")
-            if st.button("🚀 执行逆向拆解并写入逻辑树"):
-                with st.spinner("AI 逆向构建抽象语法树 (AST) 中..."):
-                    prompt = (
-                        "请将以下文档内容逆向解析为标准 JSON 的逻辑大纲树。"
-                        "每个节点包含 id, title, desc, word_count, chart_instruction, image_suggestion, is_own_experiment, references(空数组), children。"
-                        "必须直接输出纯 JSON 数组，禁止任何 Markdown 标记和解释：\n"
-                        + extracted_text[:4000]
-                    )
-                    try:
-                        res = dispatch_llm_call(prompt, system_prompt="你是一个极简主义的结构解析器。", max_tokens=3000)
-                    except LLMOutputError:
-                        st.error(llm_error_message("zh"))
-                        return
-                    parsed = re.search(r'(\[.*\]|\{.*\})', res, re.DOTALL)
-                    if parsed:
-                        tree_json = json.loads(parsed.group(1))
-                        save_json_file("logic_tree.json", tree_json if isinstance(tree_json, list) else [tree_json])
-                        st.success("逆向工程完成！大纲已写入【逻辑链路】板块。")
-                        st.rerun()
-                    else:
-                        st.error("未能从大模型返回中解析出合法的 JSON 大纲结构。")
-        except Exception:
-            st.error("无法处理上传的文档，请尝试其他 Word 文档。")
+    if not up_doc:
+        return
+    try:
+        doc = docx.Document(io.BytesIO(up_doc.read()))
+        extracted_text = extract_docx_manuscript_text(doc)
+        st.info(f"成功读取文档，纯文本字符数: {len(extracted_text)}")
+        if not st.button("🚀 执行逆向拆解并写入逻辑树"):
+            return
+        if not extracted_text.strip():
+            st.error("此 Word 文档中没有可提取的文稿文本。")
+            return
+
+        is_long_manuscript = len(extracted_text) > DEFAULT_CHUNK_CHARS
+        spinner_text = (
+            "AI 正在分析完整文稿结构..."
+            if is_long_manuscript else "AI 正在分析文稿结构..."
+        )
+        with st.spinner(spinner_text):
+            result = reverse_engineer_manuscript(extracted_text, dispatch_llm_call, locale="zh")
+
+        if persist_reverse_outline_result(result, DATA_DIR):
+            parts = result["chunks_total"]
+            if parts > 1:
+                st.success(f"文稿逆向解析完成，共处理 {parts} 个部分。")
+            else:
+                st.success("文稿逆向解析完成。")
+            st.rerun()
+            return
+
+        error_message = result.get(
+            "message",
+            "文稿未能完整完成逆向解析，因此已保留原有逻辑大纲。",
+        )
+        if result.get("error_type") == "llm":
+            error_message += " " + llm_error_message("zh")
+        st.error(error_message)
+    except Exception:
+        st.error("文稿无法处理，原有逻辑大纲已保留。")
 
 
 def module1_llm():

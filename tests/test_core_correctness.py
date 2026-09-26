@@ -1,4 +1,5 @@
 import ast
+import io
 import importlib.util
 import json
 import re
@@ -6,7 +7,9 @@ import struct
 import tempfile
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -571,6 +574,356 @@ class DocumentSupportTests(unittest.TestCase):
                 self.assertGreaterEqual(source.count("is_document_parse_error("), 2)
                 self.assertNotIn("doc_text[:6000]", source)
                 self.assertNotIn("doc_text[:5000]", source)
+
+
+class OutlineSupportTests(unittest.TestCase):
+    def setUp(self):
+        self.support = load_project_module(self, "outline_support")
+        self.documents = load_project_module(self, "document_support")
+
+    @staticmethod
+    def tree_response(title="Final outline", **fields):
+        node = {"title": title, "desc": "Source structure", "children": []}
+        node.update(fields)
+        return json.dumps([node], ensure_ascii=False)
+
+    def test_short_manuscript_uses_one_final_tree_call_with_all_text(self):
+        source = "Introduction sentinel\nMethods sentinel\nConclusion sentinel"
+        prompts = []
+
+        def llm_call(prompt, **kwargs):
+            prompts.append(prompt)
+            return self.tree_response("Paper", word_count="24")
+
+        result = self.support.reverse_engineer_manuscript(source, llm_call, locale="en")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["chunks_total"], 1)
+        self.assertEqual(len(prompts), 1)
+        self.assertNotIn("STAGE 1: SOURCE STRUCTURE EXTRACTION", prompts[0])
+        for sentinel in ("Introduction sentinel", "Methods sentinel", "Conclusion sentinel"):
+            self.assertIn(sentinel, prompts[0])
+        self.assertEqual(result["tree"][0]["word_count"], 24)
+
+    def test_long_manuscript_processes_each_chunk_once_and_keeps_final_sentinel(self):
+        source = "BEGIN_SENTINEL\n" + ("body text " * 2200) + "\nMIDDLE_SENTINEL\n" + ("methods text " * 2200) + "\nFINAL_SECTION_SENTINEL"
+        expected_chunks = self.documents.chunk_document_text(source)
+        stage_one_prompts = []
+
+        def llm_call(prompt, **kwargs):
+            if "STAGE 1: SOURCE STRUCTURE EXTRACTION" in prompt:
+                stage_one_prompts.append(prompt)
+                match = re.search(r"SOURCE DOCUMENT PART (\d+)/(\d+)", prompt)
+                return self.tree_response(f"Part {match.group(1)}")
+            return self.tree_response("Consolidated manuscript")
+
+        result = self.support.reverse_engineer_manuscript(source, llm_call, locale="en")
+
+        self.assertGreater(len(source), 20000)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["chunks_total"], len(expected_chunks))
+        self.assertEqual(len(stage_one_prompts), len(expected_chunks))
+        self.assertEqual(
+            [int(re.search(r"SOURCE DOCUMENT PART (\d+)/(\d+)", prompt).group(1)) for prompt in stage_one_prompts],
+            list(range(1, len(expected_chunks) + 1)),
+        )
+        self.assertIn("FINAL_SECTION_SENTINEL", stage_one_prompts[-1])
+
+    def test_long_manuscript_retries_only_invalid_source_chunk(self):
+        source = "A" * 5500 + "\n\n" + "B" * 5500 + "\n\n" + "C" * 100
+        calls = []
+        attempts = {}
+
+        def llm_call(prompt, **kwargs):
+            if "STAGE 1: SOURCE STRUCTURE EXTRACTION" not in prompt:
+                return self.tree_response("Consolidated")
+            part = int(re.search(r"SOURCE DOCUMENT PART (\d+)/(\d+)", prompt).group(1))
+            calls.append(part)
+            attempts[part] = attempts.get(part, 0) + 1
+            if part == 2 and attempts[part] == 1:
+                return "not JSON"
+            return self.tree_response(f"Part {part}")
+
+        result = self.support.reverse_engineer_manuscript(source, llm_call, locale="en")
+
+        self.assertEqual(calls, [1, 2, 2, 3])
+        self.assertEqual(result["status"], "ok")
+
+    def test_ordered_consolidation_merges_cross_chunk_chapters(self):
+        source = "A" * 5500 + "\n\n" + "B" * 5500 + "\n\n" + "C" * 100
+        merge_prompts = []
+        partials = {
+            1: [{"title": "Methods", "children": [{"title": "Dataset", "children": []}]}],
+            2: [{"title": "Methods continuation", "children": [{"title": "Model", "children": []}]}],
+            3: [{"title": "Results", "children": []}],
+        }
+        unified = [
+            {"title": "Methods", "children": [
+                {"title": "Dataset", "children": []}, {"title": "Model", "children": []}
+            ]},
+            {"title": "Results", "children": []},
+        ]
+
+        def llm_call(prompt, **kwargs):
+            if "STAGE 1: SOURCE STRUCTURE EXTRACTION" in prompt:
+                part = int(re.search(r"SOURCE DOCUMENT PART (\d+)/(\d+)", prompt).group(1))
+                return json.dumps(partials[part])
+            merge_prompts.append(prompt)
+            return json.dumps(unified)
+
+        result = self.support.reverse_engineer_manuscript(source, llm_call, locale="en")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual([node["title"] for node in result["tree"]], ["Methods", "Results"])
+        self.assertEqual([node["title"] for node in result["tree"][0]["children"]], ["Dataset", "Model"])
+        self.assertEqual(len(merge_prompts), 1)
+        positions = [merge_prompts[0].index(label) for label in ("Methods", "Dataset", "Methods continuation", "Model", "Results")]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_large_consolidation_batches_all_fragments_with_bounded_progress(self):
+        source = "x" * (5500 * 8)
+        merge_prompts = []
+
+        def llm_call(prompt, **kwargs):
+            if "STAGE 1: SOURCE STRUCTURE EXTRACTION" in prompt:
+                part = int(re.search(r"SOURCE DOCUMENT PART (\d+)/(\d+)", prompt).group(1))
+                return json.dumps([{"title": f"FRAGMENT_{part}", "desc": "d" * 4500, "children": []}])
+            merge_prompts.append(prompt)
+            return self.tree_response("Merged fragment")
+
+        result = self.support.reverse_engineer_manuscript(source, llm_call, locale="en")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertGreater(result["merge_rounds"], 1)
+        self.assertTrue(merge_prompts)
+        self.assertTrue(all(len(prompt) <= self.support.MAX_CONSOLIDATION_PROMPT_CHARS for prompt in merge_prompts))
+        round_one = [prompt for prompt in merge_prompts if "CONSOLIDATION ROUND 1" in prompt]
+        self.assertGreater(len(round_one), 1)
+        for part in range(1, 9):
+            self.assertEqual(sum(prompt.count(f"FRAGMENT_{part}") for prompt in round_one), 1)
+
+    def test_nonprogressing_or_oversized_merge_fails_without_tree(self):
+        source = "A" * 5500 + "\n\n" + "B" * 100
+        prompts = []
+
+        def llm_call(prompt, **kwargs):
+            prompts.append(prompt)
+            if "STAGE 1: SOURCE STRUCTURE EXTRACTION" in prompt:
+                part = int(re.search(r"SOURCE DOCUMENT PART (\d+)/(\d+)", prompt).group(1))
+                return json.dumps([{"title": f"Part {part}", "desc": "x" * 26000}])
+            return self.tree_response("Unexpected")
+
+        result = self.support.reverse_engineer_manuscript(source, llm_call, locale="en")
+
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("tree", result)
+        self.assertFalse(any("STAGE 2: ORDERED CONSOLIDATION" in prompt for prompt in prompts))
+
+    def test_normalization_rebuilds_ids_fields_and_parent_word_counts(self):
+        normalized = self.support.normalize_reverse_outline_tree([
+            {"id": "same-id", "title": " Parent ", "word_count": "999", "references": ["fake"],
+             "is_own_experiment": "false", "children": [
+                 {"id": "same-id", "title": " Child A ", "word_count": "12"},
+                 {"id": "same-id", "title": "Child B", "word_count": -4, "children": "invalid"},
+                 None,
+                 {"title": "   ", "word_count": 90},
+             ]},
+            {"title": "Leaf", "word_count": "7", "children": None},
+        ])
+
+        ids = [node["id"] for node in normalized]
+        ids.extend(child["id"] for node in normalized for child in node["children"])
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(normalized[0]["title"], "Parent")
+        self.assertEqual(normalized[0]["word_count"], 12)
+        self.assertEqual(normalized[0]["references"], [])
+        self.assertEqual(normalized[0]["is_own_experiment"], False)
+        self.assertEqual(normalized[0]["chart_instruction"], "")
+        self.assertEqual(normalized[0]["image_suggestion"], "")
+        self.assertEqual(normalized[0]["children"][1]["word_count"], 0)
+        self.assertEqual(normalized[1]["word_count"], 7)
+
+    def test_docx_extraction_includes_table_paragraphs_in_document_order(self):
+        from docx import Document
+
+        document = Document()
+        document.add_paragraph("INTRODUCTION_SENTINEL")
+        table = document.add_table(rows=1, cols=1)
+        table.cell(0, 0).text = "TABLE_SECTION_SENTINEL"
+        document.add_paragraph("CONCLUSION_SENTINEL")
+
+        extracted = self.support.extract_docx_manuscript_text(document)
+
+        self.assertLess(extracted.index("INTRODUCTION_SENTINEL"), extracted.index("TABLE_SECTION_SENTINEL"))
+        self.assertLess(extracted.index("TABLE_SECTION_SENTINEL"), extracted.index("CONCLUSION_SENTINEL"))
+
+    def test_duplicate_model_ids_are_replaced_with_unique_local_ids(self):
+        source = "short source"
+
+        def llm_call(prompt, **kwargs):
+            return json.dumps([
+                {"id": "same-id", "title": "One", "children": []},
+                {"id": "same-id", "title": "Two", "children": []},
+            ])
+
+        result = self.support.reverse_engineer_manuscript(source, llm_call)
+        ids = [node["id"] for node in result["tree"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertNotEqual(ids, ["same-id", "same-id"])
+
+    def test_llm_failure_never_provides_persistable_partial_tree(self):
+        source = "A" * 5500 + "\n\n" + "B" * 100
+
+        def llm_call(prompt, **kwargs):
+            if "STAGE 1: SOURCE STRUCTURE EXTRACTION" in prompt and "SOURCE DOCUMENT PART 2/2" in prompt:
+                raise self.support.LLMOutputError("API unavailable")
+            return self.tree_response("Partial")
+
+        result = self.support.reverse_engineer_manuscript(source, llm_call)
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("tree", result)
+        with tempfile.TemporaryDirectory() as data_dir:
+            self.assertFalse(self.support.persist_reverse_outline_result(result, data_dir))
+            self.assertFalse((Path(data_dir) / "logic_tree.json").exists())
+
+    def test_invalid_final_json_is_retried_once_then_fails_closed(self):
+        calls = []
+
+        def llm_call(prompt, **kwargs):
+            calls.append(prompt)
+            return "not JSON"
+
+        result = self.support.reverse_engineer_manuscript("short source", llm_call)
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("tree", result)
+        self.assertEqual(len(calls), 2)
+        with tempfile.TemporaryDirectory() as data_dir:
+            self.assertFalse(self.support.persist_reverse_outline_result(result, data_dir))
+            self.assertFalse((Path(data_dir) / "logic_tree.json").exists())
+
+    def test_overdeep_final_outline_gets_one_correction_retry(self):
+        prompts = []
+
+        def llm_call(prompt, **kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return json.dumps([{"title": "One", "children": [{"title": "Two", "children": [{"title": "Three", "children": [{"title": "Too deep"}]}]}]}])
+            return json.dumps([{"title": "One", "children": [{"title": "Two", "children": [{"title": "Three"}]}]}])
+
+        result = self.support.reverse_engineer_manuscript("short source", llm_call)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("previous result", prompts[1].lower())
+        self.assertEqual(len(result["tree"][0]["children"][0]["children"][0]["children"]), 0)
+
+    def test_empty_manuscript_returns_before_any_llm_call(self):
+        calls = []
+        result = self.support.reverse_engineer_manuscript(" \n\t", lambda *args, **kwargs: calls.append(args))
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_type"], "empty")
+        self.assertNotIn("tree", result)
+        self.assertEqual(calls, [])
+
+    def test_consolidation_llm_failure_retries_group_then_returns_no_tree(self):
+        source = "A" * 5500 + "\n\n" + "B" * 100
+        merge_calls = []
+
+        def llm_call(prompt, **kwargs):
+            if "STAGE 1: SOURCE STRUCTURE EXTRACTION" in prompt:
+                return self.tree_response("Local")
+            merge_calls.append(prompt)
+            raise self.support.LLMOutputError("API unavailable")
+
+        result = self.support.reverse_engineer_manuscript(source, llm_call)
+
+        self.assertEqual(len(merge_calls), 2)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["stage"], "consolidation")
+        self.assertNotIn("tree", result)
+
+    def test_persistence_gate_saves_only_successful_nonempty_tree(self):
+        tree = [{"id": "local", "title": "Complete", "children": []}]
+        with tempfile.TemporaryDirectory() as data_dir:
+            target = Path(data_dir) / "logic_tree.json"
+            previous_tree = '[{"id":"previous","title":"Keep"}]'
+            target.write_text(previous_tree, encoding="utf-8")
+            self.assertFalse(self.support.persist_reverse_outline_result({"status": "error", "tree": [{"title": "partial"}]}, data_dir))
+            self.assertFalse(self.support.persist_reverse_outline_result({"status": "ok", "tree": []}, data_dir))
+            self.assertEqual(target.read_text(encoding="utf-8"), previous_tree)
+            self.assertTrue(self.support.persist_reverse_outline_result({"status": "ok", "tree": tree}, data_dir))
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), tree)
+
+    def test_atomic_persistence_keeps_old_tree_when_temp_write_fails(self):
+        tree = [{"id": "new", "title": "Complete", "children": []}]
+        with tempfile.TemporaryDirectory() as data_dir:
+            target = Path(data_dir) / "logic_tree.json"
+            target.write_text('[{"id":"old","title":"Keep"}]', encoding="utf-8")
+            old_bytes = target.read_bytes()
+            with patch.object(self.support.json, "dump", side_effect=OSError("simulated disk failure")) as dump:
+                self.assertFalse(self.support.persist_reverse_outline_result({"status": "ok", "tree": tree}, data_dir))
+                dump.assert_called_once()
+            self.assertEqual(target.read_bytes(), old_bytes)
+            self.assertEqual({path.name for path in Path(data_dir).iterdir()}, {"logic_tree.json"})
+
+    def test_both_app_reverse_tabs_have_no_fixed_truncation_and_save_only_success(self):
+        support = self.support
+
+        class UI:
+            def __init__(self, document_text="complete source"):
+                self.messages = []
+                self.document_text = document_text
+            def __getattr__(self, name):
+                if name == "file_uploader":
+                    return lambda *args, **kwargs: types.SimpleNamespace(read=lambda: b"docx")
+                if name == "button":
+                    return lambda *args, **kwargs: True
+                if name == "spinner":
+                    return lambda message: nullcontext()
+                if name in ("subheader", "info", "success", "warning", "rerun"):
+                    return lambda *args, **kwargs: self.messages.append((name, args))
+                if name == "error":
+                    return lambda *args, **kwargs: self.messages.append((name, args))
+                raise AssertionError(f"Unexpected Streamlit UI call: {name}")
+
+        for app_name, locale in (("app.py", "en"), ("app_zh.py", "zh")):
+            with self.subTest(app=app_name):
+                source = (ROOT / app_name).read_text(encoding="utf-8")
+                app_module = ast.parse(source)
+                reverse_tab = next(node for node in app_module.body if isinstance(node, ast.FunctionDef) and node.name == "ast_reverse_tab")
+                reverse_tab_source = ast.get_source_segment(source, reverse_tab)
+                self.assertNotIn("extracted_text[:4000]", reverse_tab_source)
+                ui = UI()
+                with tempfile.TemporaryDirectory() as data_dir:
+                    namespace = {
+                        "st": ui,
+                        "io": io,
+                        "docx": types.SimpleNamespace(Document=lambda _file, text=ui.document_text: types.SimpleNamespace(paragraphs=[types.SimpleNamespace(text=text)] if text else [])),
+                        "extract_docx_manuscript_text": lambda doc: "\n".join(p.text for p in doc.paragraphs),
+                        "reverse_engineer_manuscript": lambda text, llm_call, locale: {"status": "error", "error_type": "parse"},
+                        "persist_reverse_outline_result": support.persist_reverse_outline_result,
+                        "DATA_DIR": data_dir,
+                        "dispatch_llm_call": lambda *args, **kwargs: self.fail("failure result should not call LLM"),
+                        "DEFAULT_CHUNK_CHARS": self.documents.DEFAULT_CHUNK_CHARS,
+                        "llm_error_message": lambda _locale: "model configuration message",
+                    }
+                    function = load_app_function(self, app_name, "ast_reverse_tab", namespace)
+                    function()
+                    self.assertFalse((Path(data_dir) / "logic_tree.json").exists())
+                    self.assertTrue(any(name == "error" for name, _ in ui.messages))
+
+                    empty_calls = []
+                    empty_ui = UI("")
+                    empty_namespace = dict(namespace)
+                    empty_namespace.update({
+                        "st": empty_ui,
+                        "docx": types.SimpleNamespace(Document=lambda _file: types.SimpleNamespace(paragraphs=[])),
+                        "extract_docx_manuscript_text": lambda _doc: "",
+                        "reverse_engineer_manuscript": lambda *args, **kwargs: empty_calls.append(args),
+                    })
+                    load_app_function(self, app_name, "ast_reverse_tab", empty_namespace)()
+                    self.assertEqual(empty_calls, [])
+                    self.assertFalse((Path(data_dir) / "logic_tree.json").exists())
 
 
 class ChartSupportTests(unittest.TestCase):

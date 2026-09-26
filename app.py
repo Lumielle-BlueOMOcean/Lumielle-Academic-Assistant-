@@ -16,7 +16,12 @@ Lumielle Academic Assistant —— 学术论文写作助手
 
 import streamlit as st
 from version import __version__
-from document_support import is_document_parse_error, parse_document_in_chunks
+from document_support import DEFAULT_CHUNK_CHARS, is_document_parse_error, parse_document_in_chunks
+from outline_support import (
+    extract_docx_manuscript_text,
+    persist_reverse_outline_result,
+    reverse_engineer_manuscript,
+)
 from chart_support import chart_result_message, generate_chart_image
 from writing_support import (
     LLMOutputError,
@@ -867,36 +872,45 @@ def multi_model_discussion_tab():
 
 def ast_reverse_tab():
     st.subheader("📄 Manuscript Reverse Engineering (AST Decomposition)")
-    
     up_doc = st.file_uploader("Upload an existing .docx document to extract the outline", type=["docx"], key="ast_up")
-    if up_doc:
-        try:
-            doc = docx.Document(io.BytesIO(up_doc.read()))
-            extracted_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-            st.info(f"Document read successfully, plain-text characters: {len(extracted_text)}")
-            if st.button("🚀 Run Reverse Decomposition into Logic Tree"):
-                with st.spinner("AI is reverse-building the Abstract Syntax Tree (AST)..."):
-                    prompt = (
-                        "Reverse-parse the following document content into a standard JSON logic outline tree. "
-                        "Each node contains id, title, desc, word_count, chart_instruction, image_suggestion, is_own_experiment, references (empty array), children. "
-                        "Output ONLY a pure JSON array; no Markdown markers or explanations:\n"
-                        + extracted_text[:4000]
-                    )
-                    try:
-                        res = dispatch_llm_call(prompt, system_prompt="You are a minimalist structure parser.", max_tokens=3000)
-                    except LLMOutputError:
-                        st.error(llm_error_message("en"))
-                        return
-                    parsed = re.search(r'(\[.*\]|\{.*\})', res, re.DOTALL)
-                    if parsed:
-                        tree_json = json.loads(parsed.group(1))
-                        save_json_file("logic_tree.json", tree_json if isinstance(tree_json, list) else [tree_json])
-                        st.success("Reverse engineering done! Outline written to [Logic Chain] module.")
-                        st.rerun()
-                    else:
-                        st.error("Failed to parse a valid JSON outline structure from the model response.")
-        except Exception:
-            st.error("Could not process the uploaded document. Please try another Word document.")
+    if not up_doc:
+        return
+    try:
+        doc = docx.Document(io.BytesIO(up_doc.read()))
+        extracted_text = extract_docx_manuscript_text(doc)
+        st.info(f"Document read successfully, plain-text characters: {len(extracted_text)}")
+        if not st.button("🚀 Run Reverse Decomposition into Logic Tree"):
+            return
+        if not extracted_text.strip():
+            st.error("No extractable manuscript text was found in this Word document.")
+            return
+
+        is_long_manuscript = len(extracted_text) > DEFAULT_CHUNK_CHARS
+        spinner_text = (
+            "AI is analyzing the complete manuscript structure..."
+            if is_long_manuscript else "AI is analyzing the manuscript structure..."
+        )
+        with st.spinner(spinner_text):
+            result = reverse_engineer_manuscript(extracted_text, dispatch_llm_call, locale="en")
+
+        if persist_reverse_outline_result(result, DATA_DIR):
+            parts = result["chunks_total"]
+            if parts > 1:
+                st.success(f"Reverse engineering completed. The manuscript was processed in {parts} parts.")
+            else:
+                st.success("Reverse engineering completed.")
+            st.rerun()
+            return
+
+        error_message = result.get(
+            "message",
+            "The manuscript could not be reverse-engineered completely, so the existing logic outline was kept.",
+        )
+        if result.get("error_type") == "llm":
+            error_message += " " + llm_error_message("en")
+        st.error(error_message)
+    except Exception:
+        st.error("The manuscript could not be processed. The existing logic outline was kept.")
 
 
 def module1_llm():
