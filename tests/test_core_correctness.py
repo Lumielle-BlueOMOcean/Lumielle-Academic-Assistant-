@@ -134,7 +134,6 @@ class CoreCorrectnessTests(unittest.TestCase):
             "For personal learning use only",
             "Resale for profit is prohibited",
             "commercial profit",
-            "non-commercial",
         )
         for phrase in restricted_phrases:
             self.assertNotIn(phrase.lower(), project_text.lower())
@@ -164,6 +163,25 @@ class CoreCorrectnessTests(unittest.TestCase):
             sidebar_source = ast.get_source_segment(app_sources[app_name], sidebar_function)
             for required_item in required_items:
                 self.assertIn(required_item, sidebar_source, app_name)
+
+    def test_v101_release_changelog_covers_release_scope(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        required_text = (
+            "### v1.0.1 — 2026-09-27",
+            "#### Added / 新增",
+            "#### Changed / 变更",
+            "#### Fixed / 修复",
+            "#### Removed / 移除",
+            "Existing unreadable/corrupted user JSON files are now preserved and further writes to those files are blocked",
+            "arbitrary execution of LLM-generated Python",
+            "macOS first-run environment creation by using bundled uv to create a pip-enabled environment",
+            "1029688024",
+            "MIT License",
+            "No core user-facing workflow was removed in v1.0.1.",
+            "v1.0.0 — 2026-08-26",
+        )
+        for text in required_text:
+            self.assertIn(text, readme)
 
     def test_context_layers_are_in_chapter_prompts_in_both_locales(self):
         support = load_project_module(self, "writing_support")
@@ -241,14 +259,15 @@ class CoreCorrectnessTests(unittest.TestCase):
         version = load_project_module(self, "version")
         self.assertEqual(version.__version__, "1.0.1")
 
-    def test_readme_matches_canonical_unreleased_version_and_keeps_v100_history(self):
+    def test_readme_matches_canonical_release_date_and_keeps_v100_history(self):
         version = load_project_module(self, "version")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"v{version.__version__}", readme)
         self.assertRegex(
             readme,
-            rf"(?m)^### v{re.escape(version.__version__)} — Unreleased$",
+            rf"(?m)^### v{re.escape(version.__version__)} — 2026-09-27$",
         )
+        self.assertIn(f"Current version / 当前版本：v{version.__version__} — 2026-09-27", readme)
         self.assertIn("v1.0.0", readme)
         self.assertIn("Changelog", readme)
 

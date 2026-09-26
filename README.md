@@ -7,7 +7,7 @@
 
 A Streamlit-based local academic paper writing assistant: logic outline generation, chapter writing, AIGC detection & de-smelling, and final Word export.
 
-**Current development version / 当前开发版本：v1.0.1 (Unreleased / 未发布)**
+**Current version / 当前版本：v1.0.1 — 2026-09-27**
 
 ---
 
@@ -98,39 +98,63 @@ This design lets the AI focus on writing **one chapter at a time**, while the to
 
 ## Changelog / 更新日志
 
-### v1.0.1 — Unreleased
+### v1.0.1 — 2026-09-27
 
-#### Fixed / 修复
+#### Added / 新增
 
-- Chapter-generation prompts now include the global outline, upstream context, and downstream written content or boundaries.
-- Custom writing-style prompts are interpolated into chapter-generation prompts.
-- English chapter word counts now count word tokens, including generation correction, UI results, batch results, and structure review.
-- English default prompts now initialize under `prompts.json`.
-- Word exports now remap chapter-local citations through one deduplicated global reference order, preserving each draft's saved reference mapping and falling back to current bindings for legacy drafts.
-- Empty responses and known LLM configuration/API failure messages are rejected before saving chapter text or memory; a failed memory distillation keeps the saved draft and prior summary.
-- Batch chapter generation now reports per-chapter failures and continues with the remaining chapters.
-- English memory status now reports word counts instead of character counts.
-- Replaced executable LLM-generated chart scripts with validated bar, line, scatter, and pie chart data rendered by trusted local code.
-- Chart requests without usable values now ask the user for data; explicitly illustrative charts are labeled as illustrative.
-- 科研基座不再只发送文档开头 5,000–6,000 个字符，而是按顺序分块解析完整提取文本；任一分块重试后仍失败时，不保存部分模块。 / Research Foundation imports now parse the complete extracted document in ordered chunks instead of sending only its first 5,000–6,000 characters; if any part still fails after one retry, no partial modules are saved.
-- 科研基座和文献导入会统一识别中英文文档提取错误。 / Research Foundation and literature imports consistently recognize document extraction errors in both locales.
-- LLM configuration, API, and empty-output failures now cross one checked boundary as `LLMOutputError`; feature handlers keep them out of generated text, saved outlines, and review reports.
-- 文稿逆向解析现在处理完整提取文本；长文稿按原顺序分块并合并，验证完成后才替换逻辑链路。 / Manuscript Reverse Engineering now analyzes the complete extracted text; long manuscripts are chunked in source order and consolidated before replacing the Logic Chain.
-- Literature files are still imported when AI rating fails, with rating `0`, category `Unrated`, and `analysis_status: unavailable` instead of a neutral three-star result.
-- AIGC detection failures now show an unavailable result instead of `0%`; failed logic-review blocks are excluded from saved reports, and an all-failed run preserves the prior report.
-- Multi-model discussion keeps successful answers when another model fails, and consensus uses only successful answers; outline failures leave the existing outline untouched.
+- Added one canonical SemVer source in `version.py`; both applications display the version. / 在 `version.py` 建立唯一 SemVer 版本来源，并在两个应用中显示版本号。
+- Added focused regression tests and Python 3.12 GitHub Actions CI. / 增加针对核心行为的回归测试与 Python 3.12 GitHub Actions CI。
+- Drafts now retain reference snapshots and mappings so citation exports remain stable. / 草稿保存文献快照与映射，保证导出引用稳定。
+- Added a structured chart pipeline that validates chart data and renders it with trusted local code. / 增加结构化图表流程，由本地可信代码校验数据并绘图。
+- Added ordered chunk parsing for complete Research Foundation documents and complete Manuscript Reverse Engineering. / 增加科研基座全文顺序分块解析，以及完整文稿逆向解析能力。
+- Both application sidebars now identify the MIT open-source license, GitHub repository and QQ community. / 中英文应用侧边栏均明确展示 MIT 开源许可、GitHub 仓库和 QQ 交流信息。
 
 #### Changed / 变更
 
-- Added `version.py` as the canonical SemVer version source and display the version in both app sidebars.
-- Added focused `unittest` coverage and a Python 3.12 GitHub Actions CI workflow.
-- Made the MIT open-source license and GitHub/QQ community details explicit in both application sidebars. / 在中英文应用侧边栏中明确展示 MIT 开源许可、GitHub 仓库和 QQ 交流信息。
+- Chapter generation now receives the global outline, upstream context and downstream written content or boundaries from the Context Sandwich. / 章节生成现在会接收上下文三明治中的全局大纲、上游内容和下游已写内容或边界。
+- The saved custom writing-style prompt is interpolated into each chapter-generation prompt. / 用户保存的写作风格提示词现在会实际进入章节生成提示词。
+- English word counts use word tokens across generation correction, UI results, batch results, structure review and memory status. / 英文生成纠偏、界面结果、批量结果、结构审查和记忆状态统一按英文单词计数。
+- English default prompts initialize inside `prompts.json` without replacing an existing user prompt file. / 英文默认提示词正确初始化在 `prompts.json` 中，且不覆盖已有用户配置。
+- Word export now orders and deduplicates references globally, remaps chapter-local citations, and uses saved snapshots with a legacy-binding fallback. / Word 导出按全文顺序统一去重文献并转换章节局部编号；使用草稿快照，旧草稿回退到当前绑定。
+- Long Research Foundation documents use ordered chunks; long manuscripts use ordered extraction and bounded consolidation before the outline is replaced. / 长科研基座文档按顺序分块处理；长文稿顺序提取并有界合并，验证后才替换大纲。
+- Multi-model consensus uses successful answers only; a failed outline operation leaves the previous outline intact. / 多模型共识只使用成功回答；大纲生成失败时保留原有大纲。
+- Literature remains imported when AI rating is unavailable and is marked `Unrated`; failed deep-review blocks are excluded, and an all-failed review preserves the previous report. / AI 评级不可用时仍导入文献并标记为 `Unrated`；失败的深度审查区块不进入报告，全部失败时保留旧报告。
+- MIT licensing information is consistent across `LICENSE`, README, manuals and both application interfaces. / `LICENSE`、README、手册和中英文应用界面的许可信息均统一采用 MIT 表述。
+
+#### Fixed / 修复
+
+- Fixed the Context Sandwich display/runtime mismatch so its context constrains the actual chapter-generation request. / 修复上下文三明治仅展示、不参与实际生成的问题。
+- Fixed literal `{style_prompt}` text being sent instead of the user's saved style prompt. / 修复把字面量 `{style_prompt}` 发给模型的问题。
+- Fixed English word counts being measured as non-whitespace characters. / 修复英文篇幅被按非空白字符统计的问题。
+- Fixed English defaults being initialized at the wrong configuration level. / 修复英文默认提示词写入错误配置层级的问题。
+- Fixed macOS first-run environment creation by using bundled uv to create a pip-enabled environment because standalone Python omits venv and pip. / 修复 macOS 首次启动环境创建：独立版 Python 未包含 venv 和 pip，因此改用包内 uv 创建带 pip 的虚拟环境。
+- Fixed cross-chapter citation numbers pointing to different references by applying one global ordered registry at export. / 修复章节局部引用编号在全文导出时错指文献的问题。
+- Empty or known failed LLM responses are rejected before they can be saved as generated prose. / 空响应和已知 LLM 失败结果不会再作为正文保存。
+- A failed chapter-memory distillation no longer overwrites the saved draft or prior summary. / 章节记忆提炼失败时，不再覆盖已保存草稿或原摘要。
+- Fixed chart execution safety by removing arbitrary execution of LLM-generated Python and requiring validated chart specifications. / 移除任意执行模型生成 Python 的图表路径，改为校验图表规格，修复图表执行安全问题。
+- Illustrative charts require explicit permission; negated requests do not authorize invented values. / 示意图必须获得明确授权；否定表达不会被误解为允许编造数据。
+- Fixed silent 5,000–6,000-character prefix truncation in Research Foundation parsing. / 修复科研基座静默截断在文档开头 5,000–6,000 字符的问题。
+- Fixed silent 4,000-character truncation in Manuscript Reverse Engineering. / 修复文稿逆向解析静默截断在开头 4,000 字符的问题。
+- Chinese and English document extraction failures now receive consistent handling. / 统一处理中英文文档提取失败。
+- Configuration, API and empty-output failures now cross a checked `LLMOutputError` boundary and stay out of drafts, outlines and reports. / 配置、API 和空输出错误统一经 `LLMOutputError` 检查，不再混入草稿、大纲和报告。
+- Failed literature rating no longer appears as a neutral three-star or `Other` result; it is explicitly unavailable and `Unrated`. / 文献评级失败不再显示中性三星或 `Other`，而会明确标记为不可用和 `Unrated`。
+- AIGC detection failure now reports unavailable instead of a misleading `0% AI`. / AIGC 检测失败现在显示不可用，不再误报为 `0% AI`。
+- Failed logic-review blocks are excluded from normal reports, and an all-failed run preserves the previous report. / 失败的逻辑审查区块不进入正常报告；全部失败时保留既有报告。
+- Existing unreadable/corrupted user JSON files are now preserved and further writes to those files are blocked instead of silently replacing them with defaults. / 现有不可读或损坏的用户 JSON 文件会被保留，并阻止后续写入，不再静默替换为默认值。
+- Failed model answers no longer affect multi-model consensus, and outline failures no longer discard the prior outline. / 失败的模型回答不会影响多模型共识，大纲生成失败也不会丢弃原大纲。
+
+#### Removed / 移除
+
+- Removed arbitrary execution of LLM-generated Python for chart rendering. / 移除执行模型生成 Python 代码来绘制图表的做法。
+- Removed silent fixed-prefix truncation from Research Foundation and Manuscript Reverse Engineering. / 移除科研基座与文稿逆向解析中的静默固定前缀截断。
+- Removed README and UI non-commercial restrictions that conflicted with the MIT License. / 移除与 MIT License 冲突的 README 和界面非商业限制。
+- No core user-facing workflow was removed in v1.0.1. / v1.0.1 未移除任何核心用户工作流。
 
 ### v1.0.0 — 2026-08-26
 
 #### Added / 新增
 
-- Initial published release with Chinese and English packages for macOS and Windows.
+- Initial public release with Chinese and English desktop packages for macOS and Windows. / 首次公开发布，提供 macOS 与 Windows 中英文桌面安装包。
 
 ## 📄 开源许可 / License
 
