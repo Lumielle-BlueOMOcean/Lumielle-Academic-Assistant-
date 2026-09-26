@@ -124,6 +124,7 @@ This design lets the AI focus on writing **one chapter at a time**, while the to
 
 - Added `version.py` as the canonical SemVer version source and display the version in both app sidebars.
 - Added focused `unittest` coverage and a Python 3.12 GitHub Actions CI workflow.
+- Made the MIT open-source license and GitHub/QQ community details explicit in both application sidebars. / 在中英文应用侧边栏中明确展示 MIT 开源许可、GitHub 仓库和 QQ 交流信息。
 
 ### v1.0.0 — 2026-08-26
 
@@ -133,9 +134,9 @@ This design lets the AI focus on writing **one chapter at a time**, while the to
 
 ## 📄 开源许可 / License
 
-本项目基于 [MIT License](LICENSE) 开源，仅供个人学习使用，禁止倒卖或用于商业牟利。
+本项目基于 [MIT License](LICENSE) 开源。项目源码、许可文本和反馈渠道见 [GitHub 仓库](https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-)。
 
-Licensed under the [MIT License](LICENSE). For personal learning use only. Resale for profit is prohibited.
+This project is open source and released under the [MIT License](LICENSE). Find the source code, license, and feedback channels in the [GitHub repository](https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-).
 
 ## 📮 交流反馈 / Feedback
 
@@ -144,4 +145,4 @@ Licensed under the [MIT License](LICENSE). For personal learning use only. Resal
 
 ---
 
-© 2026 Lumielle. All rights reserved.
+© 2026 Lumielle · MIT License 开源 / Released under the MIT License.

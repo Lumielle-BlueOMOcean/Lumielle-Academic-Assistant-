@@ -111,6 +111,60 @@ class CoreCorrectnessTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), original_bytes)
                 self.assertTrue(ui.errors)
 
+    def test_mit_open_source_license_and_sidebar_metadata_are_consistent(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        app_sources = {
+            name: (ROOT / name).read_text(encoding="utf-8")
+            for name in ("app.py", "app_zh.py")
+        }
+        documents = {"README.md": readme, **app_sources}
+        project_text = "\n".join(documents.values())
+        for document_name, text in documents.items():
+            for required_text in ("MIT License", "1029688024"):
+                self.assertIn(required_text, text, document_name)
+        self.assertTrue("open-source" in readme.lower() or "开源项目" in readme)
+        self.assertIn("https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-", readme)
+
+        restricted_phrases = (
+            "仅供个人学习使用",
+            "个人学习使用",
+            "禁止倒卖",
+            "禁止商业牟利",
+            "商业牟利",
+            "For personal learning use only",
+            "Resale for profit is prohibited",
+            "commercial profit",
+            "non-commercial",
+        )
+        for phrase in restricted_phrases:
+            self.assertNotIn(phrase.lower(), project_text.lower())
+
+        expected_sidebar_text = {
+            "app.py": (
+                "Open-source project",
+                "[MIT License]",
+                "[GitHub Repository]",
+                "QQ Group **1029688024**",
+                "Developer: Lumielle",
+            ),
+            "app_zh.py": (
+                "开源项目",
+                "[MIT License]",
+                "[GitHub 项目源码]",
+                "QQ 群 **1029688024**",
+                "开发者：Lumielle",
+            ),
+        }
+        for app_name, required_items in expected_sidebar_text.items():
+            module = ast.parse(app_sources[app_name])
+            sidebar_function = next(
+                node for node in module.body
+                if isinstance(node, ast.FunctionDef) and node.name == "render_global_sidebar"
+            )
+            sidebar_source = ast.get_source_segment(app_sources[app_name], sidebar_function)
+            for required_item in required_items:
+                self.assertIn(required_item, sidebar_source, app_name)
+
     def test_context_layers_are_in_chapter_prompts_in_both_locales(self):
         support = load_project_module(self, "writing_support")
         sandwich = {

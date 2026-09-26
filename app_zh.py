@@ -8,8 +8,10 @@ Lumielle Academic Assistant —— 学术论文写作助手
 # -*- coding: utf-8 -*-
 # ============================================================
 #  Lumielle Academic Assistant
+#  本项目为 MIT License 开源项目。
+#  项目源码：https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-
+#  交流反馈：QQ 群聊 1029688024
 #  开发者：Lumielle
-#  仅供个人学习使用，禁止倒卖或用于商业牟利。
 # ============================================================
 
 import streamlit as st
@@ -612,9 +614,10 @@ def render_global_sidebar():
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         "**🎓 Lumielle Academic Assistant**  \n"
+        "开源项目 · [MIT License](https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-/blob/main/LICENSE)  \n"
+        "[GitHub 项目源码](https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-)  \n"
+        "交流反馈：QQ 群 **1029688024**  \n"
         "开发者：Lumielle  \n"
-        "交流反馈：QQ 群聊 **1029688024**  \n"
-        "仅供个人学习使用，禁止倒卖牟利。"
     )
     st.sidebar.caption(f"v{__version__}")
 
@@ -3501,11 +3504,13 @@ def module7_prompts():
 # 14. 主函数
 # ============================================================
 def main():
-    # 启动版权横幅（终端可见，截图可留证）
+    # 启动项目信息（终端可见）
     print("=" * 56)
     print("  Lumielle Academic Assistant")
+    print("  MIT License 开源项目")
+    print("  项目源码：https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-")
+    print("  交流反馈：QQ 群聊 1029688024")
     print("  开发者：Lumielle")
-    print("  本工具仅供个人学习使用，禁止倒卖或商业牟利。")
     print("=" * 56)
     st.set_page_config(page_title="Lumielle Academic Assistant · 开发者 Lumielle", layout="wide", initial_sidebar_state="expanded")
 

@@ -8,10 +8,10 @@ Lumielle Academic Assistant —— 学术论文写作助手
 # -*- coding: utf-8 -*-
 # ============================================================
 #  Lumielle Academic Assistant
-#  开发者：蓝洋
-#  正规获取渠道：QQ 群聊 1029688024
-#  本工具仅授权个人学习使用，禁止倒卖或用于商业牟利。
-#  如通过其他渠道获取本工具，均属非官方分发，请向开发者举报。
+#  Open-source project released under the MIT License.
+#  Source: https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-
+#  Community & feedback: QQ Group 1029688024
+#  Developer: Lumielle
 # ============================================================
 
 import streamlit as st
@@ -618,9 +618,10 @@ def render_global_sidebar():
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         "**🎓 Lumielle Academic Assistant**  \n"
+        "Open-source project · [MIT License](https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-/blob/main/LICENSE)  \n"
+        "[GitHub Repository](https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-)  \n"
+        "Community & feedback: QQ Group **1029688024**  \n"
         "Developer: Lumielle  \n"
-        "Official channel: QQ Group **1029688024**  \n"
-        "For personal learning use only. Resale for profit is prohibited."
     )
     st.sidebar.caption(f"v{__version__}")
 
@@ -3506,12 +3507,13 @@ def module7_prompts():
 # 14. 主函数
 # ============================================================
 def main():
-    # 启动版权横幅（终端可见，截图可留证）
+    # Startup project information (visible in the terminal).
     print("=" * 56)
     print("  Lumielle Academic Assistant")
+    print("  Open-source project · MIT License")
+    print("  Source: https://github.com/Lumielle-BlueOMOcean/Lumielle-Academic-Assistant-")
+    print("  Community & feedback: QQ Group 1029688024")
     print("  Developer: Lumielle")
-    print("  Official channel: QQ Group 1029688024")
-    print("  For personal learning use only. Resale for profit is prohibited.")
     print("=" * 56)
     st.set_page_config(page_title="Lumielle Academic Assistant", layout="wide", initial_sidebar_state="expanded")
 
