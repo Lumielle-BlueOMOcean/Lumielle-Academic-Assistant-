@@ -1,5 +1,6 @@
 """Pure writing helpers shared by the English and Chinese Streamlit apps."""
 
+import json
 import re
 
 
@@ -33,7 +34,7 @@ def get_llm_failure_reason(text):
     folded = stripped.casefold()
     for marker in _LLM_FAILURE_MARKERS:
         if folded.startswith(marker):
-            return stripped[:240]
+            return safe_llm_error_text(stripped)
     return None
 
 
@@ -43,6 +44,110 @@ def require_valid_llm_output(text):
     if reason:
         raise LLMOutputError(reason)
     return text
+
+
+def safe_llm_error_text(error, max_chars=240):
+    """Return a one-line, bounded error detail with common credential forms redacted."""
+    if error is None:
+        return "The model call failed."
+    text = str(error).splitlines()[0].strip()
+    text = re.sub(
+        r"(?i)(api[_ -]?key|authorization)\s*[:=]\s*\S+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [REDACTED]", text)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", text)
+    return text[:max(0, int(max_chars))]
+
+
+def llm_error_message(locale="en", error=None):
+    """Return a concise localized message without exposing provider exceptions or secrets."""
+    if str(locale).lower().startswith("zh"):
+        return "模型调用失败，请检查当前模型/API 配置后重试。"
+    return "The model call failed. Please check the current model/API configuration and try again."
+
+
+def checked_llm_call(provider_call, *args, **kwargs):
+    """Validate a provider adapter response at the application's business boundary."""
+    return require_valid_llm_output(provider_call(*args, **kwargs))
+
+
+def collect_model_answers(model_ids, call_model):
+    """Call each model independently, returning successful answers and failed IDs."""
+    answers = {}
+    failures = []
+    for model_id in model_ids:
+        try:
+            answers[model_id] = require_valid_llm_output(call_model(model_id))
+        except LLMOutputError:
+            failures.append(model_id)
+    return answers, failures
+
+
+def parse_literature_analysis(response):
+    """Parse one literature rating; unavailable analysis is explicitly not rated."""
+    unavailable = {
+        "rating": 0,
+        "category": "Unrated",
+        "key_findings": "",
+        "quality_assessment": "",
+        "summary": "",
+        "analysis_status": "unavailable",
+    }
+    try:
+        text = require_valid_llm_output(response)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return unavailable
+        parsed = json.loads(match.group(0))
+        if not isinstance(parsed, dict):
+            return unavailable
+        rating = int(parsed.get("rating"))
+        category = parsed.get("category")
+        if not 1 <= rating <= 5 or not isinstance(category, str) or not category.strip():
+            return unavailable
+    except (LLMOutputError, TypeError, ValueError, json.JSONDecodeError):
+        return unavailable
+
+    return {
+        "rating": rating,
+        "category": category.strip(),
+        "key_findings": str(parsed.get("key_findings", "") or ""),
+        "quality_assessment": str(parsed.get("quality_assessment", "") or ""),
+        "summary": str(parsed.get("summary", "") or ""),
+        "analysis_status": "ok",
+    }
+
+
+def aigc_detection_error_result(locale="en"):
+    """Represent failed AIGC detection without implying a zero AI probability."""
+    return {
+        "score": None,
+        "label": "Error",
+        "raw": llm_error_message(locale),
+    }
+
+
+def build_deep_review_report(block_results, locale="en"):
+    """Compose reports only from successful blocks and report success/failure counts."""
+    successful = [
+        item for item in (block_results or [])
+        if isinstance(item, dict)
+        and item.get("status") == "ok"
+        and isinstance(item.get("content"), str)
+        and item["content"].strip()
+    ]
+    failed_count = len(block_results or []) - len(successful)
+    if not successful:
+        return None, 0, failed_count
+    if str(locale).lower().startswith("zh"):
+        heading = f"## 深度逻辑审查报告\n\n成功章节块：{len(successful)}；失败章节块：{failed_count}。"
+        body = "\n\n".join(f"### 📦 章节块：{item.get('title', '')}\n\n{item['content'].strip()}" for item in successful)
+    else:
+        heading = f"## Deep Logic Review Summary Report\n\nSuccessful blocks: {len(successful)}; failed blocks: {failed_count}."
+        body = "\n\n".join(f"### 📦 Chapter block: {item.get('title', '')}\n\n{item['content'].strip()}" for item in successful)
+    return f"{heading}\n\n{body}", len(successful), failed_count
 
 
 def record_generated_draft(drafts, draft_reference_maps, node_id, text, reference_ids):

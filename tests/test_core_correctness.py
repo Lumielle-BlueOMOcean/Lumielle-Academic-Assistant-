@@ -1,8 +1,10 @@
+import ast
 import importlib.util
 import json
 import re
 import struct
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -23,6 +25,29 @@ def load_project_module(test_case, name):
     except Exception as exc:
         test_case.fail(f"Could not import {path.name}: {exc}")
     return module
+
+
+def load_app_function(test_case, app_name, function_name, namespace):
+    source = (ROOT / app_name).read_text(encoding="utf-8")
+    module = ast.parse(source)
+    function = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    compiled = compile(ast.Module(body=[function], type_ignores=[]), app_name, "exec")
+    function_code = next(
+        item for item in compiled.co_consts
+        if isinstance(item, types.CodeType) and item.co_name == function_name
+    )
+    loaded = types.FunctionType(function_code, namespace)
+    loaded.__defaults__ = tuple(ast.literal_eval(value) for value in function.args.defaults) or None
+    if function.args.kwonlyargs:
+        loaded.__kwdefaults__ = {
+            argument.arg: ast.literal_eval(value)
+            for argument, value in zip(function.args.kwonlyargs, function.args.kw_defaults)
+            if value is not None
+        }
+    return loaded
 
 
 class CoreCorrectnessTests(unittest.TestCase):
@@ -240,6 +265,140 @@ class CoreCorrectnessTests(unittest.TestCase):
             support.record_generated_draft(drafts, snapshots, "chapter", "", ["new-reference"])
         self.assertEqual(drafts, {"chapter": "Old body"})
         self.assertEqual(snapshots, {"chapter": ["old-reference"]})
+
+    def test_dispatch_returns_valid_text_or_raises_for_known_failures(self):
+        support = load_project_module(self, "writing_support")
+        for app_name in ("app.py", "app_zh.py"):
+            namespace = {
+                "get_all_profiles": lambda: [{"id": "profile", "api_key": "key", "base_url": "url", "model": "model"}],
+                "get_active_profile": lambda: {"id": "profile", "api_key": "key", "base_url": "url", "model": "model"},
+                "call_llm_api": lambda **kwargs: "valid model output",
+                "checked_llm_call": support.checked_llm_call,
+                "require_valid_llm_output": support.require_valid_llm_output,
+                "LLMOutputError": support.LLMOutputError,
+            }
+            dispatch = load_app_function(self, app_name, "dispatch_llm_call", namespace)
+            self.assertEqual(dispatch("prompt"), "valid model output", app_name)
+            namespace["get_all_profiles"] = lambda: []
+            with self.assertRaises(support.LLMOutputError):
+                dispatch("prompt")
+            namespace["get_all_profiles"] = lambda: [{"id": "profile", "api_key": "key", "base_url": "url", "model": "model"}]
+
+            for response in (
+                "API key missing: sk-test-secret-token",
+                "API call failed repeatedly: timeout",
+                "OpenAI client initialization error: bad config",
+                "No LLM configured.",
+                "No valid LLM configuration found.",
+                "API 密钥缺失：sk-test-secret-token",
+                "API 连续调用失败：timeout",
+                "OpenAI 客户端构造异常：bad config",
+                "未配置任何 LLM。",
+                "未找到有效的 LLM 配置。",
+                "",
+                "   ",
+                None,
+            ):
+                with self.subTest(app=app_name, response=response):
+                    namespace["call_llm_api"] = lambda **kwargs: response
+                    with self.assertRaises(support.LLMOutputError):
+                        dispatch("prompt")
+
+    def test_partial_model_discussion_keeps_failures_out_of_answers(self):
+        support = load_project_module(self, "writing_support")
+
+        def fake_model(model_id):
+            if model_id == "B":
+                raise support.LLMOutputError("API call failed repeatedly: timeout")
+            return f"answer from {model_id}"
+
+        answers, failures = support.collect_model_answers(("A", "B", "C"), fake_model)
+        self.assertEqual(answers, {"A": "answer from A", "C": "answer from C"})
+        self.assertEqual(failures, ["B"])
+
+    def test_literature_analysis_failure_is_unrated_but_success_is_marked(self):
+        support = load_project_module(self, "writing_support")
+        for response in ("API call failed repeatedly: timeout", "not JSON"):
+            with self.subTest(response=response):
+                result = support.parse_literature_analysis(response)
+                self.assertEqual(result["rating"], 0)
+                self.assertEqual(result["category"], "Unrated")
+                self.assertEqual(result["analysis_status"], "unavailable")
+
+        result = support.parse_literature_analysis(
+            '{"rating":4,"category":"Methods","key_findings":"Finding"}'
+        )
+        self.assertEqual(result["rating"], 4)
+        self.assertEqual(result["category"], "Methods")
+        self.assertEqual(result["analysis_status"], "ok")
+
+    def test_aigc_failure_has_no_probability(self):
+        support = load_project_module(self, "writing_support")
+        for locale in ("en", "zh"):
+            with self.subTest(locale=locale):
+                result = support.aigc_detection_error_result(locale)
+                self.assertIsNone(result["score"])
+                self.assertEqual(result["label"], "Error")
+
+        for app_name in ("app.py", "app_zh.py"):
+            def fail_dispatch(*args, **kwargs):
+                raise support.LLMOutputError("API call failed repeatedly: sk-test-secret-token")
+
+            namespace = {
+                "load_json_file": lambda *args, **kwargs: {},
+                "dispatch_llm_call": fail_dispatch,
+                "aigc_detection_error_result": support.aigc_detection_error_result,
+                "LLMOutputError": support.LLMOutputError,
+                "re": re,
+                "json": json,
+            }
+            detect = load_app_function(self, app_name, "llm_detect_aigc", namespace)
+            result = detect("a sufficiently long sample text")
+            self.assertIsNone(result["score"], app_name)
+            self.assertEqual(result["label"], "Error", app_name)
+
+    def test_deep_review_report_uses_successful_blocks_only(self):
+        support = load_project_module(self, "writing_support")
+        report, successful, failed = support.build_deep_review_report(
+            [
+                {"status": "ok", "title": "Chapter A", "content": "Review A"},
+                {"status": "error", "title": "Chapter B", "content": "API key missing: sk-secret"},
+                {"status": "ok", "title": "Chapter C", "content": "Review C"},
+            ],
+            locale="en",
+        )
+        self.assertEqual((successful, failed), (2, 1))
+        self.assertIn("Review A", report)
+        self.assertIn("Review C", report)
+        self.assertNotIn("sk-secret", report)
+        self.assertIsNone(support.build_deep_review_report([], locale="en")[0])
+
+    def test_apps_use_centralized_failure_boundary_and_user_safe_messages(self):
+        for app_name in ("app.py", "app_zh.py"):
+            source = (ROOT / app_name).read_text(encoding="utf-8")
+            with self.subTest(app=app_name):
+                self.assertNotRegex(
+                    source,
+                    r"\.startswith\(\s*['\"](?:API key missing|API call failed repeatedly|API 密钥缺失|API 连续调用失败)",
+                )
+                dispatch_body = source.split("def dispatch_llm_call(", 1)[1].split("\ndef ", 1)[0]
+                self.assertIn("checked_llm_call", dispatch_body)
+                self.assertIn("llm_error_message", source)
+                self.assertIn("collect_model_answers", source)
+                self.assertIn("parse_literature_analysis", source)
+                self.assertIn("build_deep_review_report", source)
+                self.assertNotIn("{exc}", source)
+                review_body = source.split("def render_full_logic_review(", 1)[1].split("\ndef module5_writing", 1)[0]
+                self.assertLess(
+                    review_body.index("if final_report is None:"),
+                    review_body.index('save_json_file("full_logic_review.json"'),
+                )
+
+        support = load_project_module(self, "writing_support")
+        failure = support.get_llm_failure_reason(
+            "API call failed repeatedly: invalid API key sk-test-secret-token"
+        )
+        self.assertNotIn("sk-test-secret-token", failure)
 
 
 class DocumentSupportTests(unittest.TestCase):

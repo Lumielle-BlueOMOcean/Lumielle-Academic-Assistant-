@@ -114,6 +114,10 @@ This design lets the AI focus on writing **one chapter at a time**, while the to
 - Chart requests without usable values now ask the user for data; explicitly illustrative charts are labeled as illustrative.
 - 科研基座不再只发送文档开头 5,000–6,000 个字符，而是按顺序分块解析完整提取文本；任一分块重试后仍失败时，不保存部分模块。 / Research Foundation imports now parse the complete extracted document in ordered chunks instead of sending only its first 5,000–6,000 characters; if any part still fails after one retry, no partial modules are saved.
 - 科研基座和文献导入会统一识别中英文文档提取错误。 / Research Foundation and literature imports consistently recognize document extraction errors in both locales.
+- LLM configuration, API, and empty-output failures now cross one checked boundary as `LLMOutputError`; feature handlers keep them out of generated text, saved outlines, and review reports.
+- Literature files are still imported when AI rating fails, with rating `0`, category `Unrated`, and `analysis_status: unavailable` instead of a neutral three-star result.
+- AIGC detection failures now show an unavailable result instead of `0%`; failed logic-review blocks are excluded from saved reports, and an all-failed run preserves the prior report.
+- Multi-model discussion keeps successful answers when another model fails, and consensus uses only successful answers; outline failures leave the existing outline untouched.
 
 #### Changed / 变更
 
