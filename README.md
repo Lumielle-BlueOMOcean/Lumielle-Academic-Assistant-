@@ -117,6 +117,7 @@ This design supplies structured context for chapter generation and helps authors
 - Global literature clearing now distinguishes clearing library records from deleting imported source files. / 全局清空文献库时，清除记录与删除已导入原始文件现在明确区分。
 - Failed literature chunk analysis does not replace the previously valid profile or evidence store. / 文献分块分析失败时，不替换此前有效的文献画像或证据库。
 - Accepted Smart Inbox facts now retain the editable suggested role. / 接受 Smart Inbox 建议后，现在会保存可编辑的用途字段。
+- Restored continuous document flow and the original Lumielle poster artwork in both user manuals. / 恢复中英文手册的连续分页排版，并还原 Lumielle 海报原图。
 
 #### Changed / 变更
 
