@@ -22,13 +22,14 @@ from literature_support import clear_literature_library
 from literature_intelligence import (
     analyze_literature_document,
     legacy_profile_for_display,
+    review_literature_library,
     select_literature_evidence_for_chapter,
     update_evidence_store_after_success,
 )
 from research_support import (
     PRESET_SECTIONS,
     add_custom_section,
-    build_research_planning_context,
+    build_research_planning_prompt_context,
     create_default_research_base,
     migrate_research_base,
     normalize_research_source,
@@ -1179,8 +1180,7 @@ def get_research_context_text():
     """共享科研规划上下文；Grounding 关闭的事实仍参与规划。"""
     prompts = load_json_file("prompts.json", {})
     rb = migrate_research_base(load_json_file("research_base.json", create_default_research_base()))
-    context = build_research_planning_context(rb)
-    return f"研究课题：{prompts.get('global_topic', '')}" + chr(10) + chr(10) + context
+    return build_research_planning_prompt_context(rb, prompts.get("global_topic", ""), locale="zh")
 
 
 def render_research_section(section_key, section_title, section_desc):
@@ -1341,12 +1341,14 @@ def module3_literature():
     st.header("📚 文献处理")
     literatures = load_json_file("literatures.json", [])
     evidence_store = load_json_file("literature_evidence.json", {})
+    research_topic = str(load_json_file("prompts.json", {}).get("global_topic", ""))
+    research_context = get_research_context_text()
     render_literature_ingestion(
         st, literatures, evidence_store, RAW_DIR, parse_uploaded_doc_to_text,
         dispatch_llm_call,
         lambda records: save_json_file("literatures.json", records),
         lambda records: save_json_file("literature_evidence.json", records),
-        "zh",
+        "zh", research_topic=research_topic, research_context=research_context,
     )
     literatures = load_json_file("literatures.json", [])
     evidence_store = load_json_file("literature_evidence.json", {})
@@ -1373,11 +1375,12 @@ def module3_literature():
                 with c_head:
                     st.markdown(f"#### {star_prefix}{lit['title']}")
                     display_category = "未评级" if lit.get("analysis_status") == "unavailable" else lit.get("category", "其他")
-                    st.markdown(f"**评级**: {stars} ｜ **分类**: `{display_category}`")
+                    st.markdown(f"**与当前课题的相关性**: {stars} ｜ **分类**: `{display_category}`")
                     if lit.get("analysis_status") == "unavailable":
                         st.caption("该文献未能完成 AI 评级。")
                     with st.expander("👁️ 查看 LLM 文献总结与原文", expanded=False):
                         st.markdown(f"**核心发现**: {lit.get('analysis',{}).get('key_findings','-')}")
+                        st.markdown(f"**与当前课题的相关性说明**: {lit.get('analysis',{}).get('relevance_reason','-')}")
                         st.markdown(f"**质量评估**: {lit.get('analysis',{}).get('quality_assessment','-')}")
                         st.markdown(f"**文献摘要**: {lit.get('analysis',{}).get('summary', lit['summary'][:200])}")
                         # 本地文件查看：直接调用系统默认文档查看工具打开
@@ -1411,7 +1414,7 @@ def module3_literature():
                             dispatch_llm_call,
                             lambda records: save_json_file("literatures.json", records),
                             lambda records: save_json_file("literature_evidence.json", records),
-                            "zh",
+                            "zh", research_topic=research_topic, research_context=research_context,
                         )
                 with c_star:
                     if st.button("🌟", key=f"litstar_{lit['id']}"):
@@ -1442,24 +1445,10 @@ def module3_literature():
             st.warning("文献库为空，无法评估。请先导入文献。")
         else:
             with st.spinner("AI 全景扫描文献库，评估质量并寻找补足方向..."):
-                lit_summary = "\n".join([
-                    f"- [{l.get('category','其他')}][{'⭐'*int(l.get('rating',0))}] {l['title']}: {l.get('analysis',{}).get('key_findings','')[:100]}"
-                    for l in literatures
-                ])
-                context = get_research_context_text()
-                prompt = (
-                    f"你是极端严厉的学术评审委员。基于以下研究上下文和文献库，完成两件事：\n"
-                    f"1. 评估当前文献库的整体质量（覆盖度、均衡性、权威性）\n"
-                    f"2. 明确指出缺失的文献方向，并给出可补足的文献检索建议（具体关键词/研究方向）\n\n"
-                    f"【输出要求（必须严格遵守）】\n"
-                    f"- 直接输出评审结论本身，禁止输出任何思考过程、分析步骤、推理链或解说性开场白。\n"
-                    f"- 禁止出现「好的」「我来分析」「首先」「接下来」「综上所述」等过程性、总结性套话。\n"
-                    f"- 使用简洁的条目式结论（如「一、整体质量」「二、缺失方向与补足建议」），每项直接给出判断与理由。\n\n"
-                    f"【研究上下文】\n{context[:1500]}\n\n"
-                    f"【文献库清单】\n{lit_summary[:3000]}"
-                )
                 try:
-                    res = dispatch_llm_call(prompt, system_prompt="你是一位极端严厉、挑剔的学术评审委员。", max_tokens=4000)
+                    res = review_literature_library(
+                        research_topic, research_context, literatures, dispatch_llm_call, locale="zh",
+                    )
                 except LLMOutputError:
                     st.error(llm_error_message("zh"))
                 else:
@@ -3368,7 +3357,7 @@ def module7_prompts():
             "📄 文档生成格式提示词",
             value=prompts.get("format_prompt", ""),
             height=120,
-            help="控制终稿 Word 的排版格式（缩进、行距、字体等）"
+            help="此提示词作为生成 FormatSpec 的默认文字要求；只有转换、校验并保存或选择 FormatSpec 后才影响导出。"
         )
         rewrite_prompt = st.text_area(
             "🛡️ AIGC 重写提示词",

@@ -46,18 +46,23 @@ def _generation_prompt(instructions, locale):
     schema = {
         "schema_version": 1, "name": "Custom Academic", "page": {
             "size": "A4", "margins_cm": {"top": 2.54, "bottom": 2.54, "left": 3.17, "right": 3.17},
-            "page_number": {"enabled": True, "position": "center"},
+            "page_number": {"enabled": True, "position": "center", "start": 1},
         },
         "body": {"font_latin": "Times New Roman", "font_cjk": "宋体", "font_size_pt": 12, "alignment": "justify", "line_spacing": 1.5, "first_line_indent_chars": 2, "space_before_pt": 0, "space_after_pt": 6},
         "headings": {
-            "h1": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 16, "alignment": "center", "bold": True, "space_before_pt": 18, "space_after_pt": 12},
-            "h2": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 14, "alignment": "left", "bold": True, "space_before_pt": 14, "space_after_pt": 8},
-            "h3": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 12, "alignment": "left", "bold": True, "space_before_pt": 10, "space_after_pt": 6},
+            "mode": "controlled",
+            "h1": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 16, "alignment": "center", "bold": True, "space_before_pt": 18, "space_after_pt": 12, "keep_with_next": True, "page_break_before": False},
+            "h2": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 14, "alignment": "left", "bold": True, "space_before_pt": 14, "space_after_pt": 8, "keep_with_next": True, "page_break_before": False},
+            "h3": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 12, "alignment": "left", "bold": True, "space_before_pt": 10, "space_after_pt": 6, "keep_with_next": True, "page_break_before": False},
         },
-        "table": {"style": "three_line", "font_size_pt": 10.5, "caption_prefix": ""},
-        "figure": {"caption_prefix": ""},
+        "table": {"style": "three_line", "font_size_pt": 10.5, "caption_prefix": "", "caption_enabled": True},
+        "figure": {"caption_prefix": "", "width_percent": 85, "caption_mode": "numbered"},
     }
-    task = "根据用户要求生成FormatSpec JSON。只输出给定schema允许字段的JSON，不添加代码、路径或未定义字段。" if locale == "zh" else "Generate a FormatSpec JSON from the user's requirements. Return only JSON using the supplied schema; do not add code, paths, or unsupported fields."
+    task = (
+        '根据用户要求生成 FormatSpec JSON。page_number.start 为 1–32767 的整数；headings.mode 为 "controlled" 或 "legacy"；各级标题可设置 keep_with_next、page_break_before；table.style 只能为 "grid" 或 "three_line"；figure.width_percent 为 10–100 的整数，figure.caption_mode 为 "numbered" 或 "legacy"。只输出给定 schema 允许的 JSON，不添加代码、路径或未定义字段。'
+        if locale == "zh" else
+        'Generate a FormatSpec JSON from the user\'s requirements. page_number.start is an integer from 1 to 32767; headings.mode is "controlled" or "legacy"; each heading supports keep_with_next and page_break_before; table.style is "grid" or "three_line"; figure.width_percent is an integer from 10 to 100; figure.caption_mode is "numbered" or "legacy". Return only JSON using the supplied schema; do not add code, paths, or unsupported fields.'
+    )
     return f"{task}\nSchema example:\n{json.dumps(schema, ensure_ascii=False)}\nUser requirements:\n{instructions}"
 
 

@@ -103,8 +103,11 @@ This design supplies structured context for chapter generation and helps authors
 #### Added / 新增
 
 - Added an eight-section Research Fact Layer with full-source ordered parsing, editable Smart Inbox suggestions, provenance, and explicit chapter grounding controls. / 新增八类科研事实分区，支持全文顺序解析、可编辑的 Smart Inbox 建议、来源追溯和显式章节引用控制。
+- Added an all-section, bounded Research Planning Digest so late facts and facts excluded from chapter grounding can still inform logic planning. / 新增覆盖所有分区的有界科研规划摘要，使靠后的事实和未启用正文 Grounding 的事实仍可参与逻辑规划。
 - Added full-document literature analysis for PDF, DOCX, TXT, and pasted text, with source-linked evidence and per-chapter use limited to bound literature. / 新增 PDF、DOCX、TXT 和粘贴文本的全文文献分析与来源关联证据；章节写作只取用已绑定文献的证据。
+- Literature profile synthesis uses the current research topic and planning digest; relevance ratings are separate from quality assessments, and chapter evidence selection supports Chinese and English terms. / 文献档案合并会使用当前课题与规划摘要；相关性评级与质量评价分开，章节证据选择支持中英文术语。
 - Added versioned FormatSpec presets with validated import/export, custom preset management, reviewed model-generated previews, and deterministic Word rendering. / 新增带版本的 FormatSpec 预设、校验后的导入导出、自定义预设管理、需审阅确认的模型预览和确定性 Word 渲染。
+- FormatSpec v1 supports grid and three-line tables, page-number starts, per-heading pagination controls, and figure width limits; General Academic and Legacy Compatible provide distinct layouts. / FormatSpec v1 支持网格表与三线表、页码起始值、各级标题分页控制和图片宽度；General Academic 与 Legacy Compatible 使用不同版式。
 - Updated the Chinese and English user manuals for v1.1.0. / 更新中英文 v1.1.0 用户手册。
 
 #### Fixed / 修复
@@ -113,10 +116,14 @@ This design supplies structured context for chapter generation and helps authors
 - A failed memory rebuild preserves the previous valid chapter memory. / 章节记忆重建失败时保留此前有效记忆。
 - Global literature clearing now distinguishes clearing library records from deleting imported source files. / 全局清空文献库时，清除记录与删除已导入原始文件现在明确区分。
 - Failed literature chunk analysis does not replace the previously valid profile or evidence store. / 文献分块分析失败时，不替换此前有效的文献画像或证据库。
+- Accepted Smart Inbox facts now retain the editable suggested role. / 接受 Smart Inbox 建议后，现在会保存可编辑的用途字段。
 
 #### Changed / 变更
 
 - Context Sandwich documentation now describes complete-chapter memory construction and compact summaries without promising perfect recall or consistency. / 上下文三明治说明现准确描述完整章节记忆构建与摘要使用，不再承诺绝对记忆或一致性。
+- Logic planning uses a bounded digest of persisted facts from every section rather than a fixed head-only prefix; grounding toggles affect chapter retrieval, not planning inclusion. / 逻辑规划使用覆盖所有分区已存事实的有界摘要，不再依赖固定开头前缀；Grounding 开关控制正文检索，不控制规划是否纳入事实。
+- Literature relevance is evaluated against the current topic and planning context; source quality is assessed separately, and oversized library reviews use ordered profile batches before hierarchical synthesis. / 文献相关性结合当前课题和规划上下文评价，来源质量单独评估；大型文献库按档案顺序分批审查后再分层合并。
+- General Academic and Legacy Compatible now have distinct page, table, caption, and pagination behavior. / General Academic 与 Legacy Compatible 现在具有不同的页面、表格、标题和分页行为。
 - Word export formatting is now driven by validated FormatSpec data, while DOCX templates retain their existing content and styles in template-preserving mode. / Word 排版现在由经过校验的 FormatSpec 数据驱动；模板保留模式会保留模板已有内容与样式。
 
 ### v1.0.1 — 2026-09-27

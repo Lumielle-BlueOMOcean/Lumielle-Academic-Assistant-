@@ -47,7 +47,7 @@ _LABELS = {
 }
 
 
-def _import_one(title, text, source, link, raw_bytes, extension, literatures, evidence_store, raw_dir, llm_call, locale):
+def _import_one(title, text, source, link, raw_bytes, extension, literatures, evidence_store, raw_dir, llm_call, locale, research_topic="", research_context=""):
     literature_id = str(uuid.uuid4())
     filename = title if os.path.splitext(title)[1] else f"{title}{extension}"
     file_path = ""
@@ -56,13 +56,16 @@ def _import_one(title, text, source, link, raw_bytes, extension, literatures, ev
     except Exception:
         file_path = ""
     record = new_literature_record(literature_id, title, text, source=source, link=link, file_path=file_path)
-    result = analyze_literature_document(text, title, llm_call, locale=locale)
+    result = analyze_literature_document(
+        text, title, llm_call, locale=locale,
+        research_topic=research_topic, research_context=research_context,
+    )
     updated, new_store, success = apply_analysis_to_literature_record(record, evidence_store, result)
     literatures.append(updated)
     return new_store, success, result
 
 
-def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extract_upload_text, llm_call, save_records, save_evidence, locale="en"):
+def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extract_upload_text, llm_call, save_records, save_evidence, locale="en", *, research_topic="", research_context=""):
     labels = _LABELS[locale]
     st.subheader(labels["heading"])
     uploads = st.file_uploader(labels["upload"], type=["pdf", "docx", "txt"], accept_multiple_files=True, key="literature_full_uploads")
@@ -78,6 +81,7 @@ def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extrac
                     evidence_store, success, result = _import_one(
                         upload.name, text, "Local Upload", "", upload.getvalue(),
                         Path(upload.name).suffix or ".txt", literatures, evidence_store, raw_dir, llm_call, locale,
+                        research_topic, research_context,
                     )
                 if success:
                     st.success(labels["success"].format(chunks=result["chunks_total"], evidence=len(result["evidence"])))
@@ -101,6 +105,7 @@ def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extrac
                 evidence_store, success, result = _import_one(
                     title.strip(), pasted, source or "Pasted Text", source,
                     pasted.encode("utf-8"), ".txt", literatures, evidence_store, raw_dir, llm_call, locale,
+                    research_topic, research_context,
                 )
                 save_records(literatures)
                 save_evidence(evidence_store)
@@ -111,7 +116,7 @@ def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extrac
                 st.rerun()
 
 
-def render_legacy_reanalysis(st, literature, literatures, evidence_store, raw_dir, extract_document_text, llm_call, save_records, save_evidence, locale="en"):
+def render_legacy_reanalysis(st, literature, literatures, evidence_store, raw_dir, extract_document_text, llm_call, save_records, save_evidence, locale="en", *, research_topic="", research_context=""):
     labels = _LABELS[locale]
     evidence = evidence_store.get(str(literature.get("id", "")), []) if isinstance(evidence_store, dict) else []
     if evidence:
@@ -129,7 +134,10 @@ def render_legacy_reanalysis(st, literature, literatures, evidence_store, raw_di
         if is_document_parse_error(text):
             st.warning(labels["reanalyze_failed"])
             return
-        result = analyze_literature_document(text, literature.get("title", ""), llm_call, locale=locale)
+        result = analyze_literature_document(
+            text, literature.get("title", ""), llm_call, locale=locale,
+            research_topic=research_topic, research_context=research_context,
+        )
         updated, new_store, success = apply_analysis_to_literature_record(literature, evidence_store, result)
         if not success:
             st.warning(labels["reanalyze_failed"])

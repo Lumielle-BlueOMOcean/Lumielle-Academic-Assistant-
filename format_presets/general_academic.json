@@ -4,7 +4,7 @@
   "page": {
     "size": "A4",
     "margins_cm": {"top": 2.54, "bottom": 2.54, "left": 3.17, "right": 3.17},
-    "page_number": {"enabled": true, "position": "center"}
+    "page_number": {"enabled": true, "position": "center", "start": 1}
   },
   "body": {
     "font_latin": "Times New Roman",
@@ -17,10 +17,11 @@
     "space_after_pt": 6
   },
   "headings": {
-    "h1": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 16, "alignment": "center", "bold": true, "space_before_pt": 18, "space_after_pt": 12},
-    "h2": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 14, "alignment": "left", "bold": true, "space_before_pt": 14, "space_after_pt": 8},
-    "h3": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 12, "alignment": "left", "bold": true, "space_before_pt": 10, "space_after_pt": 6}
+    "mode": "controlled",
+    "h1": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 16, "alignment": "center", "bold": true, "space_before_pt": 18, "space_after_pt": 12, "keep_with_next": true, "page_break_before": false},
+    "h2": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 14, "alignment": "left", "bold": true, "space_before_pt": 14, "space_after_pt": 8, "keep_with_next": true, "page_break_before": false},
+    "h3": {"font_latin": "Arial", "font_cjk": "黑体", "font_size_pt": 12, "alignment": "left", "bold": true, "space_before_pt": 10, "space_after_pt": 6, "keep_with_next": true, "page_break_before": false}
   },
-  "table": {"style": "three_line", "font_size_pt": 10.5, "caption_prefix": ""},
-  "figure": {"caption_prefix": ""}
+  "table": {"style": "three_line", "font_size_pt": 10.5, "caption_prefix": "", "caption_enabled": true},
+  "figure": {"caption_prefix": "", "width_percent": 85, "caption_mode": "numbered"}
 }

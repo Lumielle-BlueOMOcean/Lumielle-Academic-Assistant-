@@ -9,7 +9,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Cm, Inches, Pt
+from docx.shared import Cm, Inches, Pt, RGBColor
 
 from format_support import validate_format_spec
 from writing_support import (
@@ -70,8 +70,18 @@ def _set_heading(paragraph, spec, level):
     fmt.space_before = Pt(settings["space_before_pt"])
     fmt.space_after = Pt(settings["space_after_pt"])
     fmt.first_line_indent = Pt(0)
+    fmt.keep_with_next = settings["keep_with_next"]
+    fmt.page_break_before = settings["page_break_before"]
     for run in paragraph.runs:
         _set_run_font(run, settings["font_latin"], settings["font_cjk"], settings["font_size_pt"], settings["bold"])
+
+
+def _set_legacy_heading_font(paragraph, spec, level):
+    """Match v1.0.x: retain Word heading-style geometry and only set the old font/color."""
+    settings = spec["headings"][f"h{level}"]
+    for run in paragraph.runs:
+        _set_run_font(run, settings["font_latin"], settings["font_cjk"])
+        run.font.color.rgb = RGBColor(0, 0, 0)
 
 
 def _set_cell_border(cell, **edges):
@@ -150,16 +160,17 @@ def _add_table(doc, lines, spec, number, locale):
     rows = _parse_markdown_table(lines)
     if not rows:
         return number
-    prefix = spec["table"]["caption_prefix"] or ("表" if locale == "zh" else "Table")
-    caption = doc.add_paragraph(f"{prefix} {number}")
-    _format_paragraph(caption, spec, indent=False, alignment="center")
-    for run in caption.runs:
-        run.bold = True
-        run.font.size = Pt(spec["table"]["font_size_pt"])
+    if spec["table"]["caption_enabled"]:
+        prefix = spec["table"]["caption_prefix"] or ("表" if locale == "zh" else "Table")
+        caption = doc.add_paragraph(f"{prefix} {number}")
+        _format_paragraph(caption, spec, indent=False, alignment="center")
+        for run in caption.runs:
+            run.bold = True
+            run.font.size = Pt(spec["table"]["font_size_pt"])
     cols = max(len(row) for row in rows)
     table = doc.add_table(rows=len(rows), cols=cols)
     try:
-        table.style = "Table Normal"
+        table.style = "Table Grid" if spec["table"]["style"] == "grid" else "Table Normal"
     except Exception:
         pass
     for row_index, row in enumerate(rows):
@@ -171,8 +182,22 @@ def _add_table(doc, lines, spec, number, locale):
                 paragraph.paragraph_format.space_after = Pt(0)
                 for run in paragraph.runs:
                     _set_run_font(run, spec["body"]["font_latin"], spec["body"]["font_cjk"], spec["table"]["font_size_pt"], row_index == 0)
-    _apply_three_line_borders(table)
+    if spec["table"]["style"] == "three_line":
+        _apply_three_line_borders(table)
     return number + 1
+
+
+def _set_page_number_start(section, start):
+    sect_pr = section._sectPr
+    page_number = sect_pr.find(qn("w:pgNumType"))
+    if page_number is None:
+        page_number = OxmlElement("w:pgNumType")
+        columns = sect_pr.find(qn("w:cols"))
+        if columns is None:
+            sect_pr.append(page_number)
+        else:
+            sect_pr.insert(list(sect_pr).index(columns), page_number)
+    page_number.set(qn("w:start"), str(int(start)))
 
 
 def _add_page_field(section, spec):
@@ -191,7 +216,7 @@ def _add_page_field(section, spec):
     separate = OxmlElement("w:fldChar")
     separate.set(qn("w:fldCharType"), "separate")
     displayed = OxmlElement("w:t")
-    displayed.text = "1"
+    displayed.text = str(page["start"])
     end = OxmlElement("w:fldChar")
     end.set(qn("w:fldCharType"), "end")
     run._r.extend((begin, instruction, separate, displayed, end))
@@ -231,6 +256,8 @@ def render_manuscript_docx(
             section.bottom_margin = Cm(margins["bottom"])
             section.left_margin = Cm(margins["left"])
             section.right_margin = Cm(margins["right"])
+            if spec["page"]["page_number"]["enabled"]:
+                _set_page_number_start(section, spec["page"]["page_number"]["start"])
             _add_page_field(section, spec)
 
     ordered, number_by_id, literature_by_id = collect_global_reference_registry(
@@ -249,7 +276,10 @@ def render_manuscript_docx(
         if title:
             heading = doc.add_heading(title, level=min(depth + 1, 3))
             if not template_only:
-                _set_heading(heading, spec, min(depth + 1, 3))
+                if spec["headings"]["mode"] == "legacy":
+                    _set_legacy_heading_font(heading, spec, min(depth + 1, 3))
+                else:
+                    _set_heading(heading, spec, min(depth + 1, 3))
         text = str(drafts.get(node_id, "") or "")
         if text:
             local_reference_ids = reference_ids_for_node(node, draft_reference_maps)
@@ -294,10 +324,13 @@ def render_manuscript_docx(
                 try:
                     paragraph = doc.add_paragraph()
                     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    paragraph.add_run().add_picture(path, width=Inches(page_width_in))
-                    prefix = spec["figure"]["caption_prefix"] or ("图" if locale == "zh" else "Figure")
-                    _add_caption(doc, chart.get("caption", "") if isinstance(chart, dict) else "", prefix, figure_number, spec)
-                    figure_number += 1
+                    figure_width = page_width_in * spec["figure"]["width_percent"] / 100
+                    paragraph.add_run().add_picture(path, width=Inches(figure_width))
+                    caption = chart.get("caption", "") if isinstance(chart, dict) else ""
+                    if spec["figure"]["caption_mode"] == "numbered":
+                        prefix = spec["figure"]["caption_prefix"] or ("图" if locale == "zh" else "Figure")
+                        _add_caption(doc, caption, prefix, figure_number, spec)
+                        figure_number += 1
                 except (OSError, ValueError):
                     continue
 
@@ -307,10 +340,16 @@ def render_manuscript_docx(
                 try:
                     paragraph = doc.add_paragraph()
                     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    paragraph.add_run().add_picture(path, width=Inches(page_width_in))
-                    prefix = spec["figure"]["caption_prefix"] or ("图" if locale == "zh" else "Figure")
-                    _add_caption(doc, image.get("caption", "") if isinstance(image, dict) else "", prefix, figure_number, spec)
-                    figure_number += 1
+                    figure_width = page_width_in * spec["figure"]["width_percent"] / 100
+                    paragraph.add_run().add_picture(path, width=Inches(figure_width))
+                    caption = image.get("caption", "") if isinstance(image, dict) else ""
+                    if spec["figure"]["caption_mode"] == "numbered":
+                        prefix = spec["figure"]["caption_prefix"] or ("图" if locale == "zh" else "Figure")
+                        _add_caption(doc, caption, prefix, figure_number, spec)
+                        figure_number += 1
+                    elif caption:
+                        caption_paragraph = doc.add_paragraph(caption)
+                        caption_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 except (OSError, ValueError):
                     continue
 

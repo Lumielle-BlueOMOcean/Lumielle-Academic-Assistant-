@@ -22,13 +22,14 @@ from literature_support import clear_literature_library
 from literature_intelligence import (
     analyze_literature_document,
     legacy_profile_for_display,
+    review_literature_library,
     select_literature_evidence_for_chapter,
     update_evidence_store_after_success,
 )
 from research_support import (
     PRESET_SECTIONS,
     add_custom_section,
-    build_research_planning_context,
+    build_research_planning_prompt_context,
     create_default_research_base,
     migrate_research_base,
     normalize_research_source,
@@ -1186,8 +1187,7 @@ def get_research_context_text():
     """Shared planning context includes parsed facts regardless of writing-grounding toggles."""
     prompts = load_json_file("prompts.json", {})
     rb = migrate_research_base(load_json_file("research_base.json", create_default_research_base()))
-    context = build_research_planning_context(rb)
-    return f"Research topic: {prompts.get('global_topic', '')}" + chr(10) + chr(10) + context
+    return build_research_planning_prompt_context(rb, prompts.get("global_topic", ""), locale="en")
 
 
 def render_research_section(section_key, section_title, section_desc):
@@ -1348,12 +1348,14 @@ def module3_literature():
     st.header("📚 Literature Processing")
     literatures = load_json_file("literatures.json", [])
     evidence_store = load_json_file("literature_evidence.json", {})
+    research_topic = str(load_json_file("prompts.json", {}).get("global_topic", ""))
+    research_context = get_research_context_text()
     render_literature_ingestion(
         st, literatures, evidence_store, RAW_DIR, parse_uploaded_doc_to_text,
         dispatch_llm_call,
         lambda records: save_json_file("literatures.json", records),
         lambda records: save_json_file("literature_evidence.json", records),
-        "en",
+        "en", research_topic=research_topic, research_context=research_context,
     )
     literatures = load_json_file("literatures.json", [])
     evidence_store = load_json_file("literature_evidence.json", {})
@@ -1382,11 +1384,12 @@ def module3_literature():
                 with c_head:
                     st.markdown(f"#### {star_prefix}{lit['title']}")
                     display_category = "Unrated" if lit.get("analysis_status") == "unavailable" else lit.get("category", "Other")
-                    st.markdown(f"**Rating**: {stars} | **Category**: `{display_category}`")
+                    st.markdown(f"**Relevance to current research**: {stars} | **Category**: `{display_category}`")
                     if lit.get("analysis_status") == "unavailable":
                         st.caption("AI rating unavailable for this imported reference.")
                     with st.expander("👁️ View LLM Summary & Original Text", expanded=False):
                         st.markdown(f"**Key findings**: {lit.get('analysis',{}).get('key_findings','-')}")
+                        st.markdown(f"**Relevance reason**: {lit.get('analysis',{}).get('relevance_reason','-')}")
                         st.markdown(f"**Quality assessment**: {lit.get('analysis',{}).get('quality_assessment','-')}")
                         st.markdown(f"**Abstract**: {lit.get('analysis',{}).get('summary', lit['summary'][:200])}")
                         # 本地文件查看：直接调用系统默认文档查看工具打开
@@ -1420,7 +1423,7 @@ def module3_literature():
                             dispatch_llm_call,
                             lambda records: save_json_file("literatures.json", records),
                             lambda records: save_json_file("literature_evidence.json", records),
-                            "en",
+                            "en", research_topic=research_topic, research_context=research_context,
                         )
                 with c_star:
                     if st.button("🌟", key=f"litstar_{lit['id']}"):
@@ -1451,24 +1454,10 @@ def module3_literature():
             st.warning("The literature library is empty. Import literature first.")
         else:
             with st.spinner("AI is scanning the literature library, assessing quality and finding gaps..."):
-                lit_summary = "\n".join([
-                    f"- [{l.get('category','Other')}][{'⭐'*int(l.get('rating',0))}] {l['title']}: {l.get('analysis',{}).get('key_findings','')[:100]}"
-                    for l in literatures
-                ])
-                context = get_research_context_text()
-                prompt = (
-                    f"You are an extremely strict academic review committee member. Based on the research context and literature library below, do two things:\n"
-                    f"1. Assess the overall quality of the current literature library (coverage, balance, authority)\n"
-                    f"2. Clearly point out missing literature directions and give concrete retrieval suggestions (specific keywords / research directions)\n\n"
-                    f"[OUTPUT REQUIREMENTS (MUST FOLLOW)]\n"
-                    f"- Output the review conclusion directly; no thinking process, analysis steps, reasoning chains or explanatory preamble.\n"
-                    f"- Never use process/summary filler such as \"Okay\", \"Let me analyze\", \"First\", \"Next\", \"In conclusion\".\n"
-                    f"- Use concise itemized conclusions (e.g. \"I. Overall quality\", \"II. Missing directions and suggestions\"), each with a direct judgment and reason.\n\n"
-                    f"[RESEARCH CONTEXT]\n{context[:1500]}\n\n"
-                    f"[LITERATURE LIBRARY LIST]\n{lit_summary[:3000]}"
-                )
                 try:
-                    res = dispatch_llm_call(prompt, system_prompt="You are an extremely strict, demanding academic review committee member.", max_tokens=4000)
+                    res = review_literature_library(
+                        research_topic, research_context, literatures, dispatch_llm_call, locale="en",
+                    )
                 except LLMOutputError:
                     st.error(llm_error_message("en"))
                 else:
@@ -3377,7 +3366,7 @@ def module7_prompts():
             "📄 Document Format Prompt",
             value=prompts.get("format_prompt", ""),
             height=120,
-            help="Controls final Word layout (indent, line spacing, fonts, etc.)"
+            help="Default natural-language requirements for generating a FormatSpec. They affect export only after a generated spec is reviewed, validated, and saved or selected."
         )
         rewrite_prompt = st.text_area(
             "🛡️ AIGC Rewrite Prompt",

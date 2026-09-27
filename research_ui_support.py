@@ -10,6 +10,7 @@ import pandas as pd
 from document_support import is_document_parse_error
 from research_support import (
     PRESET_SECTIONS,
+    accept_smart_inbox_facts,
     add_custom_section,
     create_default_research_base,
     migrate_research_base,
@@ -234,12 +235,9 @@ def _render_inbox(st, base, llm_call, save_base, extract_upload_text, locale):
     if st.button(text["accept"], key="research_inbox_accept"):
         target = sections[selected]
         tag_values = [tag.strip() for tag in tags.split(",") if tag.strip()]
-        for fact in pending.get("facts", []):
-            fact["section"] = selected
-            fact["tags"] = list(dict.fromkeys(fact.get("tags", []) + tag_values))
-            fact["allow_writing_grounding"] = bool(allow_grounding)
-            fact["source_title"] = pending.get("source", {}).get("title", "")
-            target["modules"].append(fact)
+        target["modules"].extend(accept_smart_inbox_facts(
+            pending, selected, tag_values, role, allow_grounding,
+        ))
         save_base(base)
         st.session_state.pop("research_inbox_pending", None)
         st.success(text["accept_notice"])

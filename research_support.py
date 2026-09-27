@@ -6,7 +6,9 @@ import json
 import re
 import uuid
 
+from context_digest_support import balanced_excerpt
 from document_support import DEFAULT_CHUNK_CHARS, parse_document_in_chunks
+from relevance_support import multilingual_terms
 
 
 PRESET_SECTIONS = (
@@ -66,6 +68,7 @@ def _normalize_fact(module, section_id, allow_grounding, source_id=None, source_
         result["content"] = str(result.get("content") or result.get("text") or "")
     tags = result.get("tags", [])
     result["tags"] = [str(tag).strip() for tag in tags if str(tag).strip()] if isinstance(tags, list) else []
+    result["role"] = str(result.get("role", "") or "")[:240]
     result["source_id"] = str(result.get("source_id") or source_id or "")
     chunk = result.get("source_chunk", source_chunk or 1)
     result["source_chunk"] = int(chunk) if isinstance(chunk, int) and not isinstance(chunk, bool) and chunk > 0 else int(source_chunk or 1)
@@ -255,32 +258,115 @@ def replace_section_facts(research_base, section_id, parse_result, *, append=Tru
     return base, True
 
 
+def _table_rows_text(columns, rows):
+    return f"columns={json.dumps(columns, ensure_ascii=False, separators=(',', ':'))}; rows=" + json.dumps(
+        rows, ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def _table_excerpt(columns, rows, max_chars):
+    full = _table_rows_text(columns, rows)
+    if len(full) <= max_chars:
+        return full
+    if max_chars <= 0:
+        return ""
+    rows = rows if isinstance(rows, list) else []
+    omitted_note = " [evenly sampled rows; omitted rows remain stored]"
+    for count in range(len(rows), 0, -1):
+        if count == 1:
+            indices = [len(rows) - 1]
+        else:
+            indices = sorted({round(position * (len(rows) - 1) / (count - 1)) for position in range(count)})
+        sampled = [rows[index] for index in indices]
+        value = _table_rows_text(columns, sampled)
+        if len(indices) < len(rows):
+            value += omitted_note
+        if len(value) <= max_chars:
+            return value
+    header = f"columns={json.dumps(columns, ensure_ascii=False, separators=(',', ':'))}; rows="
+    marker = " [rows omitted; source table remains stored]"
+    if max_chars <= len(marker):
+        return balanced_excerpt(header + marker, max_chars)
+    return balanced_excerpt(header, max_chars - len(marker)) + marker
+
+
+def _planning_fact_line(fact, budget=None):
+    title = str(fact.get("title", ""))
+    tags = ", ".join(str(tag) for tag in fact.get("tags", []) if str(tag).strip())
+    suffix = f" (tags: {tags})" if tags else ""
+    prefix = f"- {title}: "
+    if fact.get("type") == "table":
+        columns, rows = fact.get("columns", []), fact.get("data", [])
+        content = _table_rows_text(columns, rows)
+        if budget is not None and len(prefix) + len(content) + len(suffix) > budget:
+            content = _table_excerpt(columns, rows, max(0, budget - len(prefix) - len(suffix)))
+    else:
+        content = str(fact.get("content", ""))
+        if budget is not None:
+            content = balanced_excerpt(content, max(0, budget - len(prefix) - len(suffix)))
+    line = prefix + content + suffix
+    if budget is not None and len(line) > budget:
+        line = balanced_excerpt(line, budget)
+    return line
+
+
 def build_research_planning_context(research_base, max_chars=12000):
-    """Planning sees all parsed research facts, including sections disabled for prose grounding."""
+    """Build a bounded, ordered digest in which every saved section/fact gets representation."""
     base = migrate_research_base(research_base)
-    lines = []
+    sections = []
+    records = []
     for section_id, section in base["sections"].items():
         modules = section.get("modules", [])
         if not modules:
             continue
-        lines.append(f"[{section.get('name_en') or section.get('name') or section_id} | planning context]")
-        for fact in modules:
-            title = fact.get("title", "")
-            content = fact.get("content", "")
-            if fact.get("type") == "table":
-                content = f"columns={fact.get('columns', [])}; rows={fact.get('data', [])}"
-            tags = ", ".join(fact.get("tags", []))
-            lines.append(f"- {title}: {content}" + (f" (tags: {tags})" if tags else ""))
-    joined = "\n".join(lines)
-    return joined if len(joined) <= max_chars else joined[:max_chars] + "\n[Planning context display truncated; stored facts remain intact.]"
+        header = f"[{section.get('name_en') or section.get('name') or section_id} | planning context]"
+        sections.append((section_id, header, modules))
+        records.extend((section_id, fact) for fact in modules)
+    if not records:
+        return ""
+    full_lines = []
+    for _, header, modules in sections:
+        full_lines.append(header)
+        full_lines.extend(_planning_fact_line(fact) for fact in modules)
+    full = "\n".join(full_lines)
+    budget = max(0, int(max_chars))
+    if len(full) <= budget:
+        return full
+
+    # Allocate by fact count, not source position. Every section and fact therefore
+    # contributes even when later records would have fallen after a prefix limit.
+    header_chars = sum(len(header) + 1 for _, header, _ in sections)
+    available = max(0, budget - header_chars - len(records))
+    per_fact_budget = available // len(records) if records else 0
+    section_map = {section_id: header for section_id, header, _ in sections}
+    result_lines = []
+    for _, header, modules in sections:
+        if not modules:
+            continue
+        result_lines.append(header)
+        result_lines.extend(_planning_fact_line(fact, per_fact_budget) for fact in modules)
+    digest = "\n".join(result_lines)
+    if len(digest) <= budget:
+        return digest
+    # If metadata alone exceeds the target, deterministically distribute the
+    # remaining characters across the already ordered fact lines.
+    headers = set(section_map.values())
+    compact_headers = [line for line in result_lines if line in headers]
+    available = max(0, budget - sum(len(line) + 1 for line in compact_headers))
+    fact_lines = [line for line in result_lines if line not in headers]
+    per_line = available // max(1, len(fact_lines))
+    return balanced_excerpt("\n".join(compact_headers + [balanced_excerpt(line, per_line) for line in fact_lines]), budget)
 
 
-def _terms(text):
-    ascii_terms = {part.casefold() for part in re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", str(text or "")) if len(part) > 1}
-    cjk = re.findall(r"[\u3400-\u9fff]+", str(text or ""))
-    for sequence in cjk:
-        ascii_terms.update(sequence[i:i + 2] for i in range(len(sequence) - 1))
-    return ascii_terms
+def build_research_planning_prompt_context(research_base, global_topic="", *, locale="en", max_chars=12000):
+    """Create the exact all-fact planning block consumed by outline and library review."""
+    digest = build_research_planning_context(research_base, max_chars=max_chars)
+    if locale == "zh":
+        return f"【GLOBAL RESEARCH TOPIC】\n{global_topic}\n\n【RESEARCH PLANNING DIGEST】\n{digest}"
+    return f"[GLOBAL RESEARCH TOPIC]\n{global_topic}\n\n[RESEARCH PLANNING DIGEST]\n{digest}"
+
+
+_terms = multilingual_terms
 
 
 def select_research_grounding_for_chapter(research_base, chapter_title, chapter_description="", outline_position="", *, chapter_id=None, limit=8):
@@ -319,28 +405,49 @@ def build_chapter_research_context(research_base, chapter_title, chapter_descrip
         research_base, chapter_title, chapter_description, outline_position,
         chapter_id=chapter_id, limit=limit,
     )
-    constraints = []
-    facts = []
-    for item in selected:
-        title = str(item.get("title", ""))[:180]
-        if item.get("type") == "table":
-            content = f"columns={item.get('columns', [])}; rows={item.get('data', [])}"
+    def is_constraint(item):
+        return item.get("section") == "constraints" or "hard_constraint" in item.get("tags", [])
+
+    constraint_items = [item for item in selected if is_constraint(item)]
+    fact_items = [item for item in selected if not is_constraint(item)]
+    omitted = False
+    notice = (
+        "[Additional selected facts omitted by context budget; saved facts are unchanged.]"
+        if locale != "zh" else "【上下文预算不足，省略了部分已选事实；已保存的事实未被修改。】"
+    )
+    usable_budget = max(0, int(max_chars))
+    included = []
+    for item in constraint_items + fact_items:
+        line = _planning_fact_line(item)
+        used = sum(len(value) + 1 for _, value in included)
+        reserve = len(notice) + 1 if len(line) + used > usable_budget else 0
+        remaining = usable_budget - reserve - used
+        if len(line) <= remaining:
+            included.append((item, line))
+        elif not included and remaining > 0:
+            included.append((item, _planning_fact_line(item, remaining)))
         else:
-            content = str(item.get("content", ""))
-        content = content[:1200]
-        tags = ", ".join(str(tag) for tag in item.get("tags", [])[:12])
-        line = f"- {title}: {content}" + (f" (tags: {tags})" if tags else "")
-        if item.get("section") == "constraints" or "hard_constraint" in item.get("tags", []):
-            constraints.append(line)
+            omitted = True
+    if omitted:
+        while included and sum(len(value) + 1 for _, value in included) + len(notice) > usable_budget:
+            included.pop()
+        if len(notice) <= usable_budget:
+            included.append((None, notice))
+    constraint_lines = []
+    fact_lines = []
+    for item, line in included:
+        if item is None:
+            continue
+        destination = constraint_lines if is_constraint(item) else fact_lines
+        destination.append(line)
+    if omitted and included and included[-1][0] is None:
+        if fact_lines:
+            fact_lines.append(notice)
         else:
-            facts.append(line)
-    constraint_block = "\n".join(constraints)
-    fact_block = "\n".join(facts)
-    if len(constraint_block) + len(fact_block) > max_chars:
-        remaining = max_chars
-        constraint_block = constraint_block[:remaining]
-        remaining -= len(constraint_block)
-        fact_block = fact_block[:max(0, remaining)]
+            constraint_lines.append(notice)
+    constraint_block = "\n".join(constraint_lines)
+    fact_block = "\n".join(fact_lines)
+    included_facts = [item for item, _ in included if item is not None]
     if locale == "zh":
         constraint_label = "无已启用的全局研究约束。"
         facts_label = "无匹配且已启用的研究事实。"
@@ -350,8 +457,31 @@ def build_chapter_research_context(research_base, chapter_title, chapter_descrip
     return {
         "research_constraints": constraint_block or constraint_label,
         "research_facts": fact_block or facts_label,
-        "selected_research_facts": selected,
+        "selected_research_facts": included_facts,
+        "omitted_research_fact_count": max(0, len(selected) - sum(item is not None for item, _ in included)),
     }
+
+
+def accept_smart_inbox_facts(pending, section_id, tags, role, allow_grounding):
+    """Apply reviewed Smart Inbox fields to normalized facts before persistence."""
+    if not isinstance(pending, dict):
+        return []
+    source_title = str((pending.get("source") or {}).get("title", ""))
+    accepted = []
+    for item in pending.get("facts", []):
+        if not isinstance(item, dict):
+            continue
+        fact = dict(item)
+        fact["section"] = str(section_id)
+        fact["tags"] = list(dict.fromkeys(
+            [str(value).strip() for value in fact.get("tags", []) if str(value).strip()]
+            + [str(value).strip() for value in tags if str(value).strip()]
+        ))
+        fact["role"] = str(role or "").strip()[:240]
+        fact["allow_writing_grounding"] = bool(allow_grounding)
+        fact["source_title"] = source_title
+        accepted.append(fact)
+    return accepted
 
 
 def parse_classification_suggestion(response, valid_section_ids):

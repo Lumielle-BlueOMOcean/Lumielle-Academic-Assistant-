@@ -8,7 +8,9 @@ import re
 import uuid
 from pathlib import Path
 
+from context_digest_support import balanced_excerpt
 from document_support import DEFAULT_CHUNK_CHARS, chunk_document_text
+from relevance_support import multilingual_terms
 from writing_support import LLMOutputError, require_valid_llm_output
 
 
@@ -51,7 +53,7 @@ def build_chunk_extraction_prompt(title, chunk, index, total, locale="en", retry
     )
 
 
-def build_synthesis_prompt(title, extractions, locale="en", retry=False):
+def build_synthesis_prompt(title, extractions, locale="en", retry=False, *, research_topic="", research_context=""):
     ordered = "\n\n".join(
         f"[CHUNK EXTRACTION {index}/{len(extractions)}]\n{json.dumps(item, ensure_ascii=False)}"
         for index, item in enumerate(extractions, 1)
@@ -60,17 +62,21 @@ def build_synthesis_prompt(title, extractions, locale="en", retry=False):
         retry_note = "上次输出无效，请只输出符合字段要求的 JSON 对象。\n" if retry else ""
         return (
             "[DOCUMENT SYNTHESIS]\n"
-            "根据以下完整文献的有序分块提取结果形成整篇文献档案。合并重复内容；若源文献不同部分存在矛盾，应保留并标明矛盾，不要自行裁决；不得编造。评级与分类必须依据全部分块。\n"
+            "根据以下完整文献的有序分块提取结果形成整篇文献档案。合并重复内容；若源文献不同部分存在矛盾，应保留并标明矛盾，不要自行裁决；不得编造。\n"
+            "rating 仅表示该文献与当前研究项目的相关性和实用性；quality_assessment 单独评估严谨性、证据强度、局限，以及原文支持的时效性，不得将两者混为一项。\n"
             f"文献标题：{title}\n" + retry_note
-            + "仅输出 JSON 对象，字段：rating(1-5整数)、category、research_question、methods、sample、key_findings、limitations、quality_assessment、summary。\n"
+            + "仅输出 JSON 对象，字段：rating(1-5整数)、category、research_question、methods、sample、key_findings、limitations、quality_assessment、relevance_reason、summary。\n"
+            + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
             "[ORDERED CHUNK EXTRACTIONS]\n" + ordered
         )
     retry_note = "The previous output was invalid. Return only a valid JSON object with all required fields.\n" if retry else ""
     return (
         "[DOCUMENT SYNTHESIS]\n"
-        "Build one profile for the complete literature document from all ordered chunk extractions below. Merge duplicates, preserve conflicts present in the source instead of resolving them, and do not fabricate. Rating and category must reflect the whole document.\n"
+        "Build one profile for the complete literature document from all ordered chunk extractions below. Merge duplicates, preserve conflicts present in the source instead of resolving them, and do not fabricate.\n"
+        "The rating measures relevance and usefulness to the current research project. Assess intrinsic quality separately in quality_assessment: rigor, evidence strength, limitations, and timeliness only when supported by the source.\n"
         f"Title: {title}\n" + retry_note
-        + "Return only a JSON object with rating (integer 1-5), category, research_question, methods, sample, key_findings, limitations, quality_assessment, and summary.\n"
+        + "Return only a JSON object with rating (integer 1-5), category, research_question, methods, sample, key_findings, limitations, quality_assessment, relevance_reason, and summary.\n"
+        + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
         "[ORDERED CHUNK EXTRACTIONS]\n" + ordered
     )
 
@@ -130,13 +136,13 @@ def _normalize_profile(value):
     category = value.get("category")
     if isinstance(value.get("rating"), bool) or not 1 <= rating <= 5 or not isinstance(category, str) or not category.strip():
         return None
-    fields = ("research_question", "methods", "sample", "key_findings", "limitations", "quality_assessment", "summary")
+    fields = ("research_question", "methods", "sample", "key_findings", "limitations", "quality_assessment", "relevance_reason", "summary")
     profile = {key: str(value.get(key, "") or "").strip() for key in fields}
     profile.update({"rating": rating, "category": category.strip(), "analysis_status": "ok"})
     return profile
 
 
-def analyze_literature_document(document_text, title, llm_call, *, locale="en", max_chars=DEFAULT_CHUNK_CHARS):
+def analyze_literature_document(document_text, title, llm_call, *, locale="en", max_chars=DEFAULT_CHUNK_CHARS, research_topic="", research_context=""):
     """Analyze every ordered chunk, then synthesize a profile and provenance-bearing evidence."""
     if not isinstance(document_text, str) or not document_text.strip():
         return {"status": "error", "profile": None, "evidence": [], "chunks_total": 0, "failed_chunk": 0, "message": "No extractable text was provided."}
@@ -171,7 +177,10 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
     try:
         profile_raw = _call_json_with_retry(
             llm_call,
-            lambda retry: build_synthesis_prompt(title, extractions, locale, retry),
+            lambda retry: build_synthesis_prompt(
+                title, extractions, locale, retry,
+                research_topic=research_topic, research_context=research_context,
+            ),
             MAX_SYNTHESIS_ATTEMPTS,
         )
     except LLMOutputError as exc:
@@ -180,6 +189,238 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
     if profile is None:
         return {"status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks), "failed_chunk": "synthesis", "message": "The complete literature profile was invalid; prior analysis was kept."}
     return {"status": "ok", "profile": profile, "evidence": evidence, "chunks_total": len(chunks), "failed_chunk": 0, "message": ""}
+
+
+def build_literature_profile_digest(literatures, max_chars=12000, locale="en"):
+    """Create a bounded ordered digest that represents every stored literature profile."""
+    records = [item for item in literatures if isinstance(item, dict)] if isinstance(literatures, list) else []
+    labels = (
+        ("research question", "methods", "sample", "key findings", "limitations", "quality", "relevance")
+        if locale != "zh" else ("研究问题", "方法", "样本", "主要发现", "局限", "质量", "相关性")
+    )
+
+    def profile_line(record, budget=None):
+        analysis = record.get("analysis") if isinstance(record.get("analysis"), dict) else {}
+        title = str(record.get("title", "Untitled"))
+        rating = record.get("rating", analysis.get("rating", 0))
+        category = str(record.get("category", analysis.get("category", "Other")))
+        prefix = f"- [{category}][{rating}/5] {title}: "
+        fields = (
+            analysis.get("research_question", ""), analysis.get("methods", ""),
+            analysis.get("sample", ""), analysis.get("key_findings", ""),
+            analysis.get("limitations", ""), analysis.get("quality_assessment", ""),
+            analysis.get("relevance_reason", ""),
+        )
+        values = [(label, str(value).strip()) for label, value in zip(labels, fields) if str(value or "").strip()]
+        if budget is None:
+            body = "; ".join(f"{label}: {value}" for label, value in values)
+            return prefix + body
+        remaining = max(0, budget - len(prefix))
+        if not values:
+            return balanced_excerpt(prefix, budget)
+        per_field = max(1, remaining // len(values))
+        body = "; ".join(f"{label}: {balanced_excerpt(value, per_field)}" for label, value in values)
+        line = prefix + body
+        return line if len(line) <= budget else balanced_excerpt(line, budget)
+
+    full_lines = [profile_line(record) for record in records]
+    full = "\n".join(full_lines)
+    budget = max(0, int(max_chars))
+    if len(full) <= budget:
+        return full
+    if not records or budget == 0:
+        return ""
+    separator_budget = max(0, len(records) - 1)
+    per_record = max(0, (budget - separator_budget) // len(records))
+    digest = "\n".join(profile_line(record, per_record) for record in records)
+    if len(digest) <= budget:
+        return digest
+    # Preserve records from both ends and the middle if the per-record metadata
+    # itself exceeds the budget; never fall back to a head-only prefix.
+    return balanced_excerpt(digest, budget)
+
+
+def build_literature_library_review_prompt(research_topic, research_context, literatures, *, locale="en", max_chars=12000):
+    """Assemble the shared, all-profile literature quality/gap-analysis prompt."""
+    digest = build_literature_profile_digest(literatures, max_chars=max_chars, locale=locale)
+    if locale == "zh":
+        instructions = (
+            "你是严格的学术评审委员。评估文献库覆盖、均衡性和学术质量，并指出缺失方向与具体检索建议。"
+            "相关性评级衡量文献对当前课题的用途；质量评价独立考察严谨性和证据强度。只输出简洁结论。\n"
+        )
+    else:
+        instructions = (
+            "You are a rigorous academic reviewer. Assess literature coverage, balance, and scholarly quality; identify missing directions and concrete search suggestions. "
+            "Relevance ratings describe usefulness to this project; assess intrinsic quality separately by rigor and evidence strength. Return concise conclusions only.\n"
+        )
+    return (
+        instructions
+        + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n"
+        + f"[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
+        + f"[LITERATURE PROFILE DIGEST]\n{digest}"
+    )
+
+
+def _full_literature_profile_lines(literatures, locale="en"):
+    labels = (
+        ("research question", "methods", "sample", "key findings", "limitations", "quality", "relevance")
+        if locale != "zh" else ("研究问题", "方法", "样本", "主要发现", "局限", "质量", "相关性")
+    )
+    lines = []
+    for record in literatures if isinstance(literatures, list) else []:
+        if not isinstance(record, dict):
+            continue
+        analysis = record.get("analysis") if isinstance(record.get("analysis"), dict) else {}
+        title = str(record.get("title", "Untitled"))
+        rating = record.get("rating", analysis.get("rating", 0))
+        category = str(record.get("category", analysis.get("category", "Other")))
+        fields = (
+            analysis.get("research_question", ""), analysis.get("methods", ""),
+            analysis.get("sample", ""), analysis.get("key_findings", ""),
+            analysis.get("limitations", ""), analysis.get("quality_assessment", ""),
+            analysis.get("relevance_reason", ""),
+        )
+        details = "; ".join(
+            f"{label}: {str(value).strip()}"
+            for label, value in zip(labels, fields) if str(value or "").strip()
+        )
+        lines.append(f"- [{category}][{rating}/5] {title}: {details}")
+    return lines
+
+
+def build_literature_profile_batches(literatures, max_chars=12000, locale="en"):
+    """Split every structured profile into bounded ordered batches; never drop late profiles."""
+    budget = max(1, int(max_chars))
+    batches = []
+    current = []
+    current_size = 0
+    for line in _full_literature_profile_lines(literatures, locale):
+        if len(line) > budget:
+            line = balanced_excerpt(line, budget)
+        extra = len(line) + (1 if current else 0)
+        if current and current_size + extra > budget:
+            batches.append("\n".join(current))
+            current = []
+            current_size = 0
+            extra = len(line)
+        current.append(line)
+        current_size += extra
+    if current:
+        batches.append("\n".join(current))
+    return batches
+
+
+def build_literature_profile_batch_review_prompt(research_topic, research_context, batch, index, total, *, locale="en"):
+    if locale == "zh":
+        instructions = (
+            "你正在分批审查文献档案。只总结本批覆盖范围、质量差异和明确的研究缺口；不要把本批结论冒充全库结论，"
+            "不要编造档案没有提供的信息，并保留重要的不确定性。\n"
+        )
+    else:
+        instructions = (
+            "Review this batch of literature profiles only. Summarize its coverage, quality differences, and supported research gaps. "
+            "Do not present batch findings as whole-library conclusions or invent details absent from the profiles; preserve uncertainty.\n"
+        )
+    return (
+        instructions
+        + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n"
+        + f"[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
+        + f"[LITERATURE PROFILE BATCH {index}/{total}]\n{batch}"
+    )
+
+
+def build_literature_review_summary_prompt(research_topic, research_context, summaries, *, locale="en"):
+    if locale == "zh":
+        instructions = (
+            "以下是按顺序生成的全库文献档案批次总结。整合覆盖范围、质量差异、共同与相互矛盾的发现、缺口和检索建议；"
+            "区分已报告内容与推断，不要编造。相关性针对当前课题，来源质量单独评价。\n"
+        )
+    else:
+        instructions = (
+            "Synthesize these ordered batch reviews of the full literature library. Integrate coverage, quality differences, shared or conflicting findings, "
+            "gaps, and search suggestions. Distinguish reported content from inference and do not fabricate. Relevance is project-specific; source quality is separate.\n"
+        )
+    body = "\n\n".join(f"[BATCH REVIEW {index}]\n{summary}" for index, summary in enumerate(summaries, 1))
+    return (
+        instructions
+        + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n"
+        + f"[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
+        + "[LITERATURE REVIEW BATCH SUMMARIES]\n" + body
+    )
+
+
+def _checked_review_call(llm_call, prompt, max_tokens):
+    try:
+        return require_valid_llm_output(llm_call(prompt, max_tokens=max_tokens)).strip()
+    except LLMOutputError:
+        raise
+    except Exception as exc:
+        raise LLMOutputError(str(exc)) from exc
+
+
+def _group_summary_items(items, max_chars):
+    groups = []
+    current = []
+    size = 0
+    for item in items:
+        value = str(item)
+        if len(value) > max_chars:
+            value = balanced_excerpt(value, max_chars)
+        extra = len(value) + (2 if current else 0)
+        if current and size + extra > max_chars:
+            groups.append(current)
+            current = []
+            size = 0
+            extra = len(value)
+        current.append(value)
+        size += extra
+    if current:
+        groups.append(current)
+    return groups
+
+
+def review_literature_library(research_topic, research_context, literatures, llm_call, *, locale="en", max_chars=12000):
+    """Review the full library directly when bounded, otherwise batch and hierarchically synthesize every profile."""
+    budget = max(1, int(max_chars))
+    full_lines = _full_literature_profile_lines(literatures, locale)
+    if len("\n".join(full_lines)) <= budget:
+        prompt = build_literature_library_review_prompt(
+            research_topic, research_context, literatures, locale=locale, max_chars=budget,
+        )
+        return _checked_review_call(llm_call, prompt, 4000)
+
+    profile_batches = build_literature_profile_batches(literatures, budget, locale)
+    summaries = []
+    for index, batch in enumerate(profile_batches, 1):
+        prompt = build_literature_profile_batch_review_prompt(
+            research_topic, research_context, batch, index, len(profile_batches), locale=locale,
+        )
+        summary = _checked_review_call(llm_call, prompt, 1200)
+        batch_label = f"[PROFILE REVIEW BATCH {index}/{len(profile_batches)}]\n"
+        summaries.append(batch_label + balanced_excerpt(summary, min(2400, budget)))
+
+    for level in range(6):
+        if sum(len(item) for item in summaries) + max(0, len(summaries) - 1) * 2 <= budget:
+            break
+        groups = _group_summary_items(summaries, budget)
+        merged = []
+        for group in groups:
+            prompt = build_literature_review_summary_prompt(
+                research_topic, research_context, group, locale=locale,
+            )
+            prompt += "\n\nReturn a concise intermediate synthesis, preserving source-batch distinctions and conflicts."
+            value = _checked_review_call(llm_call, prompt, 1200)
+            merged.append(balanced_excerpt(value, max(1, min(2400, budget // 6))))
+        if len(merged) >= len(summaries) and sum(map(len, merged)) >= sum(map(len, summaries)):
+            raise LLMOutputError("The literature review summaries could not be reduced to the context budget.")
+        summaries = merged
+    else:
+        raise LLMOutputError("The full literature library could not be consolidated within the context budget.")
+
+    prompt = build_literature_review_summary_prompt(
+        research_topic, research_context, summaries, locale=locale,
+    )
+    return _checked_review_call(llm_call, prompt, 4000)
 
 
 def update_evidence_store_after_success(evidence_store, literature_id, result):
@@ -249,21 +490,27 @@ def select_literature_evidence_for_chapter(evidence_store, bound_literature_ids,
     """Select concise evidence only from references explicitly bound to this chapter."""
     if not isinstance(evidence_store, dict):
         return []
-    bound = {str(value) for value in (bound_literature_ids or [])}
-    query_terms = set(re.findall(r"[a-z0-9]{2,}", f"{chapter_title or ''} {chapter_description or ''}".casefold()))
+    bound = list(dict.fromkeys(str(value) for value in (bound_literature_ids or [])))
+    query_terms = multilingual_terms(f"{chapter_title or ''} {chapter_description or ''}")
     candidates = []
-    for literature_id in bound:
-        for item in evidence_store.get(literature_id, []) or []:
+    for bound_index, literature_id in enumerate(bound):
+        for evidence_index, item in enumerate(evidence_store.get(literature_id, []) or []):
             if not isinstance(item, dict):
                 continue
-            terms = set(re.findall(r"[a-z0-9]{2,}", f"{item.get('claim', '')} {item.get('section', '')} {item.get('evidence_text', '')}".casefold()))
+            terms = multilingual_terms(f"{item.get('claim', '')} {item.get('section', '')} {item.get('evidence_text', '')}")
             score = len(query_terms & terms)
             if not query_terms or score:
-                candidates.append((score, item))
-    candidates.sort(key=lambda row: (-row[0], str(row[1].get("literature_id", "")), int(row[1].get("chunk_index", 0))))
+                candidates.append((score, bound_index, evidence_index, item))
+    if query_terms:
+        candidates.sort(key=lambda row: (-row[0], row[1], int(row[3].get("chunk_index", 0)), row[2]))
     selected = []
-    for _, item in candidates[:max(0, int(limit))]:
-        selected.append({key: item.get(key, "") for key in ("literature_id", "chunk_index", "section", "claim", "evidence_text", "source_locator")})
+    reason = "no_query_terms_fallback" if not query_terms else "multilingual_term_overlap"
+    for score, _, _, item in candidates[:max(0, int(limit))]:
+        selected.append({
+            **{key: item.get(key, "") for key in ("literature_id", "chunk_index", "section", "claim", "evidence_text", "source_locator")},
+            "relevance_score": score,
+            "selection_reason": reason,
+        })
     return selected
 
 

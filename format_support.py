@@ -13,11 +13,11 @@ class FormatSpecError(ValueError):
 _ROOT_KEYS = {"schema_version", "name", "page", "body", "headings", "table", "figure"}
 _PAGE_KEYS = {"size", "margins_cm", "page_number"}
 _MARGIN_KEYS = {"top", "bottom", "left", "right"}
-_PAGE_NUMBER_KEYS = {"enabled", "position"}
+_PAGE_NUMBER_KEYS = {"enabled", "position", "start"}
 _BODY_KEYS = {"font_latin", "font_cjk", "font_size_pt", "alignment", "line_spacing", "first_line_indent_chars", "space_before_pt", "space_after_pt"}
-_HEADING_KEYS = {"font_latin", "font_cjk", "font_size_pt", "alignment", "bold", "space_before_pt", "space_after_pt"}
-_TABLE_KEYS = {"style", "font_size_pt", "caption_prefix"}
-_FIGURE_KEYS = {"caption_prefix"}
+_HEADING_KEYS = {"font_latin", "font_cjk", "font_size_pt", "alignment", "bold", "space_before_pt", "space_after_pt", "keep_with_next", "page_break_before"}
+_TABLE_KEYS = {"style", "font_size_pt", "caption_prefix", "caption_enabled"}
+_FIGURE_KEYS = {"caption_prefix", "width_percent", "caption_mode"}
 
 
 def _strict_keys(value, allowed, path):
@@ -72,6 +72,7 @@ def validate_format_spec(spec):
         raise FormatSpecError("page.page_number.enabled must be a boolean.")
     if page_number.get("position") not in {"left", "center", "right"}:
         raise FormatSpecError("page.page_number.position must be left, center, or right.")
+    page_number_start = _number(page_number.get("start", 1), "page.page_number.start", 1, 32767, integer=True)
 
     body = spec.get("body")
     _strict_keys(body, _BODY_KEYS, "body")
@@ -89,7 +90,10 @@ def validate_format_spec(spec):
         raise FormatSpecError("body.alignment must be left, center, right, or justify.")
 
     headings = spec.get("headings")
-    _strict_keys(headings, {"h1", "h2", "h3"}, "headings")
+    _strict_keys(headings, {"mode", "h1", "h2", "h3"}, "headings")
+    heading_mode = headings.get("mode", "controlled")
+    if heading_mode not in {"controlled", "legacy"}:
+        raise FormatSpecError("headings.mode must be controlled or legacy.")
     headings_clean = {}
     for level in ("h1", "h2", "h3"):
         item = headings.get(level)
@@ -102,31 +106,47 @@ def validate_format_spec(spec):
             "bold": item.get("bold"),
             "space_before_pt": _number(item.get("space_before_pt"), f"headings.{level}.space_before_pt", 0, 48),
             "space_after_pt": _number(item.get("space_after_pt"), f"headings.{level}.space_after_pt", 0, 36),
+            "keep_with_next": item.get("keep_with_next", False),
+            "page_break_before": item.get("page_break_before", False),
         }
         if heading["alignment"] not in {"left", "center", "right", "justify"}:
             raise FormatSpecError(f"headings.{level}.alignment is unsupported.")
         if not isinstance(heading["bold"], bool):
             raise FormatSpecError(f"headings.{level}.bold must be a boolean.")
+        if not isinstance(heading["keep_with_next"], bool):
+            raise FormatSpecError(f"headings.{level}.keep_with_next must be a boolean.")
+        if not isinstance(heading["page_break_before"], bool):
+            raise FormatSpecError(f"headings.{level}.page_break_before must be a boolean.")
         headings_clean[level] = heading
 
     table = spec.get("table")
     _strict_keys(table, _TABLE_KEYS, "table")
-    if table.get("style") != "three_line":
-        raise FormatSpecError("table.style must be three_line.")
+    if table.get("style") not in {"grid", "three_line"}:
+        raise FormatSpecError("table.style must be grid or three_line.")
+    if not isinstance(table.get("caption_enabled", True), bool):
+        raise FormatSpecError("table.caption_enabled must be a boolean.")
     table_clean = {
-        "style": "three_line",
+        "style": table["style"],
         "font_size_pt": _number(table.get("font_size_pt"), "table.font_size_pt", 6, 24),
         "caption_prefix": _caption_prefix(table.get("caption_prefix"), "table.caption_prefix"),
+        "caption_enabled": table.get("caption_enabled", True),
     }
     figure = spec.get("figure")
     _strict_keys(figure, _FIGURE_KEYS, "figure")
-    figure_clean = {"caption_prefix": _caption_prefix(figure.get("caption_prefix"), "figure.caption_prefix")}
+    caption_mode = figure.get("caption_mode", "numbered")
+    if caption_mode not in {"numbered", "legacy"}:
+        raise FormatSpecError("figure.caption_mode must be numbered or legacy.")
+    figure_clean = {
+        "caption_prefix": _caption_prefix(figure.get("caption_prefix"), "figure.caption_prefix"),
+        "width_percent": _number(figure.get("width_percent", 85), "figure.width_percent", 10, 100, integer=True),
+        "caption_mode": caption_mode,
+    }
     return {
         "schema_version": 1,
         "name": name,
-        "page": {"size": "A4", "margins_cm": margins_clean, "page_number": {"enabled": page_number["enabled"], "position": page_number["position"]}},
+        "page": {"size": "A4", "margins_cm": margins_clean, "page_number": {"enabled": page_number["enabled"], "position": page_number["position"], "start": page_number_start}},
         "body": body_clean,
-        "headings": headings_clean,
+        "headings": {"mode": heading_mode, **headings_clean},
         "table": table_clean,
         "figure": figure_clean,
     }
