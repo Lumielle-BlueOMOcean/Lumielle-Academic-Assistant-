@@ -7,7 +7,7 @@
 
 A Streamlit-based local academic paper writing assistant: logic outline generation, chapter writing, AIGC detection & de-smelling, and final Word export.
 
-**Current version / 当前版本：v1.0.1 — 2026-09-27**
+**Current development version / 当前开发版本：v1.0.2 — Unreleased**
 
 ---
 
@@ -37,9 +37,9 @@ Pick the folder for your platform, unzip it, and double-click the launcher to st
 
 ## 🧠 核心架构：上下文三明治 / Core Architecture: The Context Sandwich
 
-写长论文时，网页端 AI 对话有三个绕不开的痛点：**对话一长就"失忆"、反复修改时前后矛盾、上下文无限膨胀导致成本失控**。微光用「上下文三明治」机制一次解决这三个问题——它不是把整篇论文一股脑塞给模型，而是每次只喂给模型**恰到好处**的一段上下文。
+写长论文时，长对话可能增加信息遗忘、修改冲突和上下文膨胀的风险。微光将全局大纲、已写章节记忆、当前章节和下游章节边界组合为章节生成上下文，帮助降低重复和前后不一致的风险。已写章节记忆会从完整章节正文按顺序分块提取，再合并为紧凑摘要；生成章节时使用的是摘要及相关边界，而不是每次都发送所有历史正文。
 
-When writing a long paper, web-based AI chat suffers from three unavoidable pain points: **memory loss in long conversations, contradictions when revising earlier chapters, and uncontrollable context bloat**. The Context Sandwich solves all three at once — instead of cramming the whole paper into the model, it feeds the model **exactly the right amount** of context for every single chapter.
+Long conversations can increase the risk of information loss, revision conflicts, and context bloat. Lumielle combines the global outline, memories of written chapters, the current chapter, and downstream boundaries as context for chapter generation to help reduce repetition and inconsistency. Memories of written chapters are extracted from the complete chapter text in ordered chunks and synthesized into compact summaries; generation uses those summaries and relevant boundaries rather than resending every earlier chapter in full.
 
 ### 🥪 三明治的层次 / The Layers
 
@@ -47,20 +47,20 @@ When writing a long paper, web-based AI chat suffers from three unavoidable pain
 ┌─────────────────────────────────────────────┐
 │  ① 全局逻辑大纲（顶层罗盘）                    │
 │     Global logic outline — the compass       │
-│     整棵逻辑树实时压缩，始终指向课题全局        │
+│     将逻辑树压缩为课题全局方向参考              │
 ├─────────────────────────────────────────────┤
 │  ② 上游记忆（面包片 · 已写部分）               │
 │     Upstream memory — written chapters       │
-│     当前章节之前【已写】章节的完整记忆，全量带上 │
-│     未写章节只给大纲标题占位，不挤占窗口        │
+│     已写章节：完整正文分块提炼出的紧凑记忆      │
+│     未写章节只给大纲标题占位                    │
 ├─────────────────────────────────────────────┤
 │  🎯 当前章节（三明治的核心 = 要生成的内容）      │
 │     Current chapter — the meat of the sandwich│
 ├─────────────────────────────────────────────┤
 │  ③ 下游记忆（面包片 · 边界部分）               │
 │     Downstream context — boundary only       │
-│     已写章节全量提供（防回头修改产生冲突）       │
-│     未写章节只给轻量大纲边界（防剧透 / 越界）    │
+│     已写章节提供紧凑记忆，辅助回改时核对        │
+│     未写章节只给轻量大纲边界（减少越界）        │
 └─────────────────────────────────────────────┘
 ```
 
@@ -68,20 +68,20 @@ When writing a long paper, web-based AI chat suffers from three unavoidable pain
 
 | 痛点 Pain Point | 传统对话 Traditional Chat | 上下文三明治 Context Sandwich |
 |---|---|---|
-| 🧠 **记忆幻觉** Memory loss | 对话一长，AI 忘记前文，甚至编造前文 | 上游已写章节**全量记忆**实时加载，绝不遗忘 |
-| 🔄 **修改冲突** Revision conflicts | 改中间章节，跟后面已写的内容打架 | 下游已写章节**全量提供**，修改时强制保持一致 |
-| 🚀 **上下文膨胀** Context bloat | 每次修改都把全文发回去，越改越贵 | 只给当前章需要的窗口，**预算自动截断**，成本可控 |
-| 🔮 **越界跑题** Going off-topic | 模型自由发挥，写到别处去 | 全局大纲 + 下游边界双保险，始终紧扣课题 |
+| 🧠 **信息遗忘风险** Information loss | 长对话中前文信息可能难以持续追踪 | 完整章节正文参与记忆构建，压缩记忆随章节上下文提供 |
+| 🔄 **修改冲突风险** Revision conflicts | 改中间章节时可能与后文已写内容不一致 | 下游已写章节记忆可供核对，降低冲突风险 |
+| 🚀 **上下文膨胀** Context bloat | 每次修改都把全文发回去，增加上下文长度 | 使用摘要和边界，并按上下文预算取舍 |
+| 🔮 **越界跑题** Going off-topic | 模型可能写到其他章节的内容 | 全局大纲和未写章节边界可帮助限定当前章节范围 |
 
 ### ⚙️ 细节设计 / Design Details
 
-- **双向一致性**：向上记住"已写过什么"，向下防止"和后面冲突"——改中间任何一章，前后文都自动对齐。/ Bidirectional consistency: remembers what was written above, prevents conflicts below — revise any chapter and the whole paper stays coherent.
-- **智能预算**：上下文超长时按「离当前节点远近」取舍，已写记忆优先保留，自动截断并注明。/ Smart budget: when context exceeds the limit, it keeps memories nearest to the current chapter, truncating gracefully with a clear notice.
-- **防剧透机制**：下游未写章节只给标题边界，防止模型提前"偷看"后面的内容、写成流水账。/ Anti-spoiler: unwritten downstream chapters are exposed as titles only, so the model can't peek ahead and spoil the narrative.
+- **上下游辅助核对**：已写章节的紧凑记忆和下游边界可帮助模型减少重复与冲突；生成结果仍需作者核验。/ Upstream and downstream context can help reduce repetition and conflict; generated text still needs author review.
+- **上下文预算**：上下文超过预算时会按现有取舍规则截断，并附带截断提示。/ When context exceeds its budget, the current selection policy truncates it and adds a notice.
+- **未写章节边界**：下游未写章节只提供大纲标题，帮助当前章避免提前展开后续内容。/ Unwritten downstream chapters are represented by outline titles to help keep the current chapter in scope.
 
-这个设计让 AI 只专注写好**每一章**，章节之间的衔接由工具自动管理——这也是微光最核心的工程创新。
+这个设计为章节生成提供结构化上下文，帮助作者检查章节衔接；生成结果仍可能遗漏信息或出现冲突，需要作者核验。
 
-This design lets the AI focus on writing **one chapter at a time**, while the tool manages the connections between chapters automatically — the core engineering innovation of Lumielle Academic Assistant.
+This design supplies structured context for chapter generation and helps authors review continuity; generated text may still omit information or contain conflicts and needs author review.
 
 ## 🚀 快速开始 / Quick Start
 
@@ -97,6 +97,18 @@ This design lets the AI focus on writing **one chapter at a time**, while the to
 - **Windows**: 内置嵌入式 Python + 离线依赖包，首次安装无需联网。Bundled embedded Python + offline wheels; first install needs no internet.
 
 ## Changelog / 更新日志
+
+### v1.0.2 — Unreleased
+
+#### Fixed / 修复
+
+- Chapter Memory now processes the complete chapter in ordered chunks before synthesis instead of analyzing only the first 3,000 characters. / 章节记忆现在按顺序分块处理完整章节后再合并，不再只分析开头 3,000 个字符。
+- A failed memory rebuild preserves the previous valid chapter memory. / 章节记忆重建失败时保留此前有效记忆。
+- Global literature clearing now distinguishes clearing library records from deleting imported source files. / 全局清空文献库时，清除记录与删除已导入原始文件现在明确区分。
+
+#### Changed / 变更
+
+- Context Sandwich documentation now describes complete-chapter memory construction and compact summaries without promising perfect recall or consistency. / 上下文三明治说明现准确描述完整章节记忆构建与摘要使用，不再承诺绝对记忆或一致性。
 
 ### v1.0.1 — 2026-09-27
 

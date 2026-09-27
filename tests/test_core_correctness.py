@@ -255,19 +255,17 @@ class CoreCorrectnessTests(unittest.TestCase):
         support = load_project_module(self, "writing_support")
         self.assertEqual(support.count_chinese_chars("人工 智能，AI"), 7)
 
-    def test_version_is_canonical_v101(self):
+    def test_version_is_canonical_v102(self):
         version = load_project_module(self, "version")
-        self.assertEqual(version.__version__, "1.0.1")
+        self.assertEqual(version.__version__, "1.0.2")
 
-    def test_readme_matches_canonical_release_date_and_keeps_v100_history(self):
+    def test_readme_marks_current_version_unreleased_and_keeps_release_history(self):
         version = load_project_module(self, "version")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"v{version.__version__}", readme)
-        self.assertRegex(
-            readme,
-            rf"(?m)^### v{re.escape(version.__version__)} — 2026-09-27$",
-        )
-        self.assertIn(f"Current version / 当前版本：v{version.__version__} — 2026-09-27", readme)
+        self.assertIn(f"### v{version.__version__} — Unreleased", readme)
+        self.assertIn(f"Current development version / 当前开发版本：v{version.__version__} — Unreleased", readme)
+        self.assertIn("### v1.0.1 — 2026-09-27", readme)
         self.assertIn("v1.0.0", readme)
         self.assertIn("Changelog", readme)
 

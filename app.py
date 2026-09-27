@@ -17,6 +17,8 @@ Lumielle Academic Assistant —— 学术论文写作助手
 import streamlit as st
 from version import __version__
 from document_support import DEFAULT_CHUNK_CHARS, is_document_parse_error, parse_document_in_chunks
+from memory_support import update_chapter_memory
+from literature_support import clear_literature_library
 from outline_support import (
     extract_docx_manuscript_text,
     persist_reverse_outline_result,
@@ -532,6 +534,11 @@ def build_context_sandwich(current_node_id, max_chars=20000):
 # ============================================================
 def render_global_sidebar():
     """侧边栏：全局研究课题、预期字数、当前激活模型、导航"""
+    clear_notice = st.session_state.pop("global_clear_notice", None)
+    if isinstance(clear_notice, tuple) and len(clear_notice) == 2:
+        level, message = clear_notice
+        if level in {"success", "warning", "error"}:
+            getattr(st.sidebar, level)(message)
     st.sidebar.title("🎓 Lumielle Academic Assistant")
     st.sidebar.markdown("---")
     st.sidebar.subheader("🌍 Global Research Settings")
@@ -584,7 +591,7 @@ def render_global_sidebar():
             "drafts_summary.json": "🧠 Chapter Memory Pool",
             "drafts_charts.json": "📊 Chart Records",
             "drafts_images.json": "🖼️ Image Records",
-            "literatures.json": "📚 Literature Library",
+            "literatures.json": "📚 Literature Library Records",
             "logic_tree.json": "🔗 Logic Outline",
             "research_base.json": "🧪 Research Foundation",
             "gap_report.json": "📋 Gap Report",
@@ -593,13 +600,29 @@ def render_global_sidebar():
         }
         sel_names = st.multiselect("Select data types to clear", list(clear_map.values()), key="clear_sel")
         c_files = st.checkbox("🗑️ Also delete chart/image physical files", key="clear_files")
+        literature_selected = "📚 Literature Library Records" in sel_names
+        c_literature_sources = st.checkbox(
+            "Delete imported literature source files as well",
+            key="clear_literature_sources",
+            disabled=not literature_selected,
+        )
         c_confirm = st.checkbox("⚠️ I confirm clearing (irreversible)", key="clear_confirm")
         if st.button("💣 Execute Clear", disabled=not c_confirm, type="primary"):
             sel_files = [k for k, v in clear_map.items() if v in sel_names]
             if not sel_files:
                 st.sidebar.warning("Please select at least one data type.")
             else:
+                literature_report = None
+                if "literatures.json" in sel_files:
+                    literature_report = clear_literature_library(
+                        load_json_file("literatures.json", []),
+                        RAW_DIR,
+                        lambda records: save_json_file("literatures.json", records),
+                        delete_source_files=c_literature_sources,
+                    )
                 for fname in sel_files:
+                    if fname == "literatures.json":
+                        continue
                     if fname in default_files:
                         save_json_file(fname, default_files[fname])
                     else:
@@ -611,7 +634,26 @@ def render_global_sidebar():
                                 os.remove(os.path.join(d, fn))
                             except Exception:
                                 pass
-                st.sidebar.success(f"Cleared {len(sel_files)} data item(s)!")
+                if literature_report and not literature_report["records_cleared"]:
+                    clear_notice = (
+                        "error",
+                        "Other selected data items were cleared, but the literature records could not be cleared.",
+                    )
+                elif literature_report and c_literature_sources:
+                    message = (
+                        f"Cleared {len(sel_files)} data item(s). Literature records cleared; "
+                        f"{literature_report['deleted']} source file(s) deleted, "
+                        f"{literature_report['failed']} could not be deleted."
+                    )
+                    clear_notice = ("warning" if literature_report["failed"] else "success", message)
+                elif literature_report:
+                    clear_notice = (
+                        "success",
+                        f"Cleared {len(sel_files)} data item(s). Literature records cleared; imported source files were kept.",
+                    )
+                else:
+                    clear_notice = ("success", f"Cleared {len(sel_files)} data item(s)!")
+                st.session_state["global_clear_notice"] = clear_notice
                 st.rerun()
 
     # ================= 版权署名（固定显示） =================
@@ -1902,34 +1944,6 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
     return last_res, {"attempts": max_attempts, "actual": count_english_words(last_res), "target": target, "deviation": abs(count_english_words(last_res) - target) / target if target else None}
 
 
-def compress_memory(text):
-    """把章节文本压缩为严格 150-200 字核心记忆，带长度校验与一次自动重试"""
-    if not text or not text.strip():
-        return ""
-    prompt = (
-        "Compress the following text into a core memory of **strictly 150-200 words**. "
-        "Requirements: keep key arguments, core data, research methods and important conclusions; "
-        "write as coherent prose, not bullet points; output no prefix, quotes or explanation; output only the memory text itself.\n\n"
-        f"Original:\n{text[:3000]}"
-    )
-    res = require_valid_llm_output(dispatch_llm_call(prompt, max_tokens=500))
-    res = res.strip().strip('"').strip("“”").strip()
-    # 净化思考痕迹与提示词残渣（推理型模型可能把压缩指令本身混进输出）
-    res = require_valid_llm_output(purge_thinking_text(res))
-    # Length validation: target 150-200 words; tolerate 120-280 before one retry.
-    if not (120 <= count_english_words(res) <= 280):
-        retry = require_valid_llm_output(dispatch_llm_call(
-            f"The previous compression did not meet the length requirement (currently about {count_english_words(res)} words). Please re-output, strictly 150-200 words, only the memory text itself:\n{text[:3000]}",
-            max_tokens=500
-        ))
-        retry = retry.strip().strip('"').strip("“”").strip()
-        retry = require_valid_llm_output(purge_thinking_text(retry))
-        if 120 <= count_english_words(retry) <= 280:
-            return retry
-        return res if res else retry
-    return res
-
-
 def render_tree_nav(tree, nodes, sel_key="writing_selected_id", _drafts=None):
     """递归渲染可折叠的章节导航树：父章节仅作为容器（展开子章节），点击叶子节点按钮选中目标章节。
     已写章节（drafts.json 中有非空内容）会显示 ✅ 标记；父节点标题显示子树已写进度 (已写/总数)。"""
@@ -2024,10 +2038,11 @@ def render_single_chapter_editor(tree):
                 save_json_file("draft_reference_maps.json", reference_maps)
                 notices = [("success", "Chapter saved.")]
                 try:
-                    with st.spinner("Compressing chapter memory (150-200 words)..."):
-                        sum_res = compress_memory(new_text)
-                    ds = load_json_file("drafts_summary.json", {})
-                    ds[sel_id] = sum_res
+                    with st.spinner("Building compact memory from the complete chapter..."):
+                        ds = load_json_file("drafts_summary.json", {})
+                        ds, sum_res = update_chapter_memory(
+                            ds, sel_id, new_text, dispatch_llm_call, locale="en"
+                        )
                     save_json_file("drafts_summary.json", ds)
                     notices.append(("success", f"Memory updated ({count_english_words(sum_res)} words)."))
                 except LLMOutputError:
@@ -2064,12 +2079,13 @@ def render_single_chapter_editor(tree):
                                 generated_message = f"Chapter generated! Actual {count_english_words(res)} words (no target assigned)."
                             notices = [("success", generated_message)]
                             try:
-                                sum_res = compress_memory(res)
+                                ds = load_json_file("drafts_summary.json", {})
+                                ds, sum_res = update_chapter_memory(
+                                    ds, sel_id, res, dispatch_llm_call, locale="en"
+                                )
                             except LLMOutputError:
                                 notices.append(("warning", "Chapter saved, but memory distillation failed. You can retry by saving the chapter again. " + llm_error_message("en")))
                             else:
-                                ds = load_json_file("drafts_summary.json", {})
-                                ds[sel_id] = sum_res
                                 save_json_file("drafts_summary.json", ds)
                                 notices.append(("success", f"Memory updated ({count_english_words(sum_res)} words)."))
                             st.session_state[f"writing_notice_{sel_id}"] = notices
@@ -2291,11 +2307,12 @@ def render_batch_workbench():
                     else:
                         results_note.append(f"{node.get('title','')}: {count_english_words(res)} words (no target)")
                     try:
-                        sum_res = compress_memory(res)
+                        ds, sum_res = update_chapter_memory(
+                            ds, nid, res, dispatch_llm_call, locale="en"
+                        )
                     except LLMOutputError:
                         memory_warnings.append(f"{node.get('title','Untitled')}: {llm_error_message('en')}")
                     else:
-                        ds[nid] = sum_res
                         save_json_file("drafts_summary.json", ds)
                     progress_bar.progress((k + 1) / len(leaf_ids))
                 msg = f"Chapter generation finished: {len(results_note)} succeeded, {len(failed_chapters)} failed."

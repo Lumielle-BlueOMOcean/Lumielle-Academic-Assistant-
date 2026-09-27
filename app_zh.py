@@ -17,6 +17,8 @@ Lumielle Academic Assistant —— 学术论文写作助手
 import streamlit as st
 from version import __version__
 from document_support import DEFAULT_CHUNK_CHARS, is_document_parse_error, parse_document_in_chunks
+from memory_support import update_chapter_memory
+from literature_support import clear_literature_library
 from outline_support import (
     extract_docx_manuscript_text,
     persist_reverse_outline_result,
@@ -528,6 +530,11 @@ def build_context_sandwich(current_node_id, max_chars=20000):
 # ============================================================
 def render_global_sidebar():
     """侧边栏：全局研究课题、预期字数、当前激活模型、导航"""
+    clear_notice = st.session_state.pop("global_clear_notice", None)
+    if isinstance(clear_notice, tuple) and len(clear_notice) == 2:
+        level, message = clear_notice
+        if level in {"success", "warning", "error"}:
+            getattr(st.sidebar, level)(message)
     st.sidebar.title("🎓 Lumielle Academic Assistant")
     st.sidebar.markdown("---")
     st.sidebar.subheader("🌍 全局研究设置")
@@ -580,7 +587,7 @@ def render_global_sidebar():
             "drafts_summary.json": "🧠 章节记忆池",
             "drafts_charts.json": "📊 图表记录",
             "drafts_images.json": "🖼️ 图片记录",
-            "literatures.json": "📚 文献库",
+            "literatures.json": "📚 文献库记录",
             "logic_tree.json": "🔗 逻辑大纲",
             "research_base.json": "🧪 科研基座",
             "gap_report.json": "📋 缺口报告",
@@ -589,13 +596,29 @@ def render_global_sidebar():
         }
         sel_names = st.multiselect("选择要清除的数据类型", list(clear_map.values()), key="clear_sel")
         c_files = st.checkbox("🗑️ 同时删除图表/图片物理文件", key="clear_files")
+        literature_selected = "📚 文献库记录" in sel_names
+        c_literature_sources = st.checkbox(
+            "同时删除已导入的文献原始文件",
+            key="clear_literature_sources",
+            disabled=not literature_selected,
+        )
         c_confirm = st.checkbox("⚠️ 我确认清除（不可恢复）", key="clear_confirm")
         if st.button("💣 执行清除", disabled=not c_confirm, type="primary"):
             sel_files = [k for k, v in clear_map.items() if v in sel_names]
             if not sel_files:
                 st.sidebar.warning("请至少选择一项数据类型。")
             else:
+                literature_report = None
+                if "literatures.json" in sel_files:
+                    literature_report = clear_literature_library(
+                        load_json_file("literatures.json", []),
+                        RAW_DIR,
+                        lambda records: save_json_file("literatures.json", records),
+                        delete_source_files=c_literature_sources,
+                    )
                 for fname in sel_files:
+                    if fname == "literatures.json":
+                        continue
                     if fname in default_files:
                         save_json_file(fname, default_files[fname])
                     else:
@@ -607,7 +630,23 @@ def render_global_sidebar():
                                 os.remove(os.path.join(d, fn))
                             except Exception:
                                 pass
-                st.sidebar.success(f"已清除 {len(sel_files)} 项数据！")
+                if literature_report and not literature_report["records_cleared"]:
+                    clear_notice = ("error", "其他所选数据已清除，但文献库记录未能清除。")
+                elif literature_report and c_literature_sources:
+                    message = (
+                        f"已清除 {len(sel_files)} 项数据。文献库记录已清空；"
+                        f"已删除 {literature_report['deleted']} 个原始文件，"
+                        f"{literature_report['failed']} 个文件未能删除。"
+                    )
+                    clear_notice = ("warning" if literature_report["failed"] else "success", message)
+                elif literature_report:
+                    clear_notice = (
+                        "success",
+                        f"已清除 {len(sel_files)} 项数据。文献库记录已清空；已保留导入的原始文件。",
+                    )
+                else:
+                    clear_notice = ("success", f"已清除 {len(sel_files)} 项数据！")
+                st.session_state["global_clear_notice"] = clear_notice
                 st.rerun()
 
     # ================= 版权署名（固定显示） =================
@@ -1896,34 +1935,6 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
     return last_res, {"attempts": max_attempts, "actual": count_chinese_chars(last_res), "target": target, "deviation": abs(count_chinese_chars(last_res) - target) / target if target else None}
 
 
-def compress_memory(text):
-    """把章节文本压缩为严格 150-200 字核心记忆，带长度校验与一次自动重试"""
-    if not text or not text.strip():
-        return ""
-    prompt = (
-        "请将以下文本压缩为**严格150-200个汉字**的核心记忆。"
-        "要求：保留关键论点、核心数据、研究方法与重要结论；"
-        "语言连贯成段，不要分点罗列；不要输出任何前缀、引号或解释，只输出记忆正文本身。\n\n"
-        f"原文：\n{text[:3000]}"
-    )
-    res = require_valid_llm_output(dispatch_llm_call(prompt, max_tokens=500))
-    res = res.strip().strip('"').strip("“”").strip()
-    # 净化思考痕迹与提示词残渣（推理型模型可能把压缩指令本身混进输出）
-    res = require_valid_llm_output(purge_thinking_text(res))
-    # 长度校验：目标150-200字，宽容到120-280，不合格自动重试一次
-    if not (120 <= len(res) <= 280):
-        retry = require_valid_llm_output(dispatch_llm_call(
-            f"上一轮压缩不符合字数要求（当前约{len(res)}字）。请重新输出，严格控制为150-200个汉字，只输出记忆正文本身：\n{text[:3000]}",
-            max_tokens=500
-        ))
-        retry = retry.strip().strip('"').strip("“”").strip()
-        retry = require_valid_llm_output(purge_thinking_text(retry))
-        if 120 <= len(retry) <= 280:
-            return retry
-        return res if res else retry
-    return res
-
-
 def render_tree_nav(tree, nodes, sel_key="writing_selected_id", _drafts=None):
     """递归渲染可折叠的章节导航树：父章节仅作为容器（展开子章节），点击叶子节点按钮选中目标章节。
     已写章节（drafts.json 中有非空内容）会显示 ✅ 标记；父节点标题显示子树已写进度 (已写/总数)。"""
@@ -2018,10 +2029,11 @@ def render_single_chapter_editor(tree):
                 save_json_file("draft_reference_maps.json", reference_maps)
                 notices = [("success", "正文已保存。")]
                 try:
-                    with st.spinner("正在压缩章节记忆 (150-200字)..."):
-                        sum_res = compress_memory(new_text)
-                    ds = load_json_file("drafts_summary.json", {})
-                    ds[sel_id] = sum_res
+                    with st.spinner("正在基于完整章节构建精简记忆..."):
+                        ds = load_json_file("drafts_summary.json", {})
+                        ds, sum_res = update_chapter_memory(
+                            ds, sel_id, new_text, dispatch_llm_call, locale="zh"
+                        )
                     save_json_file("drafts_summary.json", ds)
                     notices.append(("success", f"记忆池已更新（本章记忆 {len(sum_res)} 字）。"))
                 except LLMOutputError:
@@ -2058,12 +2070,13 @@ def render_single_chapter_editor(tree):
                                 generated_message = f"本章生成完毕！实际 {count_chinese_chars(res)}字（未分配目标字数）。"
                             notices = [("success", generated_message)]
                             try:
-                                sum_res = compress_memory(res)
+                                ds = load_json_file("drafts_summary.json", {})
+                                ds, sum_res = update_chapter_memory(
+                                    ds, sel_id, res, dispatch_llm_call, locale="zh"
+                                )
                             except LLMOutputError:
                                 notices.append(("warning", "正文已保存，但记忆凝练失败；之后可再次保存重试。" + llm_error_message("zh")))
                             else:
-                                ds = load_json_file("drafts_summary.json", {})
-                                ds[sel_id] = sum_res
                                 save_json_file("drafts_summary.json", ds)
                                 notices.append(("success", f"记忆池已更新（本章记忆 {len(sum_res)} 字）。"))
                             st.session_state[f"writing_notice_{sel_id}"] = notices
@@ -2285,11 +2298,12 @@ def render_batch_workbench():
                     else:
                         results_note.append(f"{node.get('title','')}: {count_chinese_chars(res)}字（无目标）")
                     try:
-                        sum_res = compress_memory(res)
+                        ds, sum_res = update_chapter_memory(
+                            ds, nid, res, dispatch_llm_call, locale="zh"
+                        )
                     except LLMOutputError:
                         memory_warnings.append(f"{node.get('title','未命名')}: {llm_error_message('zh')}")
                     else:
-                        ds[nid] = sum_res
                         save_json_file("drafts_summary.json", ds)
                     progress_bar.progress((k + 1) / len(leaf_ids))
                 msg = f"批量生成结束：成功 {len(results_note)} 章，失败 {len(failed_chapters)} 章。"
