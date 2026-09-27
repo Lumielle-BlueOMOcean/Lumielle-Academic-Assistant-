@@ -7,7 +7,7 @@
 
 A Streamlit-based local academic paper writing assistant: logic outline generation, chapter writing, AIGC detection & de-smelling, and final Word export.
 
-**Current development version / 当前开发版本：v1.0.2 — Unreleased**
+**Current development version / 当前开发版本：v1.1.0 — Unreleased**
 
 ---
 
@@ -27,13 +27,13 @@ Pick the folder for your platform, unzip it, and double-click the launcher to st
 ## ✨ 功能特性 / Features
 
 - 🧠 **LLM 配置与多模型交叉讨论** — Multi-model configuration & cross discussion
-- 🏛️ **科研基座** — Research base (background, modules)
-- 📚 **文献处理** — Literature batch upload, auto parsing, rating & classification
+- 🏛️ **科研基座** — Structured research facts with editable filing and optional chapter grounding
+- 📚 **文献处理** — Full-document literature analysis with source-linked evidence and chapter bindings
 - 🧩 **逻辑链路** — Multi-level logic outline with per-node word count & chart instructions
 - ✍️ **正文写作** — Single-chapter & batch writing with word-count auto-correction
 - 🛡️ **AIGC 检测与去味** — AI probability detection & adversarial de-smelling
 - ⚙️ **提示词配置** — Global style & format prompt control
-- 📄 **终稿导出** — Word export with proper layout (fonts, spacing, tables, references)
+- 📄 **终稿导出** — Versioned FormatSpec presets with deterministic Word rendering, templates, tables, figures and references
 
 ## 🧠 核心架构：上下文三明治 / Core Architecture: The Context Sandwich
 
@@ -98,17 +98,26 @@ This design supplies structured context for chapter generation and helps authors
 
 ## Changelog / 更新日志
 
-### v1.0.2 — Unreleased
+### v1.1.0 — Unreleased
+
+#### Added / 新增
+
+- Added an eight-section Research Fact Layer with full-source ordered parsing, editable Smart Inbox suggestions, provenance, and explicit chapter grounding controls. / 新增八类科研事实分区，支持全文顺序解析、可编辑的 Smart Inbox 建议、来源追溯和显式章节引用控制。
+- Added full-document literature analysis for PDF, DOCX, TXT, and pasted text, with source-linked evidence and per-chapter use limited to bound literature. / 新增 PDF、DOCX、TXT 和粘贴文本的全文文献分析与来源关联证据；章节写作只取用已绑定文献的证据。
+- Added versioned FormatSpec presets with validated import/export, custom preset management, reviewed model-generated previews, and deterministic Word rendering. / 新增带版本的 FormatSpec 预设、校验后的导入导出、自定义预设管理、需审阅确认的模型预览和确定性 Word 渲染。
+- Updated the Chinese and English user manuals for v1.1.0. / 更新中英文 v1.1.0 用户手册。
 
 #### Fixed / 修复
 
 - Chapter Memory now processes the complete chapter in ordered chunks before synthesis instead of analyzing only the first 3,000 characters. / 章节记忆现在按顺序分块处理完整章节后再合并，不再只分析开头 3,000 个字符。
 - A failed memory rebuild preserves the previous valid chapter memory. / 章节记忆重建失败时保留此前有效记忆。
 - Global literature clearing now distinguishes clearing library records from deleting imported source files. / 全局清空文献库时，清除记录与删除已导入原始文件现在明确区分。
+- Failed literature chunk analysis does not replace the previously valid profile or evidence store. / 文献分块分析失败时，不替换此前有效的文献画像或证据库。
 
 #### Changed / 变更
 
 - Context Sandwich documentation now describes complete-chapter memory construction and compact summaries without promising perfect recall or consistency. / 上下文三明治说明现准确描述完整章节记忆构建与摘要使用，不再承诺绝对记忆或一致性。
+- Word export formatting is now driven by validated FormatSpec data, while DOCX templates retain their existing content and styles in template-preserving mode. / Word 排版现在由经过校验的 FormatSpec 数据驱动；模板保留模式会保留模板已有内容与样式。
 
 ### v1.0.1 — 2026-09-27
 

@@ -461,10 +461,13 @@ def build_chapter_prompt(sandwich, prompts, reference_literatures, *, locale, co
             f"【全局研究课题】\n{sandwich.get('global_topic', '')}",
             f"【预期总字数】\n{sandwich.get('target_word_count', 5000)}字",
             f"【全局逻辑大纲】\n{sandwich.get('global_outline', '')}",
+            f"【研究约束】\n{sandwich.get('research_constraints', '无已启用的全局研究约束。')}",
+            f"【科研事实 / 数据】\n{sandwich.get('research_facts', '无匹配且已启用的研究事实。')}\n只使用列出的已解析事实；不得补造数据或扩展来源未支持的结论。",
             "【上游已写记忆 / 未写章节提纲】\n"
             f"{sandwich.get('upstream', '')}\n"
             "请利用上游已写内容减少重复论述，并保持此前已经确立的事实、概念和术语一致。",
             f"【当前章节】\n《{sandwich.get('current_title', '')}》（内容约束：{sandwich.get('current_desc', '')}）\n{wc_constraint}",
+            f"【本章绑定文献证据】\n{sandwich.get('literature_evidence', '本章没有可用的已绑定文献证据。')}\n证据只支持其所述主张；引用编号必须对应下方可引用文献。",
             "【下游已写内容 / 未写章节边界】\n"
             f"{sandwich.get('downstream', '')}\n"
             "下游已写内容用于保持一致并避免矛盾或重复；未写章节只作为写作边界，不要把后续章节的内容提前写入本章。",
@@ -512,10 +515,13 @@ def build_chapter_prompt(sandwich, prompts, reference_literatures, *, locale, co
         f"[GLOBAL RESEARCH TOPIC]\n{sandwich.get('global_topic', '')}",
         f"[TARGET TOTAL WORD COUNT]\n{sandwich.get('target_word_count', 5000)} words",
         f"[GLOBAL LOGIC OUTLINE]\n{sandwich.get('global_outline', '')}",
+        f"[RESEARCH CONSTRAINTS]\n{sandwich.get('research_constraints', 'No enabled global research constraints.')}",
+        f"[RESEARCH FACTS / DATA]\n{sandwich.get('research_facts', 'No matching, enabled research facts.')}\nUse only these parsed facts; do not invent data or extend unsupported conclusions.",
         "[UPSTREAM WRITTEN MEMORY / OUTLINE]\n"
         f"{sandwich.get('upstream', '')}\n"
         "Use upstream written material to avoid repeating earlier points and to keep established facts, concepts, and terminology consistent.",
         f"[CURRENT CHAPTER]\n{sandwich.get('current_title', '')} (content constraints: {sandwich.get('current_desc', '')})\n{wc_constraint}",
+        f"[BOUND LITERATURE EVIDENCE]\n{sandwich.get('literature_evidence', 'No evidence chunks are available for the references bound to this chapter.')}\nEvidence supports only its stated claim; citation numbers must match the citable references below.",
         "[DOWNSTREAM WRITTEN CONTENT / BOUNDARY]\n"
         f"{sandwich.get('downstream', '')}\n"
         "Use downstream written material to stay consistent and avoid contradictions or repetition. Treat unwritten downstream sections only as boundaries; do not draft their planned content here.",

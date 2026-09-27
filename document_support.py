@@ -1,12 +1,52 @@
 """Deterministic document chunking and atomic Research Foundation parsing."""
 
+import io
+import os
 import re
+
+import PyPDF2
+import docx
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 from writing_support import LLMOutputError, require_valid_llm_output
 
 
 DEFAULT_CHUNK_CHARS = 5500
 MAX_OUTPUT_TOKENS = 7000
+
+
+def extract_document_text(raw_bytes, filename):
+    """Extract all available text from supported PDF/DOCX/TXT sources without OCR or prefix loss."""
+    extension = os.path.splitext(str(filename or ""))[1].casefold()
+    try:
+        if extension == ".pdf":
+            reader = PyPDF2.PdfReader(io.BytesIO(raw_bytes))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            if not text.strip():
+                return "Parse failed: PDF contains no extractable text (possibly scanned/image-based PDF). Convert to Word or plain text and retry."
+            return text
+        if extension == ".docx":
+            document = docx.Document(io.BytesIO(raw_bytes))
+            fragments = []
+            for element in document.element.body.iterchildren():
+                if element.tag.endswith("}p"):
+                    fragments.append(Paragraph(element, document).text)
+                elif element.tag.endswith("}tbl"):
+                    table = Table(element, document)
+                    fragments.extend(" | ".join(cell.text for cell in row.cells) for row in table.rows)
+            text = "\n".join(fragment for fragment in fragments if fragment.strip())
+            if not text.strip():
+                return "Parse failed: DOCX contains no extractable text."
+            return text
+        if extension == ".txt":
+            text = raw_bytes.decode("utf-8-sig")
+            return text if text.strip() else "Parse failed: TXT contains no text."
+        return f"Parse failed: unsupported document type {extension or '(unknown)'}."
+    except UnicodeDecodeError:
+        return "Parse failed: TXT is not valid UTF-8."
+    except Exception as exc:
+        return f"Parse failed: {exc}"
 
 
 def chunk_document_text(text, max_chars=DEFAULT_CHUNK_CHARS):
@@ -164,6 +204,10 @@ def parse_document_in_chunks(
                 "status": "error", "modules": [], "chunks_total": len(chunks),
                 "failed_chunk": index, "error_type": "parse", "message": message,
             }
+        # Retain trusted parser provenance instead of asking the model to number chunks.
+        for module in parsed_modules:
+            if isinstance(module, dict):
+                module.setdefault("source_chunk", index)
         collected.extend(parsed_modules)
 
     return {"status": "ok", "modules": collected, "chunks_total": len(chunks)}

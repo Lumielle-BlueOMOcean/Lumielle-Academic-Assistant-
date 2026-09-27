@@ -52,8 +52,8 @@ def _delete_source_files(raw_dir, file_paths):
     return {"deleted": deleted, "failed": failed}
 
 
-def clear_literature_library(literatures, raw_dir, save_records, delete_source_files=False):
-    """Clear the record index, then optionally delete only its safe RAW_DIR files."""
+def clear_literature_library(literatures, raw_dir, save_records, delete_source_files=False, save_evidence=None):
+    """Clear records/evidence, then optionally delete only their safe RAW_DIR files."""
     records = literatures if isinstance(literatures, list) else []
     source_paths = [
         record.get("file_path")
@@ -67,6 +67,18 @@ def clear_literature_library(literatures, raw_dir, save_records, delete_source_f
 
     if not records_cleared:
         return {"records_cleared": False, "deleted": 0, "failed": 0}
+
+    if save_evidence is not None:
+        try:
+            evidence_cleared = bool(save_evidence({}))
+        except Exception:
+            evidence_cleared = False
+        if not evidence_cleared:
+            try:
+                save_records(records)
+            except Exception:
+                pass
+            return {"records_cleared": False, "deleted": 0, "failed": 0}
 
     file_result = (
         _delete_source_files(raw_dir, source_paths)

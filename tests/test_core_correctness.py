@@ -255,9 +255,9 @@ class CoreCorrectnessTests(unittest.TestCase):
         support = load_project_module(self, "writing_support")
         self.assertEqual(support.count_chinese_chars("人工 智能，AI"), 7)
 
-    def test_version_is_canonical_v102(self):
+    def test_version_is_canonical_v110(self):
         version = load_project_module(self, "version")
-        self.assertEqual(version.__version__, "1.0.2")
+        self.assertEqual(version.__version__, "1.1.0")
 
     def test_readme_marks_current_version_unreleased_and_keeps_release_history(self):
         version = load_project_module(self, "version")
@@ -675,7 +675,8 @@ class DocumentSupportTests(unittest.TestCase):
             with self.subTest(app=app_name):
                 self.assertIn("parse_document_in_chunks(", source)
                 self.assertIn('parse_result["status"] == "ok"', source)
-                self.assertGreaterEqual(source.count("is_document_parse_error("), 2)
+                self.assertIn("extract_document_text(raw, uploaded_file.name)", source)
+                self.assertEqual(source.count("is_document_parse_error(doc_text)"), 1)
                 self.assertNotIn("doc_text[:6000]", source)
                 self.assertNotIn("doc_text[:5000]", source)
 

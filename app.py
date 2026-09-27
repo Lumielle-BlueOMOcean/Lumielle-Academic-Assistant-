@@ -16,9 +16,40 @@ Lumielle Academic Assistant —— 学术论文写作助手
 
 import streamlit as st
 from version import __version__
-from document_support import DEFAULT_CHUNK_CHARS, is_document_parse_error, parse_document_in_chunks
+from document_support import DEFAULT_CHUNK_CHARS, extract_document_text, is_document_parse_error, parse_document_in_chunks
 from memory_support import update_chapter_memory
 from literature_support import clear_literature_library
+from literature_intelligence import (
+    analyze_literature_document,
+    legacy_profile_for_display,
+    select_literature_evidence_for_chapter,
+    update_evidence_store_after_success,
+)
+from research_support import (
+    PRESET_SECTIONS,
+    add_custom_section,
+    build_research_planning_context,
+    create_default_research_base,
+    migrate_research_base,
+    normalize_research_source,
+    parse_classification_suggestion,
+    parse_research_source,
+    remove_custom_section,
+    select_research_grounding_for_chapter,
+)
+from format_support import (
+    FormatSpecError,
+    delete_user_preset,
+    load_builtin_presets,
+    load_user_presets,
+    parse_format_spec,
+    save_user_preset,
+)
+from word_export_support import render_manuscript_docx
+from research_ui_support import render_research_foundation
+from academic_context_support import attach_chapter_grounding
+from literature_ui_support import render_legacy_reanalysis, render_literature_ingestion
+from format_ui_support import render_format_spec_controls
 from outline_support import (
     extract_docx_manuscript_text,
     persist_reverse_outline_result,
@@ -94,11 +125,9 @@ default_files = {
     "drafts_summary.json": {},
     "drafts_charts.json": {},
     "drafts_images.json": {},
-    "research_base.json": {
-        "content": {"modules": []},
-        "background": {"modules": []},
-        "requirements": {"modules": []}
-    },
+    "research_base.json": create_default_research_base(),
+    "literature_evidence.json": {},
+    "custom_format_presets.json": {},
     "gap_report.json": {"content": ""},
     "literature_quality.json": {"content": ""},
     "full_logic_review.json": {"content": ""},
@@ -619,6 +648,7 @@ def render_global_sidebar():
                         RAW_DIR,
                         lambda records: save_json_file("literatures.json", records),
                         delete_source_files=c_literature_sources,
+                        save_evidence=lambda evidence: save_json_file("literature_evidence.json", evidence),
                     )
                 for fname in sel_files:
                     if fname == "literatures.json":
@@ -982,23 +1012,9 @@ def module1_llm():
 # 8. 板块二：科研基座（研究内容 / 研究背景 / 研究要求）
 # ============================================================
 def parse_uploaded_doc_to_text(uploaded_file):
-    """把上传的 PDF/Word/txt 解析为纯文本"""
-    name = uploaded_file.name
-    raw = uploaded_file.read()
-    try:
-        if name.endswith(".pdf"):
-            reader = PyPDF2.PdfReader(io.BytesIO(raw))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            if not text.strip():
-                return "Parse failed: PDF contains no extractable text (possibly scanned/image-based PDF). Convert to Word or plain text and retry."
-            return text
-        elif name.endswith(".docx"):
-            doc = docx.Document(io.BytesIO(raw))
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-        else:
-            return raw.decode("utf-8", errors="ignore")
-    except Exception as e:
-        return f"Parse failed: {e}"
+    """Use one complete-source extractor for PDF, DOCX, and UTF-8 TXT uploads."""
+    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    return extract_document_text(raw, uploaded_file.name)
 
 
 # 中英文键名归一化映射（v4flash 可能输出中文键名或变体键名）
@@ -1167,23 +1183,11 @@ def ai_parse_doc_to_modules(doc_text, section_desc):
 
 
 def get_research_context_text():
-    """汇总研究课题 + 科研基座全部内容，供各模块使用"""
+    """Shared planning context includes parsed facts regardless of writing-grounding toggles."""
     prompts = load_json_file("prompts.json", {})
-    rb = load_json_file("research_base.json", {"content": {"modules": []}, "background": {"modules": []}, "requirements": {"modules": []}})
-    parts = [f"Research topic: {prompts.get('global_topic','')}"]
-    labels = {"content": "Research content (data & methods)", "background": "Research background", "requirements": "Research requirements"}
-    for key, label in labels.items():
-        mods = rb.get(key, {}).get("modules", [])
-        if mods:
-            lines = [f"[{label}]"]
-            for m in mods:
-                title = m.get("title", "")
-                if m.get("type") == "table":
-                    lines.append(f"- {title}: table data {m.get('columns', [])} -> {m.get('data', [])[:5]}")
-                else:
-                    lines.append(f"- {title}: {str(m.get('content',''))[:200]}")
-            parts.append("\n".join(lines))
-    return "\n\n".join(parts)
+    rb = migrate_research_base(load_json_file("research_base.json", create_default_research_base()))
+    context = build_research_planning_context(rb)
+    return f"Research topic: {prompts.get('global_topic', '')}" + chr(10) + chr(10) + context
 
 
 def render_research_section(section_key, section_title, section_desc):
@@ -1305,40 +1309,21 @@ def render_research_section(section_key, section_title, section_desc):
 
 
 def module2_research_base():
-    st.header("🧪 Research Foundation")
-    
-    tabs = st.tabs([
-        "📌 研究内容（数据与方法）",
-        "🌱 研究背景",
-        "📋 研究要求（任务书等）"
-    ])
-    with tabs[0]:
-        render_research_section("content", "研究内容（数据与方法）", "你的实验数据、研究方法、技术路线等核心内容")
-    with tabs[1]:
-        render_research_section("background", "研究背景", "领域背景、文献综述、研究动机等")
-    with tabs[2]:
-        render_research_section("requirements", "研究要求", "导师任务书、学校格式要求、对研究方法与角度的硬性约束")
+    tree = load_json_file("logic_tree.json", [])
+    render_research_foundation(
+        st,
+        lambda: load_json_file("research_base.json", create_default_research_base()),
+        lambda value: save_json_file("research_base.json", value),
+        parse_uploaded_doc_to_text,
+        dispatch_llm_call,
+        "en",
+        flatten_tree_nodes(tree),
+    )
 
 
 # ============================================================
 # 9. 板块三：文献处理
 # ============================================================
-def build_literature_rating_prompt(title, text):
-    """构造文献评级分类 prompt"""
-    context = get_research_context_text()
-    prompt = (
-        "You are a literature intelligence analyst. Based on the researcher's background, rate and classify the following reference.\n\n"
-        f"[RESEARCH CONTEXT]\n{context[:2000]}\n\n"
-        "[REFERENCE TO ANALYZE]\n"
-        f"Title: {title}\nContent: {text[:3000]}\n\n"
-        "Output ONLY JSON (no Markdown):\n"
-        '{"rating": integer 1-5 (5=highly relevant and crucial, 1=barely relevant), '
-        '"category": "Research Background/Research Method/Theoretical Foundation/Data Source/Case Study/Other", '
-        '"key_findings": "core findings, under 100 words", '
-        '"quality_assessment": "quality assessment: rigor, timeliness, relevance, under 100 words", '
-        '"summary": "abstract, under 150 words"}'
-    )
-    return prompt
 
 
 def open_file_with_default_app(file_path):
@@ -1362,65 +1347,20 @@ def open_file_with_default_app(file_path):
 def module3_literature():
     st.header("📚 Literature Processing")
     literatures = load_json_file("literatures.json", [])
-
-    # ---- 批量导入 ----
-    st.subheader("📥 Batch Import & Intelligent Rating/Classification")
-    
-    up_files = st.file_uploader("Batch upload PDF / Word literature (multi-select)", type=["pdf", "docx"], accept_multiple_files=True, key="lit_batch_up")
-
-    if up_files and st.button("🚀 Start Batch Import & Smart Parsing"):
-        bar = st.progress(0)
-        added = 0
-        for i, uf in enumerate(up_files):
-            with st.spinner(f"Parsing \"{uf.name}\"..."):
-                text = parse_uploaded_doc_to_text(uf)
-                if is_document_parse_error(text):
-                    st.warning(f"{uf.name}: {text}")
-                    bar.progress((i + 1) / len(up_files))
-                    continue
-                prompt = build_literature_rating_prompt(uf.name, text)
-                try:
-                    response = dispatch_llm_call(prompt, system_prompt="你只输出合法 JSON，不输出任何其他内容。", max_tokens=1000)
-                except LLMOutputError:
-                    response = None
-                analysis = parse_literature_analysis(response)
-                analysis_status = analysis.pop("analysis_status")
-                if analysis_status == "unavailable":
-                    st.warning("The reference was imported, but AI rating was unavailable.")
-                lit_id = str(uuid.uuid4())
-                # Save the original source independently of whether AI analysis succeeded.
-                file_path = ""
-                try:
-                    uf.seek(0)
-                    raw_bytes = uf.read()
-                    file_name = f"{lit_id}_{uf.name}"
-                    file_path = os.path.join(RAW_DIR, file_name)
-                    with open(file_path, "wb") as rf:
-                        rf.write(raw_bytes)
-                except Exception:
-                    st.warning("The reference was imported, but its original file could not be saved.")
-                literatures.append({
-                    "id": lit_id,
-                    "title": uf.name,
-                    "summary": text[:500] + ("..." if len(text) > 500 else ""),
-                    "source": "Local Upload",
-                    "link": "",
-                    "file_path": file_path,
-                    "important": False,
-                    "rating": analysis["rating"],
-                    "category": analysis["category"],
-                    "analysis_status": analysis_status,
-                    "analysis": analysis
-                })
-                added += 1
-            bar.progress((i + 1) / len(up_files))
-        save_json_file("literatures.json", literatures)
-        st.success(f"Batch import complete! {added} reference(s) added.")
-        st.rerun()
+    evidence_store = load_json_file("literature_evidence.json", {})
+    render_literature_ingestion(
+        st, literatures, evidence_store, RAW_DIR, parse_uploaded_doc_to_text,
+        dispatch_llm_call,
+        lambda records: save_json_file("literatures.json", records),
+        lambda records: save_json_file("literature_evidence.json", records),
+        "en",
+    )
+    literatures = load_json_file("literatures.json", [])
+    evidence_store = load_json_file("literature_evidence.json", {})
 
     st.markdown("---")
 
-    # ---- 文献列表 ----
+    # ---- Literature Library ----
     st.subheader("📖 Literature Library")
     if not literatures:
         st.info("The literature library is empty. Please batch import first.")
@@ -1475,6 +1415,13 @@ def module3_literature():
                             
                         else:
                             st.caption("(original file not saved, parsed text only)")
+                        render_legacy_reanalysis(
+                            st, lit, literatures, evidence_store, RAW_DIR, extract_document_text,
+                            dispatch_llm_call,
+                            lambda records: save_json_file("literatures.json", records),
+                            lambda records: save_json_file("literature_evidence.json", records),
+                            "en",
+                        )
                 with c_star:
                     if st.button("🌟", key=f"litstar_{lit['id']}"):
                         lit['important'] = not lit.get('important', False)
@@ -1490,7 +1437,9 @@ def module3_literature():
                             except Exception:
                                 pass
                         literatures.pop(idx)
+                        evidence_store.pop(str(lit.get("id", "")), None)
                         save_json_file("literatures.json", literatures)
+                        save_json_file("literature_evidence.json", evidence_store)
                         st.rerun()
 
     st.markdown("---")
@@ -2386,32 +2335,41 @@ def render_batch_workbench():
     tpl_names = list_templates()
     tpl_opts = ["(No template; create blank document)"] + tpl_names
     tpl_sel = st.selectbox("Layout template (optional)", tpl_opts, key="quick_tpl")
-    with st.expander("⚙️ Layout parameters (default: SimSun/SimHei, 1.5 line spacing, 2-char first-line indent)", expanded=False):
-        q_ls = st.number_input("Line spacing", min_value=1.0, max_value=3.0, value=1.5, step=0.1, key="quick_ls")
-        q_fi = st.number_input("First-line indent (chars)", min_value=0, max_value=4, value=2, step=1, key="quick_fi")
-        q_font = st.text_input("Body font", value="SimSun", key="quick_font")
-        q_hfont = st.text_input("Heading font", value="SimHei", key="quick_hfont")
-        q_size = st.number_input("Body font size (pt)", min_value=9, max_value=22, value=12, step=1, key="quick_size")
-        q_align = st.selectbox("Alignment", ["justify", "left", "center", "right"], index=0, key="quick_align")
+    try:
+        quick_presets = load_builtin_presets(os.path.join(BASE_DIR, "format_presets"))
+    except FormatSpecError:
+        quick_presets = {}
+        st.error("Built-in FormatSpec presets could not be loaded. Use the main export panel to review the issue.")
+    if quick_presets:
+        try:
+            quick_presets.update(load_user_presets(os.path.join(DATA_DIR, "custom_format_presets.json")))
+        except FormatSpecError:
+            st.error("Saved custom FormatSpec presets could not be loaded; built-in presets remain available.")
+    quick_spec = None
+    if quick_presets:
+        default_quick_name = "Legacy Compatible" if "Legacy Compatible" in quick_presets else next(iter(quick_presets))
+        quick_name = st.selectbox("Formatting preset", list(quick_presets), index=list(quick_presets).index(default_quick_name), key="quick_format_spec")
+        quick_spec = quick_presets[quick_name]
     if st.button("📥 Generate Word Document Now", type="primary", key="quick_gen_doc"):
         if not flatten_tree_nodes(load_json_file("logic_tree.json", [])):
             st.warning("The logic outline is empty. Generate it in Module 4 first.")
+        elif quick_spec is None:
+            st.error("No valid FormatSpec preset is available.")
         else:
             with st.spinner("Formatting Agent is assembling the final draft..."):
-                params = {
-                    "line_spacing": float(q_ls), "first_line_indent": int(q_fi),
-                    "font_name": q_font, "font_size": int(q_size),
-                    "heading_font": q_hfont, "alignment": q_align
-                }
-                bio = build_final_document(None if tpl_sel.startswith("(No template") else tpl_sel, params)
-                st.success("Final draft assembled!")
-                st.download_button(
-                    "📥 Download Formatted Word Final Draft",
-                    data=bio,
-                    file_name="Refined_Scholar_Final.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key="quick_dl"
-                )
+                try:
+                    bio = build_final_document(None if tpl_sel.startswith("(No template") else tpl_sel, quick_spec)
+                except (FormatSpecError, ValueError):
+                    st.error("The selected FormatSpec could not be rendered. Choose a valid preset and try again.")
+                else:
+                    st.success("Final draft assembled!")
+                    st.download_button(
+                        "📥 Download Formatted Word Final Draft",
+                        data=bio,
+                        file_name="Refined_Scholar_Final.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key="quick_dl"
+                    )
 
 
 def _scan_structure_issues(tree, drafts, target_wc):
@@ -3033,109 +2991,36 @@ def render_md_table(doc, table_lines, params):
             table.cell(ri, ci).text = cell_text.strip()
 
 
-def build_final_document(template_name, params):
-    """装配终稿 Word 文档，返回 BytesIO"""
+def build_final_document(template_name, format_spec, template_only=False):
+    """Load the current manuscript state and delegate all DOCX layout to the shared renderer."""
     tree = load_json_file("logic_tree.json", [])
     drafts = load_json_file("drafts.json", {})
     draft_reference_maps = load_json_file("draft_reference_maps.json", {})
+    literatures = load_json_file("literatures.json", [])
     drafts_charts = load_json_file("drafts_charts.json", {})
     drafts_images = load_json_file("drafts_images.json", {})
-    ordered, global_number_by_id, lit_map = collect_references_for_export(
-        tree, drafts, draft_reference_maps
-    )
-
-    # 依据模板：打开模板继承页边距/页眉/样式；否则新建空白文档
-    doc = None
+    template_bytes = None
     if template_name:
-        tpath = os.path.join(TEMPLATE_DIR, template_name)
-        if os.path.exists(tpath):
-            try:
-                doc = docx.Document(tpath)
-            except Exception:
-                doc = docx.Document()
-    if doc is None:
-        doc = docx.Document()
-
-    # 标题字体设置（模板模式下也生效）
-    def set_heading_font(paragraph, level):
-        try:
-            for run in paragraph.runs:
-                run.font.name = params.get("heading_font", "黑体")
-                run._element.rPr.rFonts.set(qn("w:eastAsia"), params.get("heading_font", "黑体"))
-                run.font.color.rgb = RGBColor(0, 0, 0)
-        except Exception:
-            pass
-
-    # 遍历逻辑树装配
-    for node, depth in flatten_tree_nodes(tree):
-        nid = node.get("id")
-        title = node.get("title", "")
-        if title:
-            h = doc.add_heading(title, level=min(depth + 1, 3))
-            set_heading_font(h, depth + 1)
-
-        text = drafts.get(nid, "")
-        if text:
-            local_reference_ids = reference_ids_for_node(node, draft_reference_maps)
-            export_text = remap_local_citations(text, local_reference_ids, global_number_by_id)
-            cleaned = clean_markdown_text(export_text)
-            # 连续表格行聚合为 Word 表格
-            buf = []
-            for para in cleaned:
-                if para.startswith("TABLE|"):
-                    buf.append(para)
-                else:
-                    if buf:
-                        render_md_table(doc, buf, params)
-                        buf = []
-                    p = doc.add_paragraph(para)
-                    apply_paragraph_format(p, params)
-            if buf:
-                render_md_table(doc, buf, params)
-
-        # 挂载图表
-        for ch in drafts_charts.get(nid, []) or []:
-            if os.path.exists(ch.get("path", "")):
-                try:
-                    doc.add_picture(ch["path"], width=Inches(5.5))
-                    doc.paragraphs[-1].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                except Exception:
-                    pass
-
-        # 挂载图片
-        for im in drafts_images.get(nid, []) or []:
-            if os.path.exists(im.get("path", "")):
-                try:
-                    doc.add_picture(im["path"], width=Inches(5.0))
-                    doc.paragraphs[-1].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                    if im.get("caption"):
-                        cap = doc.add_paragraph(im["caption"])
-                        cap.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                        for run in cap.runs:
-                            run.font.size = Pt(9)
-                except Exception:
-                    pass
-
-    # 参考文献表
-    if ordered:
-        doc.add_page_break()
-        doc.add_heading("References", level=1)
-        for rid in ordered:
-            lit = lit_map[rid]
-            title = lit.get("title", "Untitled")
-            cat = lit.get("category", "")
-            findings = str(lit.get("analysis", {}).get("key_findings", ""))[:100]
-            ref_p = doc.add_paragraph(f"[{global_number_by_id[rid]}] {title}（{cat}）")
-            apply_paragraph_format(ref_p, {**params, "first_line_indent": 0})
-            if findings:
-                ref_p2 = doc.add_paragraph(f"    Key findings: {findings}")
-                for run in ref_p2.runs:
-                    run.font.size = Pt(10.5)
-
-    bio = io.BytesIO()
-    doc.save(bio)
-    bio.seek(0)
-    return bio
+        root = os.path.realpath(TEMPLATE_DIR)
+        candidate = os.path.realpath(os.path.join(root, template_name))
+        if os.path.commonpath((root, candidate)) != root:
+            raise ValueError("Selected template path is outside the templates directory.")
+        if not os.path.isfile(candidate):
+            raise ValueError("Selected DOCX template is unavailable.")
+        with open(candidate, "rb") as handle:
+            template_bytes = handle.read()
+    return render_manuscript_docx(
+        tree=tree,
+        drafts=drafts,
+        draft_reference_maps=draft_reference_maps,
+        literatures=literatures,
+        drafts_charts=drafts_charts,
+        drafts_images=drafts_images,
+        format_spec=format_spec,
+        locale='en',
+        template_bytes=template_bytes,
+        template_only=template_only,
+    )
 
 
 def module6_aigc():
@@ -3424,28 +3309,31 @@ def module6_aigc():
 
         st.markdown("---")
 
-        # ---- 格式来源选择 ----
-        st.markdown("### 🎛️ Format Source Settings")
-        format_source = st.radio(
-            "Format Basis (Template / Prompt):",
-            ["Based on Prompt", "Based on Template", "Template + Prompt Combined"],
+        # ---- FormatSpec source selection ----
+        st.markdown("### FormatSpec presets")
+        format_mode = st.radio(
+            "Export format source",
+            ['FormatSpec preset', 'DOCX template', 'Template + FormatSpec'],
             index=0,
-            help="Prompt comes from \"Document Format Prompt\" in Module 7; template comes from the .docx uploaded above.",
-            key="format_source"
+            help="A template preserves its existing content/styles; FormatSpec controls supported fields when selected.",
+            key="format_source_v110",
         )
-
         prompts = load_json_file("prompts.json", {})
-        format_prompt = prompts.get("format_prompt", "")
-        st.caption(f"Current format prompt: {format_prompt[:120]}{'...' if len(format_prompt) > 120 else ''}")
-
-        use_template = format_source in ["Based on Template", "Template + Prompt Combined"]
-        use_prompt = format_source in ["Based on Prompt", "Template + Prompt Combined"]
+        selected_spec = render_format_spec_controls(
+            st,
+            locale="en",
+            preset_directory=os.path.join(BASE_DIR, "format_presets"),
+            custom_store_path=os.path.join(DATA_DIR, "custom_format_presets.json"),
+            llm_call=dispatch_llm_call,
+            saved_format_prompt=prompts.get("format_prompt", ""),
+        )
+        use_template = format_mode in ['DOCX template', 'Template + FormatSpec']
+        template_only = format_mode == 'DOCX template'
         if use_template and not templates:
-            st.warning("⚠️ You chose to use a template, but none is uploaded. Falling back to a blank document.")
+            st.warning("No template is uploaded. The selected FormatSpec will be used.")
             use_template = False
-        tpl_name = None
-        if use_template:
-            tpl_name = st.selectbox("Select template for export", templates, key="tpl_export_sel")
+            template_only = False
+        tpl_name = st.selectbox("Select DOCX template", templates, key="tpl_export_sel") if use_template else None
 
         st.markdown("---")
 
@@ -3454,27 +3342,20 @@ def module6_aigc():
             if not flatten_tree_nodes(load_json_file("logic_tree.json", [])):
                 st.warning("The logic outline is empty. Generate it in Module 4 first.")
             else:
-                with st.spinner("Formatting Agent is assembling the final draft..."):
-                    # 依据提示词：提取排版参数；否则用默认参数
-                    if use_prompt:
-                        try:
-                            params = extract_format_params(format_prompt)
-                        except LLMOutputError:
-                            st.warning("Could not read layout settings from the model; default Word layout was used.")
-                            params = {"line_spacing": 1.5, "first_line_indent": 2, "font_name": "宋体",
-                                      "font_size": 12, "heading_font": "黑体", "alignment": "justify"}
+                with st.spinner("Assembling the final DOCX..."):
+                    try:
+                        bio = build_final_document(tpl_name, selected_spec, template_only=template_only)
+                    except (FormatSpecError, ValueError) as exc:
+                        st.error(str(exc))
                     else:
-                        params = {"line_spacing": 1.5, "first_line_indent": 2, "font_name": "宋体",
-                                  "font_size": 12, "heading_font": "黑体", "alignment": "justify"}
-                    bio = build_final_document(tpl_name, params)
-                    st.success("Final draft assembled!")
-                    st.download_button(
-                        "📥 Download Formatted Word Final Draft",
-                        data=bio,
-                        file_name="Refined_Scholar_Final.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key="export_dl"
-                    )
+                        st.success("Final draft assembled.")
+                        st.download_button(
+                            "📥 Download Formatted Word Final Draft",
+                            data=bio,
+                            file_name="Refined_Scholar_Final.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key="export_dl",
+                        )
 
 
 # ============================================================
@@ -3523,6 +3404,18 @@ def module7_prompts():
 # ============================================================
 # 14. 主函数
 # ============================================================
+_build_context_sandwich_without_fact_layer = build_context_sandwich
+
+
+def build_context_sandwich(current_node_id, max_chars=20000):
+    context = _build_context_sandwich_without_fact_layer(current_node_id, max_chars=max_chars)
+    context["current_id"] = current_node_id
+    research_base = migrate_research_base(load_json_file("research_base.json", create_default_research_base()))
+    evidence_store = load_json_file("literature_evidence.json", {})
+    literatures = load_json_file("literatures.json", [])
+    return attach_chapter_grounding(context, research_base, evidence_store, literatures, locale="en")
+
+
 def main():
     # Startup project information (visible in the terminal).
     print("=" * 56)
