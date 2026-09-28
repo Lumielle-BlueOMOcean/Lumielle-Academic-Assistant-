@@ -16,6 +16,7 @@ Lumielle Academic Assistant —— 学术论文写作助手
 
 import streamlit as st
 from version import __version__
+import llm_connection_support
 from document_support import DEFAULT_CHUNK_CHARS, extract_document_text, is_document_parse_error, parse_document_in_chunks
 from memory_support import update_chapter_memory
 from literature_support import clear_literature_library
@@ -114,10 +115,7 @@ for directory in [DATA_DIR, TEMPLATE_DIR, RAW_DIR, CHART_DIR, IMAGE_DIR, MODEL_D
     os.makedirs(directory, exist_ok=True)
 
 default_files = {
-    "llm_profiles.json": [{
-        "id": "default", "name": "DeepSeek 默认配置",
-        "base_url": "https://api.deepseek.com/v1", "api_key": "", "model": "deepseek-chat"
-    }],
+    "llm_profiles.json": [llm_connection_support.default_deepseek_profile("DeepSeek 默认配置")],
     "literatures.json": [],
     "logic_tree.json": [],
     "drafts.json": {},
@@ -698,38 +696,67 @@ def render_global_sidebar():
 # 7. 板块一：LLM 配置与多模型交叉讨论
 # ============================================================
 def fetch_models_from_base_url(base_url, api_key):
-    """通过 OpenAI 兼容的 /models 端点抓取可用模型列表。
-    返回 (成功标志, 模型列表 或 错误信息)"""
-    if not base_url or not base_url.strip():
-        return False, "请先填写 Base URL。"
-    # 处理 base_url 结尾的斜杠与 /v1 后缀，确保拼出 /models
-    url = base_url.strip().rstrip("/")
-    if not url.endswith("/models"):
-        url = url + "/models"
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            models = data.get("data", []) if isinstance(data, dict) else []
-            names = []
-            for m in models:
-                mid = m.get("id") if isinstance(m, dict) else str(m)
-                if mid:
-                    names.append(str(mid))
-            if names:
-                return True, sorted(names)
-            return False, "接口返回成功但未找到模型列表（data 为空）。"
-        return False, f"请求失败 (HTTP {resp.status_code})：{resp.text[:200]}"
-    except requests.exceptions.Timeout:
-        return False, "请求超时，请检查网络或 Base URL 是否正确。"
-    except Exception as e:
-        return False, f"请求异常: {e}"
+    """兼容既有页面调用方式，共享模型列表获取实现。"""
+    result = llm_connection_support.fetch_available_models(base_url, api_key)
+    if result["ok"]:
+        return True, result["models"]
+    return False, _connection_error_text(result["code"])
+
+
+def _connection_error_text(code):
+    return {
+        "missing_api_key": "请先填写 API Key。",
+        "missing_base_url": "请先填写 Base URL。",
+        "missing_model": "请先选择模型。",
+        "authentication_failed": "API Key 无效或认证失败，请确认已完整复制 API Key。",
+        "insufficient_balance": "API 账户余额或额度不足，请前往服务商开放平台检查账户状态。",
+        "model_not_available": "当前模型不可用，请重新拉取模型列表并从列表中选择。",
+        "rate_limited": "请求频率受限，请稍后重试。",
+        "timeout": "请求超时，请检查网络后重试。",
+        "connection_error": "无法连接服务商，请检查网络和 Base URL。",
+        "provider_error": "服务商未能完成请求，请检查 Base URL 和服务商状态。",
+        "unknown_error": "连接测试未能完成，请检查配置后重试。",
+    }.get(code, "连接测试未能完成，请检查配置后重试。")
+
+
+def _matching_connection_test(state_key, signature):
+    state = st.session_state.get(state_key)
+    if isinstance(state, dict) and state.get("signature") == signature:
+        return state.get("result")
+    return None
+
+
+def _render_connection_test(state_key, signature):
+    result = _matching_connection_test(state_key, signature)
+    if not result:
+        return None
+    if result.get("ok"):
+        st.success(
+            f"✅ 模型连接正常\n已成功调用：{result.get('model', '')}\n现在可以保存并激活此配置。"
+        )
+    else:
+        message = _connection_error_text(result.get("code", "unknown_error"))
+        if result.get("code") in {"rate_limited", "timeout", "connection_error"}:
+            st.warning(message)
+        else:
+            st.error(message)
+    return result
 
 
 def llm_config_tab():
     st.subheader("⚙️ LLM 配置矩阵")
-    st.caption("💡 DeepSeek 开放平台：https://platform.deepseek.com （申请 API Key 后在此配置）")
+    st.info(
+        "第一次使用 API？请在 [DeepSeek 开放平台](https://platform.deepseek.com) 或 "
+        "[API Key 页面](https://platform.deepseek.com/api_keys) 创建密钥，再将完整的 `sk-...` 字符串粘贴到下方。"
+        "DeepSeek App / 网页版免费聊天与开放平台 API 是不同的使用方式；API 调用取决于开放平台账户状态和余额。"
+    )
+    new_save_notice = st.session_state.pop("llm_new_save_notice", None)
+    if new_save_notice == "untested":
+        st.warning("配置已保存，但尚未通过模型连接测试。")
+    elif new_save_notice == "failed":
+        st.warning("配置已保存，但最近一次模型连接测试未通过。使用前请查看下方提示。")
+    elif new_save_notice == "passed":
+        st.success("配置已通过模型连接测试并保存。")
     profiles = get_all_profiles()
     active = get_active_profile()
     if active:
@@ -737,56 +764,72 @@ def llm_config_tab():
 
     # ---- 新增配置 ----
     with st.expander("➕ 新增 LLM 配置", expanded=False):
-        with st.form("new_llm_form"):
-            c1, c2 = st.columns(2)
-            with c1:
-                n_name = st.text_input("配置名称", value="新模型配置")
-                n_base = st.text_input("Base URL", value="https://api.deepseek.com/v1", key="n_base_url")
-            with c2:
-                n_key = st.text_input("API Key", type="password", key="n_api_key")
-            # 自动拉取模型列表
-            c_fetch, c_hint = st.columns([1, 3])
-            with c_fetch:
-                fetch_clicked = st.form_submit_button("🔍 拉取模型列表")
-            if fetch_clicked:
-                ok, result = fetch_models_from_base_url(n_base, n_key)
-                if ok:
-                    st.session_state["fetched_models"] = result
-                    st.session_state["fetch_base"] = n_base
-                    st.success(f"获取到 {len(result)} 个模型！请在下拉框选择。")
-                else:
-                    st.session_state.pop("fetched_models", None)
-                    st.error(f"模型列表获取失败：{result}")
-            # 模型选择：完全走下拉（未拉取时禁用提示）
-            if st.session_state.get("fetched_models") and st.session_state.get("fetch_base") == n_base:
-                st.selectbox(
-                    "选择模型名称（自动获取）：",
-                    st.session_state["fetched_models"],
-                    key="n_model_select",
-                    help="从该服务商 API 拉取的可用模型列表"
-                )
+        n_name = st.text_input("配置名称", value="新模型配置", key="n_name")
+        n_base = st.text_input("Base URL", value="https://api.deepseek.com", key="n_base_url")
+        n_key = st.text_input("API Key", type="password", key="n_api_key")
+        fetch_signature = llm_connection_support.make_connection_signature(n_base, n_key, "")
+        if st.button("🔍 拉取模型列表", key="fetch_new_models"):
+            fetched = llm_connection_support.fetch_available_models(n_base, n_key)
+            if fetched["ok"]:
+                st.session_state["llm_new_models"] = {"signature": fetch_signature, "models": fetched["models"]}
+                if st.session_state.get("n_model_select") not in fetched["models"]:
+                    st.session_state.pop("n_model_select", None)
+                st.success(f"获取到 {len(fetched['models'])} 个模型，请在下方选择。")
             else:
-                st.selectbox(
-                    "选择模型名称：",
-                    ["（请先点击上方「拉取模型列表」）"],
-                    key="n_model_empty",
-                    disabled=True,
-                    help="填写 Base URL 与 API Key 后点击「拉取模型列表」，从下拉框选择模型"
-                )
-            submitted = st.form_submit_button("💾 保存新增配置")
-            if submitted:
-                if not n_key:
-                    st.warning("API Key 不能为空")
-                elif not st.session_state.get("n_model_select"):
-                    st.warning("请先点击「🔍 拉取模型列表」获取模型，并从下拉框选择。")
-                else:
-                    profiles.append({
-                        "id": str(uuid.uuid4()), "name": n_name,
-                        "base_url": n_base, "api_key": n_key, "model": st.session_state["n_model_select"]
-                    })
-                    save_json_file("llm_profiles.json", profiles)
-                    st.session_state.pop("fetched_models", None)
-                    st.success("配置已新增！")
+                st.session_state.pop("llm_new_models", None)
+                st.error(f"模型列表获取失败：{_connection_error_text(fetched['code'])}")
+
+        fetched_state = st.session_state.get("llm_new_models", {})
+        new_models = fetched_state.get("models", []) if fetched_state.get("signature") == fetch_signature else []
+        if new_models:
+            n_model = st.selectbox("选择模型名称（自动获取）", new_models, key="n_model_select")
+            model_ready = True
+        else:
+            st.selectbox(
+                "选择模型名称",
+                ["（请先拉取模型列表）"],
+                key="n_model_empty",
+                disabled=True,
+                help="填写 Base URL 与 API Key 后拉取模型列表，再选择模型。",
+            )
+            n_model = ""
+            model_ready = False
+
+        test_signature = llm_connection_support.make_connection_signature(n_base, n_key, n_model)
+        if model_ready and n_model:
+            if st.button("🧪 测试模型连接", key="test_new_model_connection"):
+                with st.spinner("正在发送最小测试请求……"):
+                    result = llm_connection_support.test_model_connection(n_base, n_key, n_model)
+                st.session_state["llm_new_connection_test"] = {"signature": test_signature, "result": result}
+            test_result = _render_connection_test("llm_new_connection_test", test_signature)
+        else:
+            test_result = None
+
+        if st.button("💾 保存新增配置", key="save_new_llm_profile"):
+            if not n_key.strip():
+                st.warning("API Key 不能为空。")
+            elif not model_ready or not n_model:
+                st.warning("请先拉取模型列表并选择模型，再保存配置。")
+            else:
+                new_profile = {
+                    "id": str(uuid.uuid4()), "name": n_name,
+                    "base_url": n_base, "api_key": n_key, "model": n_model,
+                }
+                if save_json_file("llm_profiles.json", profiles + [new_profile]):
+                    profiles.append(new_profile)
+                    if test_result and test_result.get("ok"):
+                        notice = "passed"
+                        st.session_state[f"llm_profile_connection_test_{new_profile['id']}"] = {
+                            "signature": test_signature, "result": test_result,
+                        }
+                    elif test_result:
+                        notice = "failed"
+                        st.session_state[f"llm_profile_connection_test_{new_profile['id']}"] = {
+                            "signature": test_signature, "result": test_result,
+                        }
+                    else:
+                        notice = "untested"
+                    st.session_state["llm_new_save_notice"] = notice
                     st.rerun()
 
     st.markdown("---")
@@ -797,6 +840,24 @@ def llm_config_tab():
             badge = "✅ **当前激活**" if is_active else ""
             st.markdown(f"### {prof.get('name','未命名')} {badge}")
             st.caption(f"Base URL：`{prof.get('base_url','')}` ｜ Model：`{prof.get('model','')}` ｜ Key：{'已填写' if prof.get('api_key') else '未填写'}")
+            current_profile_signature = llm_connection_support.make_connection_signature(
+                st.session_state.get(f"eb_{prof['id']}", prof.get("base_url", "")),
+                st.session_state.get(f"ek_{prof['id']}", prof.get("api_key", "")),
+                st.session_state.get(f"em_select_{prof['id']}", prof.get("model", "")),
+            )
+            profile_test = _matching_connection_test(
+                f"llm_profile_connection_test_{prof['id']}", current_profile_signature
+            )
+            if profile_test and profile_test.get("ok"):
+                st.caption("✅ 本次会话已测试可用")
+            save_notice_key = f"llm_profile_save_notice_{prof['id']}"
+            profile_save_notice = st.session_state.pop(save_notice_key, None)
+            if profile_save_notice == "untested":
+                st.warning("配置已保存，但尚未通过模型连接测试。")
+            elif profile_save_notice == "failed":
+                st.warning("配置已保存，但最近一次模型连接测试未通过。")
+            elif profile_save_notice == "passed":
+                st.success("配置已通过模型连接测试并保存。")
 
             col_a, col_b = st.columns([1, 5])
             with col_a:
@@ -812,48 +873,74 @@ def llm_config_tab():
                         e_base = st.text_input("Base URL", value=prof.get("base_url", ""), key=f"eb_{prof['id']}")
                     with e2:
                         e_key = st.text_input("API Key", value=prof.get("api_key", ""), type="password", key=f"ek_{prof['id']}")
-                    st.caption(f"当前模型：`{prof.get('model','')}`")
-                    # 自动拉取模型列表（模型完全走下拉）
+                    edit_fetch_signature = llm_connection_support.make_connection_signature(e_base, e_key, "")
                     if st.button("🔍 从 Base URL 拉取模型列表", key=f"efetch_{prof['id']}"):
-                        ok, result = fetch_models_from_base_url(e_base, e_key)
-                        if ok:
-                            st.session_state[f"edit_models_{prof['id']}"] = result
-                            st.session_state[f"edit_fetch_base_{prof['id']}"] = e_base
-                            st.success(f"获取到 {len(result)} 个模型！请在下拉框选择。")
+                        fetched = llm_connection_support.fetch_available_models(e_base, e_key)
+                        if fetched["ok"]:
+                            st.session_state[f"edit_models_{prof['id']}"] = {
+                                "signature": edit_fetch_signature, "models": fetched["models"],
+                            }
+                            if st.session_state.get(f"em_select_{prof['id']}") not in fetched["models"]:
+                                st.session_state.pop(f"em_select_{prof['id']}", None)
+                            st.success(f"获取到 {len(fetched['models'])} 个模型，请在下方选择。")
                         else:
                             st.session_state.pop(f"edit_models_{prof['id']}", None)
-                            st.error(f"模型列表获取失败：{result}")
-                    if st.session_state.get(f"edit_models_{prof['id']}") and st.session_state.get(f"edit_fetch_base_{prof['id']}") == e_base:
+                            st.error(f"模型列表获取失败：{_connection_error_text(fetched['code'])}")
+                    edit_fetch_state = st.session_state.get(f"edit_models_{prof['id']}", {})
+                    edit_models = edit_fetch_state.get("models", []) if edit_fetch_state.get("signature") == edit_fetch_signature else []
+                    if edit_models:
+                        current_model = st.session_state.get(f"em_select_{prof['id']}", prof.get("model", ""))
+                        if current_model not in edit_models:
+                            st.session_state.pop(f"em_select_{prof['id']}", None)
+                            current_model = edit_models[0]
                         e_model = st.selectbox(
-                            "选择模型名称（自动获取）：",
-                            st.session_state[f"edit_models_{prof['id']}"],
-                            index=0,
-                            key=f"em_select_{prof['id']}",
-                            help="从该服务商 API 拉取的可用模型列表"
+                            "选择模型名称（自动获取）", edit_models,
+                            index=edit_models.index(current_model), key=f"em_select_{prof['id']}",
                         )
                     else:
-                        st.selectbox(
-                            "选择模型名称：",
-                            ["（请先点击上方「拉取模型列表」）"],
-                            key=f"em_empty_{prof['id']}",
-                            disabled=True,
-                            help="点击「从 Base URL 拉取模型列表」后从下拉框选择模型"
+                        current_model = prof.get("model", "")
+                        if st.session_state.get(f"em_select_{prof['id']}") != current_model:
+                            st.session_state.pop(f"em_select_{prof['id']}", None)
+                        options = [current_model] if current_model else ["（请先拉取模型列表）"]
+                        e_model = st.selectbox(
+                            "模型名称", options, key=f"em_select_{prof['id']}",
+                            disabled=not bool(current_model),
+                            help="拉取模型列表后可更换模型；也可直接测试已保存的模型。",
                         )
+                    edit_test_signature = llm_connection_support.make_connection_signature(e_base, e_key, e_model)
+                    if e_model and not e_model.startswith("（"):
+                        if st.button("🧪 测试模型连接", key=f"etest_{prof['id']}"):
+                            with st.spinner("正在发送最小测试请求……"):
+                                result = llm_connection_support.test_model_connection(e_base, e_key, e_model)
+                            st.session_state[f"llm_profile_connection_test_{prof['id']}"] = {
+                                "signature": edit_test_signature, "result": result,
+                            }
+                        edit_test_result = _render_connection_test(
+                            f"llm_profile_connection_test_{prof['id']}", edit_test_signature
+                        )
+                    else:
+                        edit_test_result = None
                     c_ed, c_del = st.columns(2)
                     with c_ed:
                         if st.button("💾 保存修改", key=f"esave_{prof['id']}"):
-                            chosen_model = st.session_state.get(f"em_select_{prof['id']}", "")
-                            if not chosen_model:
-                                st.warning("请先点击「🔍 从 Base URL 拉取模型列表」并从下拉框选择模型。")
+                            if not e_model or e_model.startswith("（"):
+                                st.warning("请先选择模型再保存。")
                             else:
-                                profiles[idx] = {
+                                updated_profiles = list(profiles)
+                                updated_profiles[idx] = {
                                     "id": prof["id"], "name": e_name,
-                                    "base_url": e_base, "api_key": e_key, "model": chosen_model
+                                    "base_url": e_base, "api_key": e_key, "model": e_model,
                                 }
-                                save_json_file("llm_profiles.json", profiles)
-                                st.session_state.pop(f"edit_models_{prof['id']}", None)
-                                st.success("已保存！")
-                                st.rerun()
+                                if save_json_file("llm_profiles.json", updated_profiles):
+                                    profiles[idx] = updated_profiles[idx]
+                                    if edit_test_result and edit_test_result.get("ok"):
+                                        notice = "passed"
+                                    elif edit_test_result:
+                                        notice = "failed"
+                                    else:
+                                        notice = "untested"
+                                    st.session_state[save_notice_key] = notice
+                                    st.rerun()
                     with c_del:
                         if st.button("🗑️ 删除此配置", key=f"edel_{prof['id']}"):
                             profiles.pop(idx)
@@ -1764,7 +1851,7 @@ def module4_logic():
             if res:
                 # 智能识别：检测返回是否为 YAML/文本思考草稿
                 if ("word_count:" in res) or ("- title:" in res) or ("title:" in res and "id:" in res):
-                    st.error("未能解析出 JSON 大纲：当前模型返回的是 YAML 文本草稿而非 JSON（推理型模型特性）。建议在板块一将模型切换为 deepseek-chat 等常规对话模型后重试。")
+                    st.error("未能解析出 JSON 大纲：当前模型返回的是 YAML 文本草稿而非 JSON（推理型模型特性）。建议在板块一切换为模型列表中支持 Chat Completions 的常规对话模型后重试。")
                 elif "未能从模型输出中解析" not in res:
                     st.error("生成的逻辑大纲字数远低于预期目标，多次尝试后仍未达标。可稍后重试，或检查板块一的目标字数设置。")
                 with st.expander("查看 LLM 原始返回（调试用）", expanded=False):

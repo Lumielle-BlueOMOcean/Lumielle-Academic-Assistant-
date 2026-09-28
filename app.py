@@ -16,6 +16,7 @@ Lumielle Academic Assistant —— 学术论文写作助手
 
 import streamlit as st
 from version import __version__
+import llm_connection_support
 from document_support import DEFAULT_CHUNK_CHARS, extract_document_text, is_document_parse_error, parse_document_in_chunks
 from memory_support import update_chapter_memory
 from literature_support import clear_literature_library
@@ -115,10 +116,7 @@ for directory in [DATA_DIR, TEMPLATE_DIR, RAW_DIR, CHART_DIR, IMAGE_DIR, MODEL_D
     os.makedirs(directory, exist_ok=True)
 
 default_files = {
-    "llm_profiles.json": [{
-        "id": "default", "name": "DeepSeek 默认配置",
-        "base_url": "https://api.deepseek.com/v1", "api_key": "", "model": "deepseek-chat"
-    }],
+    "llm_profiles.json": [llm_connection_support.default_deepseek_profile("DeepSeek Default Profile")],
     "literatures.json": [],
     "logic_tree.json": [],
     "drafts.json": {},
@@ -705,38 +703,70 @@ def render_global_sidebar():
 # 7. 板块一：LLM 配置与多模型交叉讨论
 # ============================================================
 def fetch_models_from_base_url(base_url, api_key):
-    """通过 OpenAI 兼容的 /models 端点抓取可用模型列表。
-    返回 (成功标志, 模型列表 或 错误信息)"""
-    if not base_url or not base_url.strip():
-        return False, "Please fill in the Base URL first."
-    # 处理 base_url 结尾的斜杠与 /v1 后缀，确保拼出 /models
-    url = base_url.strip().rstrip("/")
-    if not url.endswith("/models"):
-        url = url + "/models"
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            models = data.get("data", []) if isinstance(data, dict) else []
-            names = []
-            for m in models:
-                mid = m.get("id") if isinstance(m, dict) else str(m)
-                if mid:
-                    names.append(str(mid))
-            if names:
-                return True, sorted(names)
-            return False, "Request succeeded but no model list found (data is empty)."
-        return False, f"Request failed (HTTP {resp.status_code}): {resp.text[:200]}"
-    except requests.exceptions.Timeout:
-        return False, "Request timed out. Check your network or the Base URL."
-    except Exception as e:
-        return False, f"Request error: {e}"
+    """Compatibility wrapper for the shared OpenAI-compatible model fetcher."""
+    result = llm_connection_support.fetch_available_models(base_url, api_key)
+    if result["ok"]:
+        return True, result["models"]
+    return False, _connection_error_text(result["code"])
+
+
+def _connection_error_text(code):
+    return {
+        "missing_api_key": "Please enter an API Key.",
+        "missing_base_url": "Please enter a Base URL.",
+        "missing_model": "Please select a model.",
+        "authentication_failed": "The API Key was rejected. Check that you copied the complete key.",
+        "insufficient_balance": "The provider account has insufficient balance or credit. Check its Open Platform account.",
+        "model_not_available": "This model is unavailable. Fetch the model list again and select an available model.",
+        "rate_limited": "The provider is limiting requests. Wait a moment and try again.",
+        "timeout": "The request timed out. Check your network and try again.",
+        "connection_error": "Could not reach the provider. Check your network and Base URL.",
+        "provider_error": "The provider could not complete this request. Check the Base URL and provider service status.",
+        "unknown_error": "The connection test could not be completed. Check the configuration and try again.",
+    }.get(code, "The connection test could not be completed. Check the configuration and try again.")
+
+
+def _matching_connection_test(state_key, signature):
+    state = st.session_state.get(state_key)
+    if isinstance(state, dict) and state.get("signature") == signature:
+        return state.get("result")
+    return None
+
+
+def _render_connection_test(state_key, signature):
+    result = _matching_connection_test(state_key, signature)
+    if not result:
+        return None
+    if result.get("ok"):
+        st.success(
+            f"✅ Model connection is working\n"
+            f"Successfully called: {result.get('model', '')}\n"
+            "You can now save and activate this configuration."
+        )
+    else:
+        message = _connection_error_text(result.get("code", "unknown_error"))
+        if result.get("code") in {"rate_limited", "timeout", "connection_error"}:
+            st.warning(message)
+        else:
+            st.error(message)
+    return result
 
 
 def llm_config_tab():
     st.subheader("⚙️ LLM Configuration Matrix")
-    st.caption("💡 DeepSeek platform: https://platform.deepseek.com (apply for an API Key, then configure here)")
+    st.info(
+        "First time using an API? Create an API Key at the "
+        "[DeepSeek Open Platform](https://platform.deepseek.com) or its "
+        "[API Keys page](https://platform.deepseek.com/api_keys), then paste the complete `sk-...` value below. "
+        "DeepSeek App/web free chat is separate from the Open Platform API; API access depends on the API account status and balance."
+    )
+    new_save_notice = st.session_state.pop("llm_new_save_notice", None)
+    if new_save_notice == "untested":
+        st.warning("Configuration saved, but it has not passed a model connection test.")
+    elif new_save_notice == "failed":
+        st.warning("Configuration saved, but the latest model connection test failed. Review the message below before using it.")
+    elif new_save_notice == "passed":
+        st.success("Configuration saved after a successful model connection test.")
     profiles = get_all_profiles()
     active = get_active_profile()
     if active:
@@ -744,56 +774,72 @@ def llm_config_tab():
 
     # ---- 新增配置 ----
     with st.expander("➕ Add New LLM Configuration", expanded=False):
-        with st.form("new_llm_form"):
-            c1, c2 = st.columns(2)
-            with c1:
-                n_name = st.text_input("Configuration name", value="New model config")
-                n_base = st.text_input("Base URL", value="https://api.deepseek.com/v1", key="n_base_url")
-            with c2:
-                n_key = st.text_input("API Key", type="password", key="n_api_key")
-            # 自动拉取模型列表
-            c_fetch, c_hint = st.columns([1, 3])
-            with c_fetch:
-                fetch_clicked = st.form_submit_button("🔍 Fetch Model List")
-            if fetch_clicked:
-                ok, result = fetch_models_from_base_url(n_base, n_key)
-                if ok:
-                    st.session_state["fetched_models"] = result
-                    st.session_state["fetch_base"] = n_base
-                    st.success(f"Fetched {len(result)} models! Please select from the dropdown.")
-                else:
-                    st.session_state.pop("fetched_models", None)
-                    st.error(f"Failed to fetch model list: {result}")
-            # 模型选择：完全走下拉（未拉取时禁用提示）
-            if st.session_state.get("fetched_models") and st.session_state.get("fetch_base") == n_base:
-                st.selectbox(
-                    "Select Model Name (auto-fetched):",
-                    st.session_state["fetched_models"],
-                    key="n_model_select",
-                    help="Model list fetched from this provider's API"
-                )
+        n_name = st.text_input("Configuration name", value="New model config", key="n_name")
+        n_base = st.text_input("Base URL", value="https://api.deepseek.com", key="n_base_url")
+        n_key = st.text_input("API Key", type="password", key="n_api_key")
+        fetch_signature = llm_connection_support.make_connection_signature(n_base, n_key, "")
+        if st.button("🔍 Fetch Model List", key="fetch_new_models"):
+            fetched = llm_connection_support.fetch_available_models(n_base, n_key)
+            if fetched["ok"]:
+                st.session_state["llm_new_models"] = {"signature": fetch_signature, "models": fetched["models"]}
+                if st.session_state.get("n_model_select") not in fetched["models"]:
+                    st.session_state.pop("n_model_select", None)
+                st.success(f"Fetched {len(fetched['models'])} models. Select one below.")
             else:
-                st.selectbox(
-                    "Select Model Name:",
-                    ["(Click \"Fetch Model List\" above first)"],
-                    key="n_model_empty",
-                    disabled=True,
-                    help="Fill in Base URL & API Key, click \"Fetch Model List\", then select a model from the dropdown"
-                )
-            submitted = st.form_submit_button("💾 Save New Configuration")
-            if submitted:
-                if not n_key:
-                    st.warning("API Key cannot be empty")
-                elif not st.session_state.get("n_model_select"):
-                    st.warning("Please click \"🔍 Fetch Model List\" first to fetch models, then select from the dropdown.")
-                else:
-                    profiles.append({
-                        "id": str(uuid.uuid4()), "name": n_name,
-                        "base_url": n_base, "api_key": n_key, "model": st.session_state["n_model_select"]
-                    })
-                    save_json_file("llm_profiles.json", profiles)
-                    st.session_state.pop("fetched_models", None)
-                    st.success("Configuration added!")
+                st.session_state.pop("llm_new_models", None)
+                st.error(f"Failed to fetch model list: {_connection_error_text(fetched['code'])}")
+
+        fetched_state = st.session_state.get("llm_new_models", {})
+        new_models = fetched_state.get("models", []) if fetched_state.get("signature") == fetch_signature else []
+        if new_models:
+            n_model = st.selectbox("Select Model Name (auto-fetched)", new_models, key="n_model_select")
+            model_ready = True
+        else:
+            st.selectbox(
+                "Select Model Name",
+                ["(Fetch the model list first)"],
+                key="n_model_empty",
+                disabled=True,
+                help="Fill in Base URL and API Key, then fetch models to select one.",
+            )
+            n_model = ""
+            model_ready = False
+
+        test_signature = llm_connection_support.make_connection_signature(n_base, n_key, n_model)
+        if model_ready and n_model:
+            if st.button("🧪 Test Model Connection", key="test_new_model_connection"):
+                with st.spinner("Sending a minimal test request…"):
+                    result = llm_connection_support.test_model_connection(n_base, n_key, n_model)
+                st.session_state["llm_new_connection_test"] = {"signature": test_signature, "result": result}
+            test_result = _render_connection_test("llm_new_connection_test", test_signature)
+        else:
+            test_result = None
+
+        if st.button("💾 Save New Configuration", key="save_new_llm_profile"):
+            if not n_key.strip():
+                st.warning("API Key cannot be empty.")
+            elif not model_ready or not n_model:
+                st.warning("Fetch the model list and select a model before saving.")
+            else:
+                new_profile = {
+                    "id": str(uuid.uuid4()), "name": n_name,
+                    "base_url": n_base, "api_key": n_key, "model": n_model,
+                }
+                if save_json_file("llm_profiles.json", profiles + [new_profile]):
+                    profiles.append(new_profile)
+                    if test_result and test_result.get("ok"):
+                        notice = "passed"
+                        st.session_state[f"llm_profile_connection_test_{new_profile['id']}"] = {
+                            "signature": test_signature, "result": test_result,
+                        }
+                    elif test_result:
+                        notice = "failed"
+                        st.session_state[f"llm_profile_connection_test_{new_profile['id']}"] = {
+                            "signature": test_signature, "result": test_result,
+                        }
+                    else:
+                        notice = "untested"
+                    st.session_state["llm_new_save_notice"] = notice
                     st.rerun()
 
     st.markdown("---")
@@ -804,6 +850,24 @@ def llm_config_tab():
             badge = "✅ **Currently Active**" if is_active else ""
             st.markdown(f"### {prof.get('name','Untitled')} {badge}")
             st.caption(f"Base URL: `{prof.get('base_url','')}` | Model: `{prof.get('model','')}` | Key: {'filled' if prof.get('api_key') else 'not filled'}")
+            current_profile_signature = llm_connection_support.make_connection_signature(
+                st.session_state.get(f"eb_{prof['id']}", prof.get("base_url", "")),
+                st.session_state.get(f"ek_{prof['id']}", prof.get("api_key", "")),
+                st.session_state.get(f"em_select_{prof['id']}", prof.get("model", "")),
+            )
+            profile_test = _matching_connection_test(
+                f"llm_profile_connection_test_{prof['id']}", current_profile_signature
+            )
+            if profile_test and profile_test.get("ok"):
+                st.caption("✅ Tested successfully in this session")
+            save_notice_key = f"llm_profile_save_notice_{prof['id']}"
+            profile_save_notice = st.session_state.pop(save_notice_key, None)
+            if profile_save_notice == "untested":
+                st.warning("Configuration saved, but it has not passed a model connection test.")
+            elif profile_save_notice == "failed":
+                st.warning("Configuration saved, but the latest model connection test failed.")
+            elif profile_save_notice == "passed":
+                st.success("Configuration saved after a successful model connection test.")
 
             col_a, col_b = st.columns([1, 5])
             with col_a:
@@ -819,48 +883,72 @@ def llm_config_tab():
                         e_base = st.text_input("Base URL", value=prof.get("base_url", ""), key=f"eb_{prof['id']}")
                     with e2:
                         e_key = st.text_input("API Key", value=prof.get("api_key", ""), type="password", key=f"ek_{prof['id']}")
-                    st.caption(f"Current model: `{prof.get('model','')}`")
-                    # 自动拉取模型列表（模型完全走下拉）
+                    edit_fetch_signature = llm_connection_support.make_connection_signature(e_base, e_key, "")
                     if st.button("🔍 Fetch Models from Base URL", key=f"efetch_{prof['id']}"):
-                        ok, result = fetch_models_from_base_url(e_base, e_key)
-                        if ok:
-                            st.session_state[f"edit_models_{prof['id']}"] = result
-                            st.session_state[f"edit_fetch_base_{prof['id']}"] = e_base
-                            st.success(f"Fetched {len(result)} models! Please select from the dropdown.")
+                        fetched = llm_connection_support.fetch_available_models(e_base, e_key)
+                        if fetched["ok"]:
+                            st.session_state[f"edit_models_{prof['id']}"] = {
+                                "signature": edit_fetch_signature, "models": fetched["models"],
+                            }
+                            if st.session_state.get(f"em_select_{prof['id']}") not in fetched["models"]:
+                                st.session_state.pop(f"em_select_{prof['id']}", None)
+                            st.success(f"Fetched {len(fetched['models'])} models. Select one below.")
                         else:
                             st.session_state.pop(f"edit_models_{prof['id']}", None)
-                            st.error(f"Failed to fetch model list: {result}")
-                    if st.session_state.get(f"edit_models_{prof['id']}") and st.session_state.get(f"edit_fetch_base_{prof['id']}") == e_base:
+                            st.error(f"Failed to fetch model list: {_connection_error_text(fetched['code'])}")
+                    edit_fetch_state = st.session_state.get(f"edit_models_{prof['id']}", {})
+                    edit_models = edit_fetch_state.get("models", []) if edit_fetch_state.get("signature") == edit_fetch_signature else []
+                    if edit_models:
+                        current_model = st.session_state.get(f"em_select_{prof['id']}", prof.get("model", ""))
+                        if current_model not in edit_models:
+                            st.session_state.pop(f"em_select_{prof['id']}", None)
+                            current_model = edit_models[0]
                         e_model = st.selectbox(
-                            "Select Model Name (auto-fetched):",
-                            st.session_state[f"edit_models_{prof['id']}"],
-                            index=0,
-                            key=f"em_select_{prof['id']}",
-                            help="Model list fetched from this provider's API"
+                            "Select Model Name (auto-fetched)", edit_models,
+                            index=edit_models.index(current_model), key=f"em_select_{prof['id']}",
                         )
                     else:
-                        st.selectbox(
-                            "Select Model Name:",
-                            ["(Click \"Fetch Model List\" above first)"],
-                            key=f"em_empty_{prof['id']}",
-                            disabled=True,
-                            help="Click \"Fetch Models from Base URL\", then select a model from the dropdown"
+                        current_model = prof.get("model", "")
+                        options = [current_model] if current_model else ["(Fetch the model list first)"]
+                        e_model = st.selectbox(
+                            "Model Name", options, key=f"em_select_{prof['id']}",
+                            disabled=not bool(current_model),
+                            help="Fetch models to choose a different model. The saved model can be tested as-is.",
                         )
+                    edit_test_signature = llm_connection_support.make_connection_signature(e_base, e_key, e_model)
+                    if e_model and not e_model.startswith("("):
+                        if st.button("🧪 Test Model Connection", key=f"etest_{prof['id']}"):
+                            with st.spinner("Sending a minimal test request…"):
+                                result = llm_connection_support.test_model_connection(e_base, e_key, e_model)
+                            st.session_state[f"llm_profile_connection_test_{prof['id']}"] = {
+                                "signature": edit_test_signature, "result": result,
+                            }
+                        edit_test_result = _render_connection_test(
+                            f"llm_profile_connection_test_{prof['id']}", edit_test_signature
+                        )
+                    else:
+                        edit_test_result = None
                     c_ed, c_del = st.columns(2)
                     with c_ed:
                         if st.button("💾 Save Changes", key=f"esave_{prof['id']}"):
-                            chosen_model = st.session_state.get(f"em_select_{prof['id']}", "")
-                            if not chosen_model:
-                                st.warning("Please click \"🔍 Fetch Models from Base URL\" first and select a model from the dropdown.")
+                            if not e_model or e_model.startswith("("):
+                                st.warning("Select a model before saving changes.")
                             else:
-                                profiles[idx] = {
+                                updated_profiles = list(profiles)
+                                updated_profiles[idx] = {
                                     "id": prof["id"], "name": e_name,
-                                    "base_url": e_base, "api_key": e_key, "model": chosen_model
+                                    "base_url": e_base, "api_key": e_key, "model": e_model,
                                 }
-                                save_json_file("llm_profiles.json", profiles)
-                                st.session_state.pop(f"edit_models_{prof['id']}", None)
-                                st.success("Saved!")
-                                st.rerun()
+                                if save_json_file("llm_profiles.json", updated_profiles):
+                                    profiles[idx] = updated_profiles[idx]
+                                    if edit_test_result and edit_test_result.get("ok"):
+                                        notice = "passed"
+                                    elif edit_test_result:
+                                        notice = "failed"
+                                    else:
+                                        notice = "untested"
+                                    st.session_state[save_notice_key] = notice
+                                    st.rerun()
                     with c_del:
                         if st.button("🗑️ Delete This Configuration", key=f"edel_{prof['id']}"):
                             profiles.pop(idx)
@@ -1773,7 +1861,7 @@ def module4_logic():
             if res:
                 # 智能识别：检测返回是否为 YAML/文本思考草稿
                 if ("word_count:" in res) or ("- title:" in res) or ("title:" in res and "id:" in res):
-                    st.error("Failed to parse a JSON outline: the current model returned YAML draft text instead of JSON (a trait of reasoning models). Switch to a regular chat model like deepseek-chat in Module 1 and retry.")
+                    st.error("Failed to parse a JSON outline: the current model returned YAML draft text instead of JSON (a trait of reasoning models). Switch to a regular chat-completions model shown in the fetched model list and retry.")
                 elif "未能从模型输出中解析" not in res:
                     st.error("The generated outline's word count is far below the target even after multiple attempts. Retry later, or check the target word count in Module 1.")
                 with st.expander("View raw LLM response (debug)", expanded=False):

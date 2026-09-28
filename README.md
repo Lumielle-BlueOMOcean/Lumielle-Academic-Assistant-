@@ -26,7 +26,7 @@ Pick the folder for your platform, unzip it, and double-click the launcher to st
 
 ## ✨ 功能特性 / Features
 
-- 🧠 **LLM 配置与多模型交叉讨论** — Multi-model configuration & cross discussion
+- 🧠 **LLM 配置与多模型交叉讨论** — Multi-model configuration & cross discussion, with an optional real model connection test before saving
 - 🏛️ **科研基座** — Structured research facts with editable filing and optional chapter grounding
 - 📚 **文献处理** — Full-document literature analysis with source-linked evidence and chapter bindings
 - 🧩 **逻辑链路** — Multi-level logic outline with per-node word count & chart instructions
@@ -88,8 +88,19 @@ This design supplies structured context for chapter generation and helps authors
 1. 解压对应平台的版本文件夹 / Unzip the folder for your platform
 2. macOS：双击 `Launch.command`（中文版 `一键启动.command`）/ Windows：双击 `Launch.bat`（中文版 `一键启动.bat`）
 3. 首次启动自动安装依赖（约 1-3 分钟）/ First launch auto-installs dependencies (~1-3 min)
-4. 在「LLM Configuration」填入 API Key，拉取模型 / Enter API Key and fetch models
+4. 在「LLM Configuration」填写 API Key，拉取模型列表并选择模型，建议测试连接后保存 / Enter the API Key, fetch and select a model, test the connection if possible, then save
 5. 侧边栏填写研究课题与预期字数，开始写作 / Fill in topic & word count, start writing
+
+### DeepSeek API 配置 / DeepSeek API Setup
+
+DeepSeek 开放平台 / DeepSeek Open Platform: <https://platform.deepseek.com><br>
+API Keys: <https://platform.deepseek.com/api_keys>
+
+创建 API Key 后，将完整的 `sk-...` 字符串填入微光，使用 Base URL `https://api.deepseek.com`，拉取模型列表并从当前可用模型中选择，再点击“测试模型连接”并保存。新配置默认使用 `deepseek-flash`；`deepseek-flash` 和 `deepseek-v4-pro` 是当前建议尝试的模型，实际以拉取模型列表返回的账号可用模型为准。
+
+Create an API Key, paste the complete `sk-...` value into Lumielle, use Base URL `https://api.deepseek.com`, fetch the model list, select an available model, test the connection, and save. New profiles default to `deepseek-flash`; `deepseek-flash` and `deepseek-v4-pro` are current models to try, while the fetched list is authoritative for models available to your account.
+
+DeepSeek App/web free chat is separate from the Open Platform API. API access depends on the Open Platform account status and balance. / DeepSeek App 或网页版免费聊天与开放平台 API 是不同的使用方式；API 调用取决于开放平台账户状态和余额。
 
 ## 🖥️ 平台说明 / Platform Notes
 
@@ -109,6 +120,7 @@ This design supplies structured context for chapter generation and helps authors
 - Added versioned FormatSpec presets with validated import/export, custom preset management, reviewed model-generated previews, and deterministic Word rendering. / 新增带版本的 FormatSpec 预设、校验后的导入导出、自定义预设管理、需审阅确认的模型预览和确定性 Word 渲染。
 - FormatSpec v1 supports grid and three-line tables, page-number starts, per-heading pagination controls, and figure width limits; General Academic and Legacy Compatible provide distinct layouts. / FormatSpec v1 支持网格表与三线表、页码起始值、各级标题分页控制和图片宽度；General Academic 与 Legacy Compatible 使用不同版式。
 - Redesigned both v1.1.0 user manuals for first-time users, with a first-paper quick start, plain-language feature guides, revision guidance, FAQ, troubleshooting, and the restored poster. / 面向初次使用者重设计中英文 v1.1.0 手册，加入从资料到首篇论文初稿的快速流程、通俗功能说明、章节修改指引、常见问题、故障处理，并保留原版海报。
+- Added a real, minimal LLM model-connection test with clear guidance for authentication, balance, unavailable models, rate limits, and network errors. / 新增真实的最小 LLM 模型连接测试，并针对认证、余额、模型不可用、限流和网络错误提供清晰提示。
 
 #### Fixed / 修复
 
@@ -121,6 +133,7 @@ This design supplies structured context for chapter generation and helps authors
 
 #### Changed / 变更
 
+- New DeepSeek profiles use `https://api.deepseek.com` and `deepseek-flash`; existing saved profiles are not migrated automatically. The fetched model list remains authoritative for the account. / 新初始化的 DeepSeek 配置使用 `https://api.deepseek.com` 和 `deepseek-flash`；已有配置不会自动迁移，具体可用模型以拉取列表为准。
 - Context Sandwich documentation now describes complete-chapter memory construction and compact summaries without promising perfect recall or consistency. / 上下文三明治说明现准确描述完整章节记忆构建与摘要使用，不再承诺绝对记忆或一致性。
 - Logic planning uses a bounded digest of persisted facts from every section rather than a fixed head-only prefix; grounding toggles affect chapter retrieval, not planning inclusion. / 逻辑规划使用覆盖所有分区已存事实的有界摘要，不再依赖固定开头前缀；Grounding 开关控制正文检索，不控制规划是否纳入事实。
 - Literature relevance is evaluated against the current topic and planning context; source quality is assessed separately, and oversized library reviews use ordered profile batches before hierarchical synthesis. / 文献相关性结合当前课题和规划上下文评价，来源质量单独评估；大型文献库按档案顺序分批审查后再分层合并。
