@@ -119,7 +119,7 @@ DeepSeek App/web free chat is separate from the Open Platform API. API access de
 - Literature profile synthesis uses the current research topic and planning digest; relevance ratings are separate from quality assessments, and chapter evidence selection supports Chinese and English terms. / 文献档案合并会使用当前课题与规划摘要；相关性评级与质量评价分开，章节证据选择支持中英文术语。
 - Added versioned FormatSpec presets with validated import/export, custom preset management, reviewed model-generated previews, and deterministic Word rendering. / 新增带版本的 FormatSpec 预设、校验后的导入导出、自定义预设管理、需审阅确认的模型预览和确定性 Word 渲染。
 - FormatSpec v1 supports grid and three-line tables, page-number starts, per-heading pagination controls, and figure width limits; General Academic and Legacy Compatible provide distinct layouts. / FormatSpec v1 支持网格表与三线表、页码起始值、各级标题分页控制和图片宽度；General Academic 与 Legacy Compatible 使用不同版式。
-- Redesigned both v1.1.0 user manuals for first-time users, with a first-paper quick start, plain-language feature guides, revision guidance, FAQ, troubleshooting, and the restored poster. / 面向初次使用者重设计中英文 v1.1.0 手册，加入从资料到首篇论文初稿的快速流程、通俗功能说明、章节修改指引、常见问题、故障处理，并保留原版海报。
+- Finalized the Chinese and English v1.1.0 user manuals with detailed AI API setup, model-list retrieval, connection testing, a first-paper quick start, and chapter revision with memory updates; updated the Lumielle poster. / 完成中英文 v1.1.0 用户手册最终版，加入详细的 AI API 配置、模型列表获取、模型连接测试、论文快速开始、章节回改与记忆更新流程；更新 Lumielle 海报。
 - Added a real, minimal LLM model-connection test with clear guidance for authentication, balance, unavailable models, rate limits, and network errors. / 新增真实的最小 LLM 模型连接测试，并针对认证、余额、模型不可用、限流和网络错误提供清晰提示。
 
 #### Fixed / 修复
