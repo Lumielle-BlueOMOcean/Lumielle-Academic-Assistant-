@@ -130,6 +130,7 @@ DeepSeek App/web free chat is separate from the Open Platform API. API access de
 - Failed literature chunk analysis does not replace the previously valid profile or evidence store. / 文献分块分析失败时，不替换此前有效的文献画像或证据库。
 - Accepted Smart Inbox facts now retain the editable suggested role. / 接受 Smart Inbox 建议后，现在会保存可编辑的用途字段。
 - Restored continuous document flow and the original Lumielle poster artwork in both user manuals. / 恢复中英文手册的连续分页排版，并还原 Lumielle 海报原图。
+- macOS first-run dependency setup now automatically retries the official Python package index when the preferred mirror is unavailable. / macOS 首次启动安装依赖时，首选镜像不可用会自动切换至官方 Python 软件源。
 
 #### Changed / 变更
 
