@@ -169,11 +169,11 @@ class ChapterMemoryTests(unittest.TestCase):
 
 
 class VersionTests(unittest.TestCase):
-    def test_canonical_version_and_unreleased_readme_entry(self):
+    def test_canonical_version_and_released_readme_entry(self):
         version = load_project_module(self, "version")
         self.assertEqual(version.__version__, "1.1.0")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("v1.1.0 — Unreleased", readme)
+        self.assertIn("v1.1.0 — 2026-09-29", readme)
 
 
 if __name__ == "__main__":

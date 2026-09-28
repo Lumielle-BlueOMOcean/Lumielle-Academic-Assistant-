@@ -259,12 +259,12 @@ class CoreCorrectnessTests(unittest.TestCase):
         version = load_project_module(self, "version")
         self.assertEqual(version.__version__, "1.1.0")
 
-    def test_readme_marks_current_version_unreleased_and_keeps_release_history(self):
+    def test_readme_marks_current_release_and_keeps_release_history(self):
         version = load_project_module(self, "version")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"v{version.__version__}", readme)
-        self.assertIn(f"### v{version.__version__} — Unreleased", readme)
-        self.assertIn(f"Current development version / 当前开发版本：v{version.__version__} — Unreleased", readme)
+        self.assertIn(f"### v{version.__version__} — 2026-09-29", readme)
+        self.assertIn(f"Current release / 当前正式版本：v{version.__version__} — 2026-09-29", readme)
         self.assertIn("### v1.0.1 — 2026-09-27", readme)
         self.assertIn("v1.0.0", readme)
         self.assertIn("Changelog", readme)

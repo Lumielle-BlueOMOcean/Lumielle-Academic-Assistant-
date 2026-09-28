@@ -7,7 +7,7 @@
 
 A Streamlit-based local academic paper writing assistant: logic outline generation, chapter writing, AIGC detection & de-smelling, and final Word export.
 
-**Current development version / 当前开发版本：v1.1.0 — Unreleased**
+**Current release / 当前正式版本：v1.1.0 — 2026-09-29**
 
 ---
 
@@ -109,7 +109,7 @@ DeepSeek App/web free chat is separate from the Open Platform API. API access de
 
 ## Changelog / 更新日志
 
-### v1.1.0 — Unreleased
+### v1.1.0 — 2026-09-29
 
 #### Added / 新增
 

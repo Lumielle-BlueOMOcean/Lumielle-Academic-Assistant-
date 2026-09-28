@@ -1,5 +1,7 @@
 # User manual sources
 
+Current manual release: v1.1.0, released 2026-09-29.
+
 The canonical Chinese and English manuals now include the AI API setup, model-list retrieval, “Test Model Connection” step, first-paper quick start, and chapter revision with memory updates. The editable DOCX files in this directory are the manual sources of truth; the PDFs in `docs/` are the user-facing release files. The canonical Lumielle poster is `../assets/lumielle_poster.png`.
 
 When a manual changes, update both language versions and both formats: DOCX source and PDF release file. Keep the API setup instructions aligned with the current LLM Configuration UI.
