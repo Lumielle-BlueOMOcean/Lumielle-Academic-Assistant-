@@ -12,6 +12,7 @@ from context_digest_support import balanced_excerpt
 from document_support import DEFAULT_CHUNK_CHARS, chunk_document_text
 from relevance_support import multilingual_terms
 from writing_support import LLMOutputError, require_valid_llm_output
+from structured_output_support import parse_first_json_value
 
 
 MAX_CHUNK_ATTEMPTS = 2
@@ -20,19 +21,14 @@ MAX_EVIDENCE_CHARS = 1800
 
 
 def _json_object(response):
-    text = str(response or "").strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            return None
-        try:
-            value = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
+    value = parse_first_json_value(response)
     return value if isinstance(value, dict) else None
+
+
+class _StructuredCallFailure(LLMOutputError):
+    def __init__(self, failure_stage):
+        super().__init__(failure_stage)
+        self.failure_stage = failure_stage
 
 
 def build_chunk_extraction_prompt(title, chunk, index, total, locale="en", retry=False):
@@ -83,25 +79,45 @@ def build_synthesis_prompt(title, extractions, locale="en", retry=False, *, rese
 
 def _checked_call(llm_call, prompt):
     try:
-        return require_valid_llm_output(llm_call(prompt, max_tokens=1400)).strip()
+        response = llm_call(prompt, max_tokens=1400, json_mode=True)
+    except Exception:
+        # Provider details may contain request data or credentials; keep them out of results/UI.
+        raise _StructuredCallFailure("provider_call") from None
+    if not isinstance(response, str) or not response.strip():
+        raise _StructuredCallFailure("empty_structured_output")
+    try:
+        return require_valid_llm_output(response).strip()
     except LLMOutputError:
-        raise
-    except Exception as exc:
-        raise LLMOutputError(str(exc)) from exc
+        # Application adapters encode provider errors as known, credential-safe strings.
+        raise _StructuredCallFailure("provider_call") from None
 
 
-def _call_json_with_retry(llm_call, prompt_factory, attempts=2):
-    last_error = None
+def _call_json_with_retry(llm_call, prompt_factory, attempts=2, validator=None):
+    last_stage = "invalid_structured_output"
     for attempt in range(attempts):
         try:
             response = _checked_call(llm_call, prompt_factory(attempt == 1))
-            parsed = _json_object(response)
-            if parsed is not None:
-                return parsed
-            last_error = LLMOutputError("The model returned invalid JSON.")
-        except LLMOutputError as exc:
-            last_error = exc
-    raise last_error or LLMOutputError("The model returned no usable literature analysis.")
+        except _StructuredCallFailure as exc:
+            if exc.failure_stage == "provider_call":
+                # A transport/authentication failure is not a schema correction request.
+                raise
+            last_stage = exc.failure_stage
+            continue
+        parsed = parse_first_json_value(response)
+        if parsed is None or not isinstance(parsed, dict):
+            last_stage = "invalid_structured_output"
+            continue
+        if not parsed:
+            last_stage = "empty_structured_output"
+            continue
+        if validator is not None:
+            validated = validator(parsed)
+            if validated is None:
+                last_stage = "schema_validation_failure"
+                continue
+            return validated
+        return parsed
+    raise _StructuredCallFailure(last_stage)
 
 
 def _normalize_chunk_extraction(value):
@@ -126,6 +142,25 @@ def _normalize_chunk_extraction(value):
         "conclusion": field("conclusion"),
         "definitions": field("definitions"),
     }
+
+
+def _validate_chunk_extraction(value):
+    text_fields = (
+        "research_question", "theory", "method", "sample", "data", "results",
+        "limitations", "conclusion", "definitions",
+    )
+    for name in text_fields:
+        if name not in value or not isinstance(value[name], (str, list)):
+            return None
+    claims = value.get("claims")
+    if not isinstance(claims, list):
+        return None
+    for claim in claims:
+        if not isinstance(claim, dict):
+            return None
+        if any(not isinstance(claim.get(name), str) for name in ("section", "claim", "evidence_text")):
+            return None
+    return value
 
 
 def _normalize_profile(value):
@@ -155,9 +190,14 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
                 llm_call,
                 lambda retry, chunk=chunk, index=index: build_chunk_extraction_prompt(title, chunk, index, len(chunks), locale, retry),
                 MAX_CHUNK_ATTEMPTS,
+                validator=_validate_chunk_extraction,
             )
-        except LLMOutputError as exc:
-            return {"status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks), "failed_chunk": index, "message": f"Literature chunk {index} could not be analyzed after one retry: {exc}"}
+        except _StructuredCallFailure as exc:
+            return {
+                "status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks),
+                "failed_chunk": index, "failure_stage": exc.failure_stage,
+                "failure_code": exc.failure_stage, "message": "A literature source chunk could not be analyzed; no partial analysis was stored.",
+            }
         extraction = _normalize_chunk_extraction(parsed)
         extractions.append(extraction)
         for claim in extraction["claims"]:
@@ -182,12 +222,16 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
                 research_topic=research_topic, research_context=research_context,
             ),
             MAX_SYNTHESIS_ATTEMPTS,
+            validator=_normalize_profile,
         )
-    except LLMOutputError as exc:
-        return {"status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks), "failed_chunk": "synthesis", "message": f"The complete literature profile could not be synthesized: {exc}"}
-    profile = _normalize_profile(profile_raw)
-    if profile is None:
-        return {"status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks), "failed_chunk": "synthesis", "message": "The complete literature profile was invalid; prior analysis was kept."}
+    except _StructuredCallFailure as exc:
+        return {
+            "status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks),
+            "failed_chunk": "synthesis", "failure_stage": "document_synthesis",
+            "failure_code": exc.failure_stage,
+            "message": "The complete literature profile could not be synthesized; prior analysis was kept.",
+        }
+    profile = profile_raw
     return {"status": "ok", "profile": profile, "evidence": evidence, "chunks_total": len(chunks), "failed_chunk": 0, "message": ""}
 
 

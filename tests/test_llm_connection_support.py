@@ -19,7 +19,7 @@ class FakeHTTPError(Exception):
 
 def successful_client(response=None):
     completion = response or SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="Different valid response"))]
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"status":"ok"}'))]
     )
     create = Mock(return_value=completion)
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
@@ -41,9 +41,12 @@ class LLMConnectionSupportTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["code"], "ok")
         self.assertEqual(result["model"], "chat-model")
-        self.assertEqual(create.call_args.kwargs["messages"], [{"role": "user", "content": "Reply with OK."}])
+        self.assertEqual(result["structured_mode"], "native")
+        request = create.call_args.kwargs
+        self.assertIn("JSON", request["messages"][0]["content"])
+        self.assertEqual(request["response_format"], {"type": "json_object"})
         self.assertEqual(create.call_args.kwargs["temperature"], 0)
-        self.assertLessEqual(create.call_args.kwargs["max_tokens"], 8)
+        self.assertLessEqual(create.call_args.kwargs["max_tokens"], 32)
 
     def test_connection_rejects_missing_configuration_without_network(self):
         for values, expected in (
@@ -75,6 +78,7 @@ class LLMConnectionSupportTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["code"], expected)
                 self.assertEqual(result["http_status"], status_code)
+                self.assertEqual(client.chat.completions.create.call_count, 1)
 
     def test_timeout_and_connection_failures_have_distinct_codes(self):
         import httpx
@@ -97,6 +101,7 @@ class LLMConnectionSupportTests(unittest.TestCase):
                     )
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["code"], expected)
+                self.assertEqual(client.chat.completions.create.call_count, 1)
 
     def test_provider_error_text_never_returns_an_api_key(self):
         secret = "sk-secret-test-value"
@@ -119,6 +124,7 @@ class LLMConnectionSupportTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(create.call_args.kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertEqual(create.call_args.kwargs["response_format"], {"type": "json_object"})
 
     def test_generic_provider_does_not_receive_deepseek_options(self):
         client, create = successful_client()
@@ -128,6 +134,34 @@ class LLMConnectionSupportTests(unittest.TestCase):
             )
 
         self.assertNotIn("extra_body", create.call_args.kwargs)
+        self.assertEqual(create.call_args.kwargs["response_format"], {"type": "json_object"})
+
+    def test_explicit_response_format_rejection_uses_prompt_only_fallback(self):
+        client, create = successful_client()
+        create.side_effect = [FakeHTTPError(400, "Invalid parameter: response_format"), create.return_value]
+        with patch.object(self.support, "OpenAI", return_value=client):
+            result = self.support.test_model_connection(
+                "https://provider.example/v1", "sk-test", "chat-model"
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["structured_mode"], "compatibility")
+        self.assertEqual(create.call_count, 2)
+        self.assertIn("response_format", create.call_args_list[0].kwargs)
+        self.assertNotIn("response_format", create.call_args_list[1].kwargs)
+        self.assertIn("JSON", create.call_args_list[1].kwargs["messages"][0]["content"])
+
+    def test_malformed_structured_response_fails_the_connection_test(self):
+        client, _ = successful_client(SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="not JSON"))]
+        ))
+        with patch.object(self.support, "OpenAI", return_value=client):
+            result = self.support.test_model_connection(
+                "https://provider.example/v1", "sk-test", "chat-model"
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "invalid_structured_output")
 
     def test_model_list_url_preserves_provider_paths_without_duplicate_models(self):
         response = SimpleNamespace(status_code=200, json=lambda: {"data": [{"id": "model-a"}]})

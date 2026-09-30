@@ -82,7 +82,8 @@ class ResearchFactLayerTests(unittest.TestCase):
             chunk = prompt.split("[DOCUMENT CONTENT]\n", 1)[-1]
             seen.append(chunk)
             markers = [word for word in ("FIRST_SENTINEL", "MIDDLE_SENTINEL", "FINAL_RESEARCH_SENTINEL") if word in chunk]
-            return json.dumps([{"title": "Extracted fact", "type": "fact", "content": " ".join(markers)}])
+            content = " ".join(markers) or "General research context"
+            return json.dumps({"facts": [{"title": "Extracted fact", "type": "fact", "content": content}]})
 
         result = parse_research_source(source, "methods", llm, max_chars=2500)
         self.assertEqual(result["status"], "ok")

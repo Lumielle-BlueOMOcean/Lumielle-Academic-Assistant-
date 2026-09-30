@@ -47,6 +47,51 @@ _LABELS = {
 }
 
 
+_FAILURE_MESSAGES = {
+    "en": {
+        "provider_call": "The source was saved, but the AI service call failed. Test the current model connection and try again; no partial profile or evidence was stored.",
+        "invalid_structured_output": "The source was saved, but the AI returned malformed structured data. Retry; no partial profile or evidence was stored.",
+        "empty_structured_output": "The source was saved, but the AI returned empty analysis data. Retry; no partial profile or evidence was stored.",
+        "schema_validation_failure": "The source was saved, but the AI data did not match the literature-analysis schema. Retry; no partial profile or evidence was stored.",
+        "document_synthesis": "Chunk analysis completed, but full-document synthesis failed. The source was kept; no partial profile or evidence was stored.",
+    },
+    "zh": {
+        "provider_call": "原始资料已保存，但 AI 服务调用失败。请先测试当前模型连接后重试；未保存部分档案或证据。",
+        "invalid_structured_output": "原始资料已保存，但 AI 返回的数据格式异常。请重试；未保存部分档案或证据。",
+        "empty_structured_output": "原始资料已保存，但 AI 返回了空的分析数据。请重试；未保存部分档案或证据。",
+        "schema_validation_failure": "原始资料已保存，但 AI 返回内容不符合文献分析格式。请重试；未保存部分档案或证据。",
+        "document_synthesis": "文献分块已处理，但整篇档案合并失败。原始资料已保留，未保存部分档案或证据。",
+    },
+}
+
+_REANALYSIS_FAILURE_MESSAGES = {
+    "en": {
+        "provider_call": "The AI service call failed during re-analysis. Test the current model connection and retry; existing profile and evidence were preserved.",
+        "invalid_structured_output": "The AI returned malformed structured data during re-analysis. Existing profile and evidence were preserved.",
+        "empty_structured_output": "The AI returned empty analysis data during re-analysis. Existing profile and evidence were preserved.",
+        "schema_validation_failure": "The AI data did not match the literature-analysis schema. Existing profile and evidence were preserved.",
+        "document_synthesis": "Full-document synthesis failed during re-analysis. Existing profile and evidence were preserved.",
+    },
+    "zh": {
+        "provider_call": "重新分析时 AI 服务调用失败。请先测试当前模型连接后重试；原有档案与证据保持不变。",
+        "invalid_structured_output": "重新分析时 AI 返回的数据格式异常；原有档案与证据保持不变。",
+        "empty_structured_output": "重新分析时 AI 返回了空的分析数据；原有档案与证据保持不变。",
+        "schema_validation_failure": "重新分析时 AI 返回内容不符合文献分析格式；原有档案与证据保持不变。",
+        "document_synthesis": "文献分块已处理，但整篇档案合并失败；原有档案与证据保持不变。",
+    },
+}
+
+
+def failure_message(result, locale="en", *, reanalysis=False):
+    """Map an internal analysis stage to concise localized copy without raw details."""
+    language = "zh" if str(locale).lower().startswith("zh") else "en"
+    messages = _REANALYSIS_FAILURE_MESSAGES if reanalysis else _FAILURE_MESSAGES
+    return messages[language].get(
+        result.get("failure_stage") if isinstance(result, dict) else None,
+        _LABELS[language]["reanalyze_failed" if reanalysis else "unavailable"],
+    )
+
+
 def _import_one(title, text, source, link, raw_bytes, extension, literatures, evidence_store, raw_dir, llm_call, locale, research_topic="", research_context=""):
     literature_id = str(uuid.uuid4())
     filename = title if os.path.splitext(title)[1] else f"{title}{extension}"
@@ -86,7 +131,7 @@ def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extrac
                 if success:
                     st.success(labels["success"].format(chunks=result["chunks_total"], evidence=len(result["evidence"])))
                 else:
-                    st.warning(labels["unavailable"])
+                    st.warning(failure_message(result, locale))
                 added += 1
             progress.progress((index + 1) / len(uploads))
         save_records(literatures)
@@ -112,7 +157,7 @@ def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extrac
                 if success:
                     st.success(labels["success"].format(chunks=result["chunks_total"], evidence=len(result["evidence"])))
                 else:
-                    st.warning(labels["unavailable"])
+                    st.warning(failure_message(result, locale))
                 st.rerun()
 
 
@@ -140,7 +185,7 @@ def render_legacy_reanalysis(st, literature, literatures, evidence_store, raw_di
         )
         updated, new_store, success = apply_analysis_to_literature_record(literature, evidence_store, result)
         if not success:
-            st.warning(labels["reanalyze_failed"])
+            st.warning(failure_message(result, locale, reanalysis=True))
             return
         literature.update(updated)
         save_records(literatures)

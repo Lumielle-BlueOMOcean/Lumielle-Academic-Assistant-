@@ -95,7 +95,7 @@ def is_document_parse_error(text):
 def _build_chunk_prompt(chunk, purpose, part_number, total_parts, locale, retry=False):
     if locale == "zh":
         retry_instruction = (
-            "你上次的结果不是有效的非空模块 JSON 数组。请修正后只输出合法 JSON 数组。\n"
+            "你上次的结果不是有效的非空科研事实 JSON 对象。请修正后只输出合法 JSON 对象。\n"
             if retry else ""
         )
         return (
@@ -105,14 +105,15 @@ def _build_chunk_prompt(chunk, purpose, part_number, total_parts, locale, retry=
             "只提取本分块明确包含的信息；不得因为其他分块可能包含相关内容而省略本块内容，不得推断本块未提供的章节或事实。\n"
             "保留实质信息与表格数据。文本模块格式为 {\"title\":\"标题\",\"type\":\"text\",\"content\":\"内容\"}；"
             "表格模块格式为 {\"title\":\"标题\",\"type\":\"table\",\"columns\":[...],\"data\":[[...]]}；识别到的表格用 table，其余内容用 text。\n"
-            "只输出一个非空 JSON 数组；禁止 Markdown 围栏、解释、截断、省略号或添加本分块没有的内容。\n"
+            "只输出一个非空 JSON 对象，顶层字段为 facts，值为模块数组，例如 {\"facts\":[{\"title\":\"标题\",\"type\":\"text\",\"content\":\"内容\",\"tags\":[]}]}。\n"
+            "禁止 Markdown 围栏、解释、截断、省略号或添加本分块没有的内容。\n"
             + retry_instruction
             + "[DOCUMENT CONTENT]\n"
             + chunk
         )
 
     retry_instruction = (
-        "Your previous response was not a valid non-empty module JSON array. Correct it and output only valid JSON.\n"
+        "Your previous response was not a valid non-empty research-facts JSON object. Correct it and output only a valid JSON object.\n"
         if retry else ""
     )
     return (
@@ -121,7 +122,8 @@ def _build_chunk_prompt(chunk, purpose, part_number, total_parts, locale, retry=
         f"This is part {part_number} of {total_parts} of one source document (DOCUMENT PART {part_number}/{total_parts}).\n"
         "Extract all substantive information present in this part. Do not omit content because another part may contain related material, and do not infer sections or facts absent from this part.\n"
         "Use text modules as {\"title\":\"title\",\"type\":\"text\",\"content\":\"content\"}; use table modules as {\"title\":\"title\",\"type\":\"table\",\"columns\":[...],\"data\":[[...]]}. Represent detected tables as table modules and other content as text modules.\n"
-        "Return one non-empty JSON array only. No Markdown fences, explanations, truncation, ellipses, or content absent from this part.\n"
+        "Return one non-empty JSON object only, with a top-level facts array, for example {\"facts\":[{\"title\":\"title\",\"type\":\"text\",\"content\":\"content\",\"tags\":[]}]}.\n"
+        "No Markdown fences, explanations, truncation, ellipses, or content absent from this part.\n"
         + retry_instruction
         + "[DOCUMENT CONTENT]\n"
         + chunk
@@ -154,7 +156,7 @@ def parse_document_in_chunks(
         }
 
     collected = []
-    system_prompt = "你是严谨的结构化解析器，只输出 JSON。" if locale == "zh" else "You are a rigorous structured parser. Output only JSON."
+    system_prompt = "你是严谨的科研事实结构化解析器，只输出 JSON 对象。" if locale == "zh" else "You are a rigorous research-facts parser. Output only a JSON object."
     for index, chunk in enumerate(chunks, start=1):
         parsed_modules = None
         last_response = ""
@@ -167,25 +169,40 @@ def parse_document_in_chunks(
                 locale,
                 retry=attempt == 1,
             )
-            kwargs = {"system_prompt": system_prompt, "max_tokens": MAX_OUTPUT_TOKENS}
+            kwargs = {"system_prompt": system_prompt, "max_tokens": MAX_OUTPUT_TOKENS, "json_mode": True}
             if attempt == 1:
                 kwargs["temp"] = 0.3
             try:
-                last_response = require_valid_llm_output(llm_call(prompt, **kwargs))
-            except LLMOutputError as exc:
+                response = llm_call(prompt, **kwargs)
+            except Exception:
+                response = "API call failed repeatedly"
+            last_response = response if isinstance(response, str) else ""
+            if not isinstance(response, str) or not response.strip():
+                failure_stage = "empty_structured_output"
+                continue
+            try:
+                last_response = require_valid_llm_output(response)
+            except LLMOutputError:
                 if locale == "zh":
-                    message = f"文档第 {index}/{len(chunks)} 部分调用模型失败，因此本次没有导入任何部分结果：{exc}"
+                    message = f"AI 服务调用失败（第 {index}/{len(chunks)} 块），未导入部分内容。请先测试当前模型连接后重试。"
                 else:
-                    message = f"The model could not process document part {index} of {len(chunks)}, so no partial content was imported: {exc}"
+                    message = f"The AI service call failed for part {index} of {len(chunks)}. No partial content was imported. Test the current model connection and try again."
                 return {
                     "status": "error", "modules": [], "chunks_total": len(chunks),
-                    "failed_chunk": index, "error_type": "llm", "message": message,
+                    "failed_chunk": index, "error_type": "llm", "failure_stage": "provider_call",
+                    "failure_code": "provider_call_failed", "message": message,
                 }
 
             try:
                 raw_modules = parse_response(last_response)
             except (TypeError, ValueError):
                 raw_modules = None
+            if raw_modules is None:
+                failure_stage = "invalid_structured_output"
+            elif not isinstance(raw_modules, list) or not raw_modules:
+                failure_stage = "empty_structured_output"
+            else:
+                failure_stage = "schema_validation_failure"
             if isinstance(raw_modules, list) and raw_modules:
                 parsed_modules = normalize_modules(raw_modules)
                 if isinstance(parsed_modules, list) and parsed_modules:
@@ -195,14 +212,24 @@ def parse_document_in_chunks(
         if parsed_modules is None:
             if on_parse_failure:
                 on_parse_failure(chunk, last_response)
-            message = (
-                f"文档未能完整解析，因此本次没有导入不完整内容。第 {index}/{len(chunks)} 个分块重试后仍无法解析。"
-                if locale == "zh"
-                else f"The document could not be parsed completely, so no partial content was imported. Part {index} of {len(chunks)} failed after one retry."
-            )
+            if locale == "zh":
+                descriptions = {
+                    "invalid_structured_output": "AI 返回的数据格式异常",
+                    "empty_structured_output": "AI 返回了空的科研事实数据",
+                    "schema_validation_failure": "AI 返回的数据不符合科研事实格式",
+                }
+                message = f"{descriptions[failure_stage]}（第 {index}/{len(chunks)} 块），未导入不完整内容。请重试；若持续出现，请联系维护者并注明失败分块。"
+            else:
+                descriptions = {
+                    "invalid_structured_output": "The AI returned malformed structured data",
+                    "empty_structured_output": "The AI returned no research facts",
+                    "schema_validation_failure": "The AI data did not match the research-fact schema",
+                }
+                message = f"{descriptions[failure_stage]} for part {index} of {len(chunks)}. No partial content was imported. Retry; if this continues, tell support which part failed."
             return {
                 "status": "error", "modules": [], "chunks_total": len(chunks),
-                "failed_chunk": index, "error_type": "parse", "message": message,
+                "failed_chunk": index, "error_type": "parse", "failure_stage": failure_stage,
+                "failure_code": failure_stage, "message": message,
             }
         # Retain trusted parser provenance instead of asking the model to number chunks.
         for module in parsed_modules:

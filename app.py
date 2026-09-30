@@ -17,6 +17,11 @@ Lumielle Academic Assistant —— 学术论文写作助手
 import streamlit as st
 from version import __version__
 import llm_connection_support
+from structured_output_support import (
+    create_completion_with_json_fallback,
+    parse_first_json_value,
+    structured_request_options,
+)
 from document_support import DEFAULT_CHUNK_CHARS, extract_document_text, is_document_parse_error, parse_document_in_chunks
 from memory_support import update_chapter_memory
 from literature_support import clear_literature_library
@@ -300,13 +305,11 @@ def detect_aigc(text: str) -> dict:
 # 3. LLM 核心调用层（多配置支持）
 # ============================================================
 def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_name, temp=0.7, json_mode=False):
-    """底层 API 调用，包含重试机制。
-    json_mode=True 时启用 response_format=json_object 强制模型输出合法 JSON，
-    若服务商不支持该参数则自动降级为普通模式重试。"""
+    """底层 API 调用；结构化请求只在明确不支持 JSON 参数时兼容降级。"""
     if not api_key:
         return "API key missing. Please fill it in under [Base Environment Configuration]."
     try:
-        client = OpenAI(api_key=api_key, base_url=base_url)
+        client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0 if json_mode else 2)
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -316,7 +319,15 @@ def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_nam
         if max_tokens:
             req_params["max_tokens"] = max_tokens
         if json_mode:
-            req_params["response_format"] = {"type": "json_object"}
+            req_params.update(structured_request_options(base_url))
+            try:
+                res, _structured_mode = create_completion_with_json_fallback(
+                    client.chat.completions.create, req_params
+                )
+                content = res.choices[0].message.content
+                return content if isinstance(content, str) and content.strip() else ""
+            except Exception:
+                return "API call failed repeatedly: structured request failed"
 
         for attempt in range(3):
             try:
@@ -333,15 +344,13 @@ def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_nam
                     return ""
                 return content
             except Exception as e:
-                # JSON 模式不支持时降级为普通模式重试
-                if json_mode and ("response_format" in req_params) and attempt == 0:
-                    req_params.pop("response_format", None)
-                    continue
                 if attempt < 2:
                     time.sleep(2)
                 else:
                     return f"API call failed repeatedly: {e}"
     except Exception as e:
+        if json_mode:
+            return "API call failed repeatedly: structured request initialization failed"
         return f"OpenAI client initialization error: {e}"
 
 def get_all_profiles():
@@ -1157,61 +1166,40 @@ def _normalize_module_dict(m):
 
 
 def _extract_json_array(res):
-    """从 LLM 返回中稳健提取 JSON 数组：
-    1. 剥离 Markdown 代码块围栏（```json ... ```）
-    2. 支持 {"modules": [...]} 包装对象
-    3. 支持纯数组
-    4. 逐字符定位真正的 JSON 起始/结束，避免被解释文字干扰
-    5. 元素自动做中文键名归一化，兼容嵌套结构
-    返回 list 或 None（解析失败时）"""
-    if not res or not res.strip():
+    """提取首个 JSON value，并兼容论文结构的新旧包装格式。"""
+    data = parse_first_json_value(res)
+
+    def normalize_items(items):
+        if not isinstance(items, list):
+            return None
+        out = []
+        for item in items:
+            normalized = _normalize_module_dict(item)
+            if isinstance(normalized, list):
+                out.extend(normalized)
+            elif normalized is not None:
+                out.append(normalized)
+        return out or None
+
+    if isinstance(data, list):
+        return normalize_items(data)
+    if not isinstance(data, dict):
         return None
-    # 剥离 Markdown 围栏
-    cleaned = re.sub(r"```(?:json)?\s*", "", res)
-    cleaned = re.sub(r"\s*```", "", cleaned).strip()
 
-    # 尝试多个候选 JSON 片段（首个 {/[ 到最后一个 }/]）
-    candidates = []
-    try:
-        candidates.append(cleaned)
-    except Exception:
-        pass
-    start = min([i for i in (cleaned.find('['), cleaned.find('{')) if i >= 0], default=-1)
-    if start >= 0:
-        end = max(cleaned.rfind(']'), cleaned.rfind('}'))
-        if end > start:
-            candidates.append(cleaned[start:end + 1])
+    # Check single modules before the legacy ``data`` wrapper, since table
+    # modules also use ``data`` for their rows.
+    if any(key in data for key in ("title", "name", "标题", "名称")) and any(
+        key in data for key in ("content", "text", "type", "columns", "data", "内容", "描述")
+    ):
+        return normalize_items([data])
 
-    for frag in candidates:
-        try:
-            data = json.loads(frag)
-        except Exception:
-            continue
-        # 直接是数组
-        if isinstance(data, list):
-            out = []
-            for x in data:
-                nx = _normalize_module_dict(x)
-                if isinstance(nx, list):  # 嵌套展开
-                    out.extend(nx)
-                elif nx is not None:
-                    out.append(nx)
-            if out:
-                return out
-        # 包装对象：modules/结构/items 等键里是数组
-        if isinstance(data, dict):
-            for wrap_key in ("modules", "structure", "items", "sections", "data", "结果", "模块", "内容", "list", "子模块", "章节", "模块列表"):
-                v = data.get(wrap_key)
-                if isinstance(v, list):
-                    out = []
-                    for x in v:
-                        nx = _normalize_module_dict(x)
-                        if isinstance(nx, list):
-                            out.extend(nx)
-                        elif nx is not None:
-                            out.append(nx)
-                    if out:
-                        return out
+    for wrap_key in (
+        "facts", "modules", "structure", "items", "sections", "data",
+        "结果", "模块", "内容", "list", "子模块", "章节", "模块列表",
+    ):
+        if wrap_key in data:
+            return normalize_items(data[wrap_key])
+
     return None
 
 

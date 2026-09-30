@@ -43,7 +43,7 @@ class LLMConnectionUITests(unittest.TestCase):
                 self.assertFalse(app.exception)
                 self.assertTrue(any("Fetch Model List" in item.label or "拉取模型列表" in item.label for item in app.button))
                 self.assertTrue(any(test_button in item.label for item in app.button))
-                self.assertTrue(any("v1.1.0" in item.value for item in app.caption))
+                self.assertTrue(any("v1.1.1" in item.value for item in app.caption))
                 saved_defaults = json.loads((Path(temp_dir) / "data" / "llm_profiles.json").read_text(encoding="utf-8"))
                 self.assertEqual(saved_defaults[0]["base_url"], "https://api.deepseek.com")
                 self.assertEqual(saved_defaults[0]["model"], "deepseek-flash")

@@ -9,6 +9,11 @@ from urllib.parse import urlsplit, urlunsplit
 import openai
 import requests
 from openai import OpenAI
+from structured_output_support import (
+    create_completion_with_json_fallback,
+    parse_first_json_value,
+    structured_request_options,
+)
 
 
 def default_deepseek_profile(name: str) -> dict[str, str]:
@@ -59,6 +64,7 @@ def _safe_message(code: str) -> str:
         "timeout": "The request timed out. Check your network and try again.",
         "connection_error": "Could not reach the provider. Check the network and Base URL.",
         "provider_error": "The provider could not complete this request. Check the Base URL and provider service status.",
+        "invalid_structured_output": "The model did not return the required JSON connection response. Check model compatibility and try again.",
         "unknown_error": "The connection test could not be completed.",
     }.get(code, "The connection test could not be completed.")
 
@@ -128,9 +134,16 @@ def fetch_available_models(base_url: str, api_key: str, timeout: int = 15) -> di
         return _failure("unknown_error")
 
 
-def _has_valid_completion(response) -> bool:
+def _completion_content(response) -> str | None:
     choices = getattr(response, "choices", None)
-    return bool(choices) and any(getattr(choice, "message", None) is not None for choice in choices)
+    if not choices:
+        return None
+    for choice in choices:
+        message = getattr(choice, "message", None)
+        content = getattr(message, "content", None) if message is not None else None
+        if isinstance(content, str) and content.strip():
+            return content
+    return None
 
 
 def test_model_connection(
@@ -139,7 +152,7 @@ def test_model_connection(
     model_name: str,
     timeout: int = 20,
 ) -> dict:
-    """Send one tiny chat-completions request and return a credential-safe result."""
+    """Test authentication, model access, and the production structured JSON path."""
     normalized_base_url = str(base_url or "").strip()
     normalized_key = str(api_key or "").strip()
     normalized_model = str(model_name or "").strip()
@@ -152,16 +165,11 @@ def test_model_connection(
 
     request_args = {
         "model": normalized_model,
-        "messages": [{"role": "user", "content": "Reply with OK."}],
+        "messages": [{"role": "user", "content": 'Return only this JSON object: {"status":"ok"}'}],
         "temperature": 0,
-        "max_tokens": 8,
+        "max_tokens": 32,
     }
-    try:
-        deepseek_host = (urlsplit(normalized_base_url).hostname or "").lower() == "api.deepseek.com"
-    except ValueError:
-        deepseek_host = False
-    if deepseek_host:
-        request_args["extra_body"] = {"thinking": {"type": "disabled"}}
+    request_args.update(structured_request_options(normalized_base_url))
 
     try:
         client = OpenAI(
@@ -170,14 +178,19 @@ def test_model_connection(
             timeout=timeout,
             max_retries=0,
         )
-        response = client.chat.completions.create(**request_args)
-        if not _has_valid_completion(response):
-            return _failure("provider_error", normalized_model)
+        response, structured_mode = create_completion_with_json_fallback(
+            client.chat.completions.create, request_args
+        )
+        content = _completion_content(response)
+        parsed = parse_first_json_value(content)
+        if not isinstance(parsed, dict) or str(parsed.get("status", "")).strip().casefold() != "ok":
+            return _failure("invalid_structured_output", normalized_model)
         return {
             "ok": True,
             "code": "ok",
             "model": normalized_model,
             "http_status": 200,
+            "structured_mode": structured_mode,
             "message": "",
         }
     except Exception as exc:

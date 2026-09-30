@@ -9,6 +9,7 @@ import uuid
 from context_digest_support import balanced_excerpt
 from document_support import DEFAULT_CHUNK_CHARS, parse_document_in_chunks
 from relevance_support import multilingual_terms
+from structured_output_support import parse_first_json_value
 
 
 PRESET_SECTIONS = (
@@ -190,24 +191,38 @@ def normalize_research_source(source, filename="pasted.txt", source_id=None):
 
 
 def _parse_array(response):
-    text = str(response or "").strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"(?:\[.*\]|\{.*\})", text, re.DOTALL)
-        if not match:
-            return None
-        try:
-            parsed = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
+    parsed = parse_first_json_value(response)
     if isinstance(parsed, dict):
         for key in ("facts", "modules", "items"):
-            if isinstance(parsed.get(key), list):
-                return parsed[key]
+            if key in parsed:
+                return parsed[key] if isinstance(parsed[key], list) else None
+        if (parsed.get("title") or parsed.get("name")) and (
+            "content" in parsed or "text" in parsed or "columns" in parsed or "data" in parsed
+        ):
+            return [parsed]
         return None
     return parsed if isinstance(parsed, list) else None
+
+
+def _is_valid_research_module(module):
+    if not isinstance(module, dict):
+        return False
+    if not str(module.get("title") or module.get("name") or "").strip():
+        return False
+    kind = str(module.get("type", "text") or "text").strip().casefold()
+    if kind in {"text", "fact"}:
+        content = module.get("content", module.get("text", ""))
+        return isinstance(content, str) and bool(content.strip())
+    if kind == "table":
+        columns = module.get("columns")
+        rows = module.get("data")
+        return (
+            isinstance(columns, list)
+            and any(str(column).strip() for column in columns)
+            and isinstance(rows, list)
+            and any(isinstance(row, list) and row for row in rows)
+        )
+    return False
 
 
 def parse_research_source(document_text, section_id, llm_call, *, locale="en", max_chars=DEFAULT_CHUNK_CHARS, source_id=None, allow_writing_grounding=True):
@@ -218,11 +233,17 @@ def parse_research_source(document_text, section_id, llm_call, *, locale="en", m
     purpose = section["name_zh"] if locale == "zh" and section else section["name_en"] if section else str(section_id)
 
     def normalize(modules):
-        return [fact for fact in (_normalize_fact(m, section_id, allow_writing_grounding, source_id) for m in modules) if fact]
+        return [
+            fact
+            for module in modules
+            if _is_valid_research_module(module)
+            for fact in [_normalize_fact(module, section_id, allow_writing_grounding, source_id)]
+            if fact
+        ]
 
     result = parse_document_in_chunks(
         document_text,
-        purpose + ("。只输出包含 title、type、content、tags 的事实模块 JSON 数组。" if locale == "zh" else ". Return structured facts as a JSON array with title, type, content, and tags."),
+        purpose + ("。只输出顶层 facts 为数组的 JSON 对象；模块包含 title、type、content 或表格 columns/data。" if locale == "zh" else ". Return a JSON object with a top-level facts array; modules contain title, type, content, or table columns/data."),
         llm_call,
         parse_response=_parse_array,
         normalize_modules=normalize,
@@ -230,7 +251,12 @@ def parse_research_source(document_text, section_id, llm_call, *, locale="en", m
         max_chars=max_chars,
     )
     if result["status"] != "ok":
-        return {"status": "error", "facts": [], "chunks_total": result.get("chunks_total", 0), "failed_chunk": result.get("failed_chunk", 0), "message": result.get("message", "Research parsing failed.")}
+        return {
+            "status": "error", "facts": [], "chunks_total": result.get("chunks_total", 0),
+            "failed_chunk": result.get("failed_chunk", 0), "error_type": result.get("error_type"),
+            "failure_stage": result.get("failure_stage"), "failure_code": result.get("failure_code"),
+            "message": result.get("message", "Research parsing failed."),
+        }
     facts = []
     seen = set()
     for fact in result["modules"]:

@@ -1,7 +1,8 @@
 """Pure writing helpers shared by the English and Chinese Streamlit apps."""
 
-import json
 import re
+
+from structured_output_support import parse_first_json_value
 
 
 class LLMOutputError(RuntimeError):
@@ -97,17 +98,14 @@ def parse_literature_analysis(response):
     }
     try:
         text = require_valid_llm_output(response)
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            return unavailable
-        parsed = json.loads(match.group(0))
+        parsed = parse_first_json_value(text)
         if not isinstance(parsed, dict):
             return unavailable
         rating = int(parsed.get("rating"))
         category = parsed.get("category")
         if not 1 <= rating <= 5 or not isinstance(category, str) or not category.strip():
             return unavailable
-    except (LLMOutputError, TypeError, ValueError, json.JSONDecodeError):
+    except (LLMOutputError, TypeError, ValueError):
         return unavailable
 
     return {

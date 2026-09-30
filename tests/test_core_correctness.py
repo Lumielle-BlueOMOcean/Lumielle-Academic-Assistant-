@@ -6,11 +6,14 @@ import os
 import re
 import struct
 import tempfile
+import time
 import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from structured_output_support import create_completion_with_json_fallback, structured_request_options
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -255,19 +258,26 @@ class CoreCorrectnessTests(unittest.TestCase):
         support = load_project_module(self, "writing_support")
         self.assertEqual(support.count_chinese_chars("人工 智能，AI"), 7)
 
-    def test_version_is_canonical_v110(self):
+    def test_version_is_canonical_v111_candidate(self):
         version = load_project_module(self, "version")
-        self.assertEqual(version.__version__, "1.1.0")
+        self.assertEqual(version.__version__, "1.1.1")
 
     def test_readme_marks_current_release_and_keeps_release_history(self):
         version = load_project_module(self, "version")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"v{version.__version__}", readme)
-        self.assertIn(f"### v{version.__version__} — 2026-09-29", readme)
-        self.assertIn(f"Current release / 当前正式版本：v{version.__version__} — 2026-09-29", readme)
+        self.assertIn("### v1.1.1 — Unreleased", readme)
+        self.assertIn("Current release / 当前正式版本：v1.1.0 — 2026-09-29", readme)
         self.assertIn("### v1.0.1 — 2026-09-27", readme)
         self.assertIn("v1.0.0", readme)
         self.assertIn("Changelog", readme)
+        for change in (
+            "structured AI parsing for Research Foundation",
+            "full-document literature analysis",
+            "structured-capability check in the model connection test",
+            "Failure messages now distinguish provider calls",
+        ):
+            self.assertIn(change, readme)
 
     def test_global_reference_registry_uses_snapshots_and_deduplicates(self):
         support = load_project_module(self, "writing_support")
@@ -611,7 +621,7 @@ class DocumentSupportTests(unittest.TestCase):
         )
 
         self.assertEqual(calls, [1, 2, 2, 3])
-        self.assertEqual(prompts[1], prompts[2].replace("Your previous response was not a valid non-empty module JSON array. Correct it and output only valid JSON.\n", ""))
+        self.assertEqual(prompts[1], prompts[2].replace("Your previous response was not a valid non-empty research-facts JSON object. Correct it and output only a valid JSON object.\n", ""))
         self.assertEqual(result["status"], "ok")
         self.assertEqual([module["title"] for module in result["modules"]], ["Part 1", "Part 2", "Part 3"])
 
@@ -639,7 +649,7 @@ class DocumentSupportTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["modules"], [])
         self.assertEqual(result["error_type"], "parse")
-        self.assertIn("no partial content was imported", result["message"])
+        self.assertIn("no partial content was imported", result["message"].lower())
         self.assertEqual(len(logged_failures), 1)
         self.assertTrue(logged_failures[0][0].lstrip().startswith("B"))
 
@@ -667,7 +677,7 @@ class DocumentSupportTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["modules"], [])
         self.assertEqual(result["error_type"], "llm")
-        self.assertIn("no partial content was imported", result["message"])
+        self.assertIn("no partial content was imported", result["message"].lower())
 
     def test_applications_delegate_full_document_and_use_shared_parse_error_check(self):
         for app_name in ("app.py", "app_zh.py"):
@@ -1459,6 +1469,79 @@ class ChartSupportTests(unittest.TestCase):
         chart_source = (ROOT / "chart_support.py").read_text(encoding="utf-8")
         self.assertTrue("json_mode=True" in chart_source, "chart LLM call does not request JSON mode")
         self.assertFalse(re.search(r"(?<![.\w])(?:exec|eval|compile)\s*\(", chart_source), "chart helper executes code")
+
+
+class AppStructuredRequestTests(unittest.TestCase):
+    @staticmethod
+    def _response(content='{"status":"ok"}'):
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=content))]
+        )
+
+    def _load_call(self, app_name, client):
+        self.openai_factory = Mock(return_value=client)
+        return load_app_function(self, app_name, "call_llm_api", {
+            "OpenAI": self.openai_factory,
+            "time": time,
+            "create_completion_with_json_fallback": create_completion_with_json_fallback,
+            "structured_request_options": structured_request_options,
+        })
+
+    def _client(self, create):
+        return types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+        )
+
+    def test_both_apps_request_json_and_only_deepseek_disables_thinking(self):
+        for app_name in ("app.py", "app_zh.py"):
+            for base_url, expects_thinking in (
+                ("https://api.deepseek.com", True),
+                ("https://provider.example/v1", False),
+            ):
+                with self.subTest(app=app_name, base_url=base_url):
+                    create = Mock(return_value=self._response())
+                    call = self._load_call(app_name, self._client(create))
+                    result = call("prompt", "system", 100, "test-key", base_url, "model", json_mode=True)
+                    self.assertEqual(result, '{"status":"ok"}')
+                    kwargs = create.call_args.kwargs
+                    self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+                    self.assertEqual(self.openai_factory.call_args.kwargs["max_retries"], 0)
+                    self.assertEqual("extra_body" in kwargs, expects_thinking)
+                    if expects_thinking:
+                        self.assertEqual(kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+
+    def test_free_text_calls_keep_existing_behavior_without_structured_options(self):
+        for app_name in ("app.py", "app_zh.py"):
+            create = Mock(return_value=self._response("plain prose"))
+            call = self._load_call(app_name, self._client(create))
+            self.assertEqual(call("prompt", "system", 100, "key", "https://api.deepseek.com", "model"), "plain prose")
+            self.assertEqual(self.openai_factory.call_args.kwargs["max_retries"], 2)
+            self.assertNotIn("response_format", create.call_args.kwargs)
+            self.assertNotIn("extra_body", create.call_args.kwargs)
+
+    def test_both_apps_use_one_explicit_compatibility_fallback(self):
+        class ProviderError(Exception):
+            status_code = 400
+
+        for app_name in ("app.py", "app_zh.py"):
+            with self.subTest(app=app_name):
+                create = Mock(side_effect=[ProviderError("response_format is unsupported"), self._response()])
+                call = self._load_call(app_name, self._client(create))
+                result = call("prompt", "system", 100, "key", "https://api.deepseek.com", "model", json_mode=True)
+                self.assertEqual(result, '{"status":"ok"}')
+                self.assertEqual(create.call_count, 2)
+                self.assertIn("response_format", create.call_args_list[0].kwargs)
+                self.assertNotIn("response_format", create.call_args_list[1].kwargs)
+                self.assertIn("extra_body", create.call_args_list[1].kwargs)
+
+    def test_structured_app_failures_do_not_return_provider_exception_details(self):
+        secret = "sk-test-secret-value-123456"
+        for app_name in ("app.py", "app_zh.py"):
+            create = Mock(side_effect=RuntimeError(f"provider error Authorization: Bearer {secret}"))
+            call = self._load_call(app_name, self._client(create))
+            result = call("prompt", "system", 100, "key", "https://provider.example/v1", "model", json_mode=True)
+            self.assertNotIn(secret, result)
+            self.assertEqual(create.call_count, 1)
 
 
 if __name__ == "__main__":
