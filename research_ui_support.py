@@ -11,6 +11,7 @@ from document_support import is_document_parse_error
 from research_support import (
     PRESET_SECTIONS,
     accept_smart_inbox_facts,
+    apply_section_grounding,
     add_custom_section,
     create_default_research_base,
     migrate_research_base,
@@ -27,7 +28,8 @@ _TEXT = {
         "sections": "Research sections", "inbox": "Smart Research Inbox",
         "choose": "Section", "empty": "No facts yet. Add a note or process a source.",
         "grounding": "Allow this section's relevant facts in chapter writing",
-        "grounding_help": "When enabled, relevant parsed facts may enter selected chapter prompts; the entire section is not sent to every chapter. This section still informs research planning and the logic outline when disabled. More injected material is not always better; unrelated facts can add repetition, conflict, and context noise.",
+        "grounding_help": "This is the parent switch for the facts below. Turning it on enables all current facts by default; you may then disable individual facts. Turning it off disables all facts and prevents them from entering chapter text. Research planning and the logic outline still use this section either way.",
+        "grounding_status": "Writing grounding: {enabled} / {total} facts enabled",
         "file": "Upload a research source", "paste": "Paste or type research text", "title": "Source title",
         "parse_file": "Parse uploaded source", "parse_text": "Parse pasted text", "title_module": "Fact title",
         "content": "Fact content", "tags": "Tags (comma-separated)", "save": "Save section changes",
@@ -51,7 +53,8 @@ _TEXT = {
         "sections": "科研资料分区", "inbox": "智能归档 / 未分类科研资料",
         "choose": "选择分区", "empty": "暂无事实。可手动添加，或解析文件/粘贴文本。",
         "grounding": "允许本板块的相关事实参与正文 Grounding",
-        "grounding_help": "开启后，本板块解析出的相关事实可在需要的章节进入正文生成上下文，并不代表整板块会加入每一章。即使关闭，本板块仍参与科研基座理解、逻辑大纲等规划环节。并非注入越多正文质量越高；无关资料可能增加重复、冲突和上下文噪声。",
+        "grounding_help": "这是下方事实的总开关。开启后，本分区现有事实默认全部参与正文 Grounding；之后仍可单独关闭某条事实。关闭后，本分区所有事实均不进入章节正文。本分区仍可用于科研理解与逻辑大纲规划。",
+        "grounding_status": "正文 Grounding：{enabled} / {total} 条事实已启用",
         "file": "上传科研资料", "paste": "直接输入或粘贴科研文本", "title": "资料标题",
         "parse_file": "解析上传资料", "parse_text": "解析粘贴文本", "title_module": "事实标题",
         "content": "事实内容", "tags": "标签（逗号分隔）", "save": "保存本板块更改",
@@ -76,6 +79,15 @@ _TEXT = {
 
 def _name(section, locale):
     return section.get("name_zh" if locale == "zh" else "name_en") or section.get("name") or section.get("id", "")
+
+
+def sync_section_grounding_state(section, section_id, enabled, session_state):
+    """Cascade a parent toggle into facts and their not-yet-rendered Streamlit widgets."""
+    apply_section_grounding(section, enabled)
+    modules = section.get("modules", []) if isinstance(section, dict) else []
+    for index, fact in enumerate(modules if isinstance(modules, list) else []):
+        if isinstance(fact, dict):
+            session_state[f"research_fact_allow_{section_id}_{index}"] = bool(enabled)
 
 
 def _extract_source(upload, pasted_text, pasted_title, extract_upload_text, locale):
@@ -111,10 +123,19 @@ def _render_section(st, base, section_id, llm_call, save_base, extract_upload_te
     text = _TEXT[locale]
     section = base["sections"][section_id]
     st.subheader(_name(section, locale))
-    st.caption(text["grounding_help"])
-    section["allow_writing_grounding"] = st.checkbox(
-        text["grounding"], value=bool(section.get("allow_writing_grounding", False)), key=f"research_grounding_{section_id}"
+    previous_grounding = bool(section.get("allow_writing_grounding", False))
+    section_grounding = st.checkbox(
+        text["grounding"], value=previous_grounding, key=f"research_grounding_{section_id}",
+        help=text["grounding_help"],
     )
+    if section_grounding != previous_grounding:
+        sync_section_grounding_state(section, section_id, section_grounding, st.session_state)
+        save_base(base)
+    elif not section_grounding:
+        # Keep legacy/inconsistent child values and widget state behind the parent gate.
+        sync_section_grounding_state(section, section_id, False, st.session_state)
+    else:
+        section["allow_writing_grounding"] = True
 
     upload = st.file_uploader(text["file"], type=["pdf", "docx", "txt"], key=f"research_upload_{section_id}")
     pasted_title = st.text_input(text["title"], key=f"research_title_{section_id}")
@@ -171,7 +192,15 @@ def _render_section(st, base, section_id, llm_call, save_base, extract_upload_te
             else:
                 fact["content"] = st.text_area(text["content"], value=fact.get("content", ""), key=f"research_fact_content_{section_id}_{index}")
             fact["tags"] = [tag.strip() for tag in st.text_input(text["tags"], value=", ".join(fact.get("tags", [])), key=f"research_fact_tags_{section_id}_{index}").split(",") if tag.strip()]
-            fact["allow_writing_grounding"] = st.checkbox(text["selected_grounding"], value=bool(fact.get("allow_writing_grounding", section["allow_writing_grounding"])), key=f"research_fact_allow_{section_id}_{index}")
+            fact_grounding_key = f"research_fact_allow_{section_id}_{index}"
+            if fact_grounding_key not in st.session_state:
+                st.session_state[fact_grounding_key] = bool(fact.get("allow_writing_grounding", section["allow_writing_grounding"]))
+            fact_grounding = st.checkbox(
+                text["selected_grounding"],
+                key=fact_grounding_key,
+                disabled=not section["allow_writing_grounding"],
+            )
+            fact["allow_writing_grounding"] = bool(section["allow_writing_grounding"] and fact_grounding)
             mode = fact.get("binding_mode", "auto")
             mode_keys = ["auto", "global", "chapters"]
             selected_mode = st.selectbox(text["binding"], mode_keys, index=mode_keys.index(mode) if mode in mode_keys else 0, format_func=lambda value: text["binding_modes"][value], key=f"research_fact_binding_{section_id}_{index}")
@@ -179,6 +208,8 @@ def _render_section(st, base, section_id, llm_call, save_base, extract_upload_te
             if selected_mode == "chapters":
                 fact["chapter_ids"] = st.multiselect(text["chapters"], chapter_ids, default=[value for value in fact.get("chapter_ids", []) if value in chapter_ids], format_func=lambda value: chapter_names.get(value, value), key=f"research_fact_chapters_{section_id}_{index}")
             st.caption(f"Source: {fact.get('source_title', fact.get('source_id', 'manual'))} · chunk {fact.get('source_chunk', 1)}")
+    enabled_count = sum(bool(fact.get("allow_writing_grounding", False)) for fact in modules) if section["allow_writing_grounding"] else 0
+    st.caption(text["grounding_status"].format(enabled=enabled_count, total=len(modules)))
     if modules and st.button(text["save"], key=f"research_save_{section_id}"):
         save_base(base)
         st.success(text["save"])
@@ -237,6 +268,7 @@ def _render_inbox(st, base, llm_call, save_base, extract_upload_text, locale):
         tag_values = [tag.strip() for tag in tags.split(",") if tag.strip()]
         target["modules"].extend(accept_smart_inbox_facts(
             pending, selected, tag_values, role, allow_grounding,
+            section_enabled=target.get("allow_writing_grounding", False),
         ))
         save_base(base)
         st.session_state.pop("research_inbox_pending", None)

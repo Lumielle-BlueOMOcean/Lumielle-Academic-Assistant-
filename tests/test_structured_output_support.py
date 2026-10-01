@@ -318,7 +318,7 @@ class LiteratureStructuredPipelineTests(unittest.TestCase):
         for response, expected in (
             ("", "empty_structured_output"),
             ("{}", "empty_structured_output"),
-            (json.dumps({"research_question": "RQ"}), "schema_validation_failure"),
+            (json.dumps({"status": "ok"}), "schema_validation_failure"),
         ):
             with self.subTest(expected=expected):
                 result = analyze_literature_document(

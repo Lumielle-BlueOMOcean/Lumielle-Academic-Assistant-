@@ -116,6 +116,8 @@ DeepSeek App/web free chat is separate from the Open Platform API. API access de
 - Repaired structured AI parsing for Research Foundation imports and full-document literature analysis in Literature Intelligence. / 修复科研基座导入与 Literature Intelligence 全文文献分析中的结构化 AI 解析。
 - Improved the structured-capability check in the model connection test. / 改进模型连接测试中的结构化能力检查。
 - Failure messages now distinguish provider calls, malformed or empty output, schema validation, and full-document synthesis without exposing raw provider errors. / 失败提示现在区分服务调用、格式异常或空内容、结构校验和全文合并阶段，且不暴露原始服务错误。
+- Clarified section-level and fact-level Research grounding: enabling a section enables its existing facts by default, while individual facts can still be excluded; disabling the section disables all its facts. / 明确科研基座分区与事实级 Grounding 的父子关系：开启分区会默认开启现有事实，之后仍可单独排除事实；关闭分区会关闭其全部事实。
+- Literature Intelligence now accepts valid partial per-chunk academic schemas, normalizes omitted fields before full-document synthesis, and stores evidence only when its quotation exactly matches the source chunk. / Literature Intelligence 现在接受有效的分块部分学术字段，在全文合并前规范化缺失字段，并且只保存与原文分块精确匹配的引文证据。
 
 ### v1.1.0 — 2026-09-29
 

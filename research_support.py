@@ -91,6 +91,23 @@ def _normalize_modules(modules, section_id, allow_grounding):
     return result
 
 
+def apply_section_grounding(section, enabled):
+    """Set the section-level grounding switch and cascade it to its current facts."""
+    if not isinstance(section, dict):
+        return 0
+    enabled = bool(enabled)
+    section["allow_writing_grounding"] = enabled
+    changed = 0
+    modules = section.get("modules", [])
+    for fact in modules if isinstance(modules, list) else []:
+        if not isinstance(fact, dict):
+            continue
+        if bool(fact.get("allow_writing_grounding", False)) != enabled:
+            changed += 1
+        fact["allow_writing_grounding"] = enabled
+    return changed
+
+
 def migrate_research_base(value):
     """Read old broad sections without discarding any material or custom sections."""
     if not isinstance(value, dict):
@@ -488,7 +505,7 @@ def build_chapter_research_context(research_base, chapter_title, chapter_descrip
     }
 
 
-def accept_smart_inbox_facts(pending, section_id, tags, role, allow_grounding):
+def accept_smart_inbox_facts(pending, section_id, tags, role, allow_grounding, *, section_enabled=True):
     """Apply reviewed Smart Inbox fields to normalized facts before persistence."""
     if not isinstance(pending, dict):
         return []
@@ -504,7 +521,7 @@ def accept_smart_inbox_facts(pending, section_id, tags, role, allow_grounding):
             + [str(value).strip() for value in tags if str(value).strip()]
         ))
         fact["role"] = str(role or "").strip()[:240]
-        fact["allow_writing_grounding"] = bool(allow_grounding)
+        fact["allow_writing_grounding"] = bool(section_enabled and allow_grounding)
         fact["source_title"] = source_title
         accepted.append(fact)
     return accepted

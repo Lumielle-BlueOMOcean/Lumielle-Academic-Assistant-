@@ -37,14 +37,14 @@ def build_chunk_extraction_prompt(title, chunk, index, total, locale="en", retry
         return (
             "你是严谨的学术文献分析器。只提取本分块明确陈述的内容，不推测缺失结论，也不补全其他分块的信息。\n"
             f"文献标题：{title}\n本分块：{index}/{total}\n"
-            "提取研究问题、理论、方法、样本、数据、结果、明确主张、局限、结论和重要定义。每项主张尽可能附带原文短引句，不能编造定位。只输出 JSON 对象，键包括 research_question、theory、method、sample、data、results、claims、limitations、conclusion、definitions。claims 为含 section、claim、evidence_text 的数组。\n"
+            "尽可能提取研究问题、理论、方法、样本、数据、结果、明确主张、局限、结论和重要定义。只返回本分块实际支持的字段；不适用于本分块的字段可以省略，claims 可以省略或为空数组。每项主张尽可能附带原文短引句；不得编造事实或引文。只输出 JSON 对象，各字段使用 research_question、theory、method、sample、data、results、claims、limitations、conclusion、definitions。claims 为含 section、claim、evidence_text 的数组。\n"
             + retry_note + f"[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
         )
     retry_note = "The previous output was invalid. Re-extract only from this chunk and return valid JSON.\n" if retry else ""
     return (
         "You are a careful academic literature analyst. Extract only information explicitly stated in this source chunk. Do not infer missing conclusions or complete material from other chunks.\n"
         f"Title: {title}\nSource chunk: {index}/{total}\n"
-        "Extract the research question, theory, method, sample, data, results, explicit claims, limitations, conclusion, and important definitions. Attach a short exact source quotation to each claim when possible. Do not invent page locators. Return one JSON object with research_question, theory, method, sample, data, results, claims, limitations, conclusion, definitions. claims is an array of {section, claim, evidence_text}.\n"
+        "Extract whichever of the research question, theory, method, sample, data, results, explicit claims, limitations, conclusion, and important definitions this chunk actually supports. Omit fields that do not apply to this chunk; claims may be omitted or an empty array. Attach a short exact source quotation to a claim when possible. Do not invent facts or quotations. Return one JSON object using research_question, theory, method, sample, data, results, claims, limitations, conclusion, and definitions. claims is an array of {section, claim, evidence_text}.\n"
         + retry_note + f"[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
     )
 
@@ -55,23 +55,23 @@ def build_synthesis_prompt(title, extractions, locale="en", retry=False, *, rese
         for index, item in enumerate(extractions, 1)
     )
     if locale == "zh":
-        retry_note = "上次输出无效，请只输出符合字段要求的 JSON 对象。\n" if retry else ""
+        retry_note = "上次输出无效，请只输出合法 JSON；rating 必须为 1–5 整数，未提供的文字字段可以省略。\n" if retry else ""
         return (
             "[DOCUMENT SYNTHESIS]\n"
             "根据以下完整文献的有序分块提取结果形成整篇文献档案。合并重复内容；若源文献不同部分存在矛盾，应保留并标明矛盾，不要自行裁决；不得编造。\n"
             "rating 仅表示该文献与当前研究项目的相关性和实用性；quality_assessment 单独评估严谨性、证据强度、局限，以及原文支持的时效性，不得将两者混为一项。\n"
             f"文献标题：{title}\n" + retry_note
-            + "仅输出 JSON 对象，字段：rating(1-5整数)、category、research_question、methods、sample、key_findings、limitations、quality_assessment、relevance_reason、summary。\n"
+            + "仅输出 JSON 对象。rating 为必需的 1–5 整数；category 可省略。research_question、methods、sample、key_findings、limitations、quality_assessment、relevance_reason、summary 只填写有材料支持的文字字段，没有内容的字段可以省略。\n"
             + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
             "[ORDERED CHUNK EXTRACTIONS]\n" + ordered
         )
-    retry_note = "The previous output was invalid. Return only a valid JSON object with all required fields.\n" if retry else ""
+    retry_note = "The previous output was invalid. Return valid JSON; rating must be an integer from 1 to 5, and unsupported text fields may be omitted.\n" if retry else ""
     return (
         "[DOCUMENT SYNTHESIS]\n"
         "Build one profile for the complete literature document from all ordered chunk extractions below. Merge duplicates, preserve conflicts present in the source instead of resolving them, and do not fabricate.\n"
         "The rating measures relevance and usefulness to the current research project. Assess intrinsic quality separately in quality_assessment: rigor, evidence strength, limitations, and timeliness only when supported by the source.\n"
         f"Title: {title}\n" + retry_note
-        + "Return only a JSON object with rating (integer 1-5), category, research_question, methods, sample, key_findings, limitations, quality_assessment, relevance_reason, and summary.\n"
+        + "Return only a JSON object. rating is required and must be an integer from 1 to 5; category may be omitted. Include only supported text fields among research_question, methods, sample, key_findings, limitations, quality_assessment, relevance_reason, and summary; omit fields with no content.\n"
         + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
         "[ORDERED CHUNK EXTRACTIONS]\n" + ordered
     )
@@ -120,59 +120,109 @@ def _call_json_with_retry(llm_call, prompt_factory, attempts=2, validator=None):
     raise _StructuredCallFailure(last_stage)
 
 
-def _normalize_chunk_extraction(value):
-    def field(name):
-        result = value.get(name, "")
-        if isinstance(result, list):
-            return "; ".join(str(part).strip() for part in result if str(part).strip())
-        return str(result or "").strip()
+_CHUNK_TEXT_FIELDS = (
+    "research_question", "theory", "method", "sample", "data", "results",
+    "limitations", "conclusion", "definitions",
+)
+_PROFILE_TEXT_FIELDS = (
+    "research_question", "methods", "sample", "key_findings", "limitations",
+    "quality_assessment", "relevance_reason", "summary",
+)
 
-    claims = value.get("claims", [])
-    if not isinstance(claims, list):
-        claims = []
-    return {
-        "research_question": field("research_question"),
-        "theory": field("theory"),
-        "method": field("method"),
-        "sample": field("sample"),
-        "data": field("data"),
-        "results": field("results"),
-        "claims": [item for item in claims if isinstance(item, dict)],
-        "limitations": field("limitations"),
-        "conclusion": field("conclusion"),
-        "definitions": field("definitions"),
-    }
+
+def _normalize_chunk_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if item is None:
+                continue
+            if not isinstance(item, (str, int, float, bool)):
+                return None
+            text = str(item).strip()
+            if text:
+                parts.append(text)
+        return "; ".join(parts)
+    return None
+
+
+def normalize_chunk_extraction(value):
+    """Normalize optional per-chunk dimensions while requiring meaningful content."""
+    if not isinstance(value, dict):
+        return None
+    normalized = {}
+    for name in _CHUNK_TEXT_FIELDS:
+        text = _normalize_chunk_text(value.get(name))
+        if text is None:
+            return None
+        normalized[name] = text
+
+    raw_claims = value.get("claims")
+    if raw_claims is None:
+        raw_claims = []
+    if not isinstance(raw_claims, list):
+        return None
+    claims = []
+    for claim in raw_claims:
+        if not isinstance(claim, dict):
+            return None
+        item = {}
+        for name in ("section", "claim", "evidence_text"):
+            field = claim.get(name)
+            if field is None:
+                field = ""
+            if not isinstance(field, str):
+                return None
+            item[name] = field.strip()
+        if item["claim"]:
+            claims.append(item)
+    normalized["claims"] = claims
+
+    if not any(normalized[name] for name in _CHUNK_TEXT_FIELDS) and not claims:
+        return None
+    return normalized
 
 
 def _validate_chunk_extraction(value):
-    text_fields = (
-        "research_question", "theory", "method", "sample", "data", "results",
-        "limitations", "conclusion", "definitions",
-    )
-    for name in text_fields:
-        if name not in value or not isinstance(value[name], (str, list)):
-            return None
-    claims = value.get("claims")
-    if not isinstance(claims, list):
-        return None
-    for claim in claims:
-        if not isinstance(claim, dict):
-            return None
-        if any(not isinstance(claim.get(name), str) for name in ("section", "claim", "evidence_text")):
-            return None
-    return value
+    return normalize_chunk_extraction(value)
 
 
-def _normalize_profile(value):
-    try:
-        rating = int(value.get("rating"))
-    except (TypeError, ValueError):
+def normalize_profile(value):
+    """Normalize a complete-document profile without inventing academic content."""
+    if not isinstance(value, dict):
         return None
-    category = value.get("category")
-    if isinstance(value.get("rating"), bool) or not 1 <= rating <= 5 or not isinstance(category, str) or not category.strip():
+    raw_rating = value.get("rating")
+    if isinstance(raw_rating, bool):
         return None
-    fields = ("research_question", "methods", "sample", "key_findings", "limitations", "quality_assessment", "relevance_reason", "summary")
-    profile = {key: str(value.get(key, "") or "").strip() for key in fields}
+    if isinstance(raw_rating, int):
+        rating = raw_rating
+    elif isinstance(raw_rating, str) and re.fullmatch(r"[1-5]", raw_rating.strip()):
+        rating = int(raw_rating.strip())
+    else:
+        return None
+    if not 1 <= rating <= 5:
+        return None
+
+    raw_category = value.get("category")
+    if raw_category is None:
+        category = "Other"
+    elif isinstance(raw_category, str):
+        category = raw_category.strip() or "Other"
+    else:
+        return None
+    profile = {}
+    for key in _PROFILE_TEXT_FIELDS:
+        field = value.get(key)
+        if field is None:
+            field = ""
+        if not isinstance(field, str):
+            return None
+        profile[key] = field.strip()
+    if not any(profile.values()):
+        return None
     profile.update({"rating": rating, "category": category.strip(), "analysis_status": "ok"})
     return profile
 
@@ -198,7 +248,7 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
                 "failed_chunk": index, "failure_stage": exc.failure_stage,
                 "failure_code": exc.failure_stage, "message": "A literature source chunk could not be analyzed; no partial analysis was stored.",
             }
-        extraction = _normalize_chunk_extraction(parsed)
+        extraction = parsed
         extractions.append(extraction)
         for claim in extraction["claims"]:
             claim_text = str(claim.get("claim", "") or "").strip()
@@ -222,7 +272,7 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
                 research_topic=research_topic, research_context=research_context,
             ),
             MAX_SYNTHESIS_ATTEMPTS,
-            validator=_normalize_profile,
+            validator=normalize_profile,
         )
     except _StructuredCallFailure as exc:
         return {
