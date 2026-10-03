@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -54,6 +55,7 @@ _FAILURE_MESSAGES = {
         "empty_structured_output": "The source was saved, but the AI returned empty analysis data. Retry; no partial profile or evidence was stored.",
         "schema_validation_failure": "The source was saved, but the AI data did not match the literature-analysis schema. Retry; no partial profile or evidence was stored.",
         "document_synthesis": "Chunk analysis completed, but full-document synthesis failed. The source was kept; no partial profile or evidence was stored.",
+        "synthesis_reduction_failure": "The ordered chunk analyses could not be compacted safely for full-document synthesis. The source was kept; no partial profile or evidence was stored.",
     },
     "zh": {
         "provider_call": "原始资料已保存，但 AI 服务调用失败。请先测试当前模型连接后重试；未保存部分档案或证据。",
@@ -61,6 +63,7 @@ _FAILURE_MESSAGES = {
         "empty_structured_output": "原始资料已保存，但 AI 返回了空的分析数据。请重试；未保存部分档案或证据。",
         "schema_validation_failure": "原始资料已保存，但 AI 返回内容不符合文献分析格式。请重试；未保存部分档案或证据。",
         "document_synthesis": "文献分块已处理，但整篇档案合并失败。原始资料已保留，未保存部分档案或证据。",
+        "synthesis_reduction_failure": "无法在安全限制内归并全部文献分块。原始资料已保留，未保存部分档案或证据。",
     },
 }
 
@@ -71,6 +74,7 @@ _REANALYSIS_FAILURE_MESSAGES = {
         "empty_structured_output": "The AI returned empty analysis data during re-analysis. Existing profile and evidence were preserved.",
         "schema_validation_failure": "The AI data did not match the literature-analysis schema. Existing profile and evidence were preserved.",
         "document_synthesis": "Full-document synthesis failed during re-analysis. Existing profile and evidence were preserved.",
+        "synthesis_reduction_failure": "The ordered chunk analyses could not be compacted safely. Existing profile and evidence were preserved.",
     },
     "zh": {
         "provider_call": "重新分析时 AI 服务调用失败。请先测试当前模型连接后重试；原有档案与证据保持不变。",
@@ -78,6 +82,7 @@ _REANALYSIS_FAILURE_MESSAGES = {
         "empty_structured_output": "重新分析时 AI 返回了空的分析数据；原有档案与证据保持不变。",
         "schema_validation_failure": "重新分析时 AI 返回内容不符合文献分析格式；原有档案与证据保持不变。",
         "document_synthesis": "文献分块已处理，但整篇档案合并失败；原有档案与证据保持不变。",
+        "synthesis_reduction_failure": "无法在安全限制内归并全部文献分块；原有档案与证据保持不变。",
     },
 }
 
@@ -87,6 +92,7 @@ _FAILURE_GROUPS = {
     "invalid_structured_output": "invalid_json",
     "empty_structured_output": "empty",
     "truncated_output": "truncated",
+    "synthesis_reduction_failure": "reduction",
     "content_filtered": "filtered",
     "rate_limited": "temporary",
     "timeout": "temporary",
@@ -130,12 +136,27 @@ def _failure_detail(result, locale="en"):
         else f" (chunk {chunk_index}/{chunks_total})" if valid_chunk_position
         else ""
     )
+    locator = diagnostic.get("source_locator")
+    safe_locator = locator if isinstance(locator, str) and re.fullmatch(r"\d+(?:\.\d+)*", locator) else ""
+    locator_text = (
+        f"（源分块 {safe_locator}）" if language == "zh" and safe_locator
+        else f" (source part {safe_locator})" if safe_locator
+        else ""
+    )
+    failure_stage = diagnostic.get("stage")
     if language == "zh":
-        return {
+        truncated_detail = (
+            "各部分已完成分析，但最终档案合并连续两次超过模型输出长度限制"
+            if failure_stage == "synthesis"
+            else "文献已自动细分处理，但其中一个最小分块的结构化输出仍超过模型长度限制"
+        )
+        reduction_detail = "无法在有界长度内归并全部分块摘要"
+        details = {
             "schema_validation_failure": "结构化数据不兼容" + chunk_text,
             "invalid_structured_output": "结构化 JSON 格式无效" + chunk_text,
             "empty_structured_output": "模型返回了空分析内容" + chunk_text,
-            "truncated_output": "输出达到长度限制，扩大预算重试后仍未完成" + chunk_text,
+            "truncated_output": truncated_detail + chunk_text + locator_text,
+            "synthesis_reduction_failure": reduction_detail,
             "content_filtered": "模型内容安全过滤阻止了本次分析" + chunk_text,
             "rate_limited": "AI 服务暂时繁忙或请求受限，系统已自动重试" + status_text,
             "timeout": "AI 服务响应超时，系统已自动重试" + status_text,
@@ -152,12 +173,28 @@ def _failure_detail(result, locale="en"):
             "provider_call": "AI 服务调用失败，请检查模型配置后重试" + status_text,
             "source_extraction_failure": "原文提取失败",
             "empty_source": "没有可分析的原文",
-        }.get(code, "AI 分析失败" + chunk_text + status_text)
-    return {
+        }
+        detail = details.get(code, "AI 分析失败" + chunk_text + status_text)
+        if code != "truncated_output":
+            detail += locator_text
+        split_depth = diagnostic.get("split_depth")
+        if isinstance(split_depth, int) and not isinstance(split_depth, bool) and code == "truncated_output":
+            detail += f"（细分层级 {split_depth}）"
+        reduction_level = diagnostic.get("reduction_level")
+        if isinstance(reduction_level, int) and not isinstance(reduction_level, bool):
+            detail += f"（归并层级 {reduction_level}）"
+        return detail
+    truncated_detail = (
+        "All source parts were analyzed, but final profile synthesis exceeded the output limit twice"
+        if failure_stage == "synthesis"
+        else "The source was split automatically, but a minimum-size part still exceeded the model output limit"
+    )
+    details = {
         "schema_validation_failure": "Incompatible structured data" + chunk_text,
         "invalid_structured_output": "Malformed structured JSON" + chunk_text,
         "empty_structured_output": "The model returned empty analysis" + chunk_text,
-        "truncated_output": "Output reached its length limit and remained incomplete after a larger-budget retry" + chunk_text,
+        "truncated_output": truncated_detail + chunk_text + locator_text,
+        "synthesis_reduction_failure": "The chunk analyses could not be compacted within bounded synthesis limits",
         "content_filtered": "The model's content filter blocked this analysis" + chunk_text,
         "rate_limited": "The AI service is busy or rate-limited; automatic retries were attempted" + status_text,
         "timeout": "The AI service timed out; automatic retries were attempted" + status_text,
@@ -174,7 +211,17 @@ def _failure_detail(result, locale="en"):
         "provider_call": "The AI service call failed; check the model configuration" + status_text,
         "source_extraction_failure": "Source text extraction failed",
         "empty_source": "No source text was available to analyze",
-    }.get(code, "AI analysis failed" + chunk_text + status_text)
+    }
+    detail = details.get(code, "AI analysis failed" + chunk_text + status_text)
+    if code != "truncated_output":
+        detail += locator_text
+    split_depth = diagnostic.get("split_depth")
+    if isinstance(split_depth, int) and not isinstance(split_depth, bool) and code == "truncated_output":
+        detail += f" (split depth {split_depth})"
+    reduction_level = diagnostic.get("reduction_level")
+    if isinstance(reduction_level, int) and not isinstance(reduction_level, bool):
+        detail += f" (reduction level {reduction_level})"
+    return detail
 
 
 def failure_message(result, locale="en", *, reanalysis=False):
@@ -223,7 +270,7 @@ def summarize_literature_batch(items, locale="en"):
         summary = f"本批次共 {len(outcomes)} 篇：成功分析 {analyzed}，仅保存原文 {source_only}。"
         names = {
             "schema": "结构化数据不兼容", "invalid_json": "JSON 格式无效", "empty": "空分析结果",
-            "truncated": "输出达到长度限制", "temporary": "服务暂时不可用/请求受限",
+            "truncated": "输出达到长度限制", "reduction": "分块摘要归并失败", "temporary": "服务暂时不可用/请求受限",
             "configuration": "模型配置或账户问题", "filtered": "内容安全过滤", "provider": "其他服务错误",
             "source": "原文提取失败",
         }
@@ -241,7 +288,7 @@ def summarize_literature_batch(items, locale="en"):
     summary = f"Batch: {len(outcomes)} files; analyzed {analyzed}; original only {source_only}."
     names = {
         "schema": "incompatible structured data", "invalid_json": "invalid JSON", "empty": "empty analysis",
-        "truncated": "length-limited output", "temporary": "temporary service/rate-limit issue",
+        "truncated": "length-limited output", "reduction": "chunk reduction failure", "temporary": "temporary service/rate-limit issue",
         "configuration": "model configuration/account issue", "filtered": "content filter", "provider": "other provider error",
         "source": "source extraction failure",
     }
@@ -262,6 +309,7 @@ def _safe_batch_notice(items):
     diagnostic_fields = (
         "stage", "chunk_index", "chunks_total", "failure_code", "finish_reason",
         "http_status", "response_chars", "structured_mode", "retry_count", "top_level_shape",
+        "source_locator", "source_chars", "split_depth", "reduction_level",
     )
     safe = []
     for item in items if isinstance(items, (list, tuple)) else ():
@@ -269,7 +317,36 @@ def _safe_batch_notice(items):
             continue
         result = item.get("result", {}) if isinstance(item.get("result"), dict) else {}
         raw_diagnostic = result.get("diagnostic", {}) if isinstance(result.get("diagnostic"), dict) else {}
-        diagnostic = {key: raw_diagnostic[key] for key in diagnostic_fields if key in raw_diagnostic}
+        diagnostic = {}
+        for key in diagnostic_fields:
+            if key not in raw_diagnostic:
+                continue
+            value = raw_diagnostic[key]
+            if key == "source_locator":
+                if isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+)*", value):
+                    diagnostic[key] = value
+            elif key == "top_level_shape":
+                if isinstance(value, dict):
+                    diagnostic[key] = {
+                        str(name)[:60]: str(kind)[:24]
+                        for name, kind in list(value.items())[:24]
+                        if isinstance(name, str) and isinstance(kind, str)
+                    }
+            elif key in {"source_chars", "split_depth", "reduction_level", "chunk_index", "chunks_total", "http_status", "response_chars", "retry_count"}:
+                if isinstance(value, int) and not isinstance(value, bool):
+                    diagnostic[key] = value
+            elif key == "stage":
+                if isinstance(value, str) and value in {"input", "chunk", "synthesis", "synthesis_reduction"}:
+                    diagnostic[key] = value
+            elif key == "finish_reason":
+                if isinstance(value, str) and value in {"stop", "length", "content_filter", "insufficient_system_resource", "aborted", "unknown"}:
+                    diagnostic[key] = value
+            elif key == "structured_mode":
+                if isinstance(value, str) and value in {"native", "compatibility", "legacy", "unknown"}:
+                    diagnostic[key] = value
+            elif key == "failure_code":
+                if isinstance(value, str) and re.fullmatch(r"[a-z_]{1,80}", value):
+                    diagnostic[key] = value
         safe.append({
             "filename": str(item.get("filename", "file"))[:240],
             "success": bool(item.get("success")),
@@ -281,6 +358,60 @@ def _safe_batch_notice(items):
             },
         })
     return safe
+
+
+def literature_summary_for_display(literature, locale="en"):
+    """Show only a completed AI summary; never substitute the imported source prefix."""
+    language = "zh" if str(locale).lower().startswith("zh") else "en"
+    record = literature if isinstance(literature, dict) else {}
+    analysis = record.get("analysis") if isinstance(record.get("analysis"), dict) else {}
+    summary = analysis.get("summary")
+    if record.get("analysis_status") == "ok":
+        if isinstance(summary, str) and summary.strip():
+            prefix = "AI 文献摘要：" if language == "zh" else "AI literature summary:"
+            return f"{prefix} {summary.strip()}"
+        return "AI 文献摘要：完整分析中未提供摘要。" if language == "zh" else "AI literature summary: no summary was provided in the completed analysis."
+    return "AI 文献摘要：尚未生成（文献分析未完成）。" if language == "zh" else "AI literature summary: not generated because analysis is incomplete."
+
+
+def literature_importance_control(literature, locale="en"):
+    language = "zh" if str(locale).lower().startswith("zh") else "en"
+    marked = bool(literature.get("important", False)) if isinstance(literature, dict) else False
+    if language == "zh":
+        label = "📌 已标记重点" if marked else "📌 标记重点"
+        help_text = "人工重点标记，仅用于快速识别重要文献，不改变 AI 相关性评级，也不会自动绑定到章节。"
+    else:
+        label = "📌 Important" if marked else "📌 Mark important"
+        help_text = "Manual importance marker only; it does not change the AI relevance rating or bind the reference to a chapter."
+    return label, help_text
+
+
+def toggle_literature_importance(literature):
+    if not isinstance(literature, dict):
+        return False
+    literature["important"] = not bool(literature.get("important", False))
+    return literature["important"]
+
+
+_CATEGORY_LABELS_ZH = {
+    "Empirical Study": "实证研究",
+    "Theoretical / Conceptual Study": "理论 / 概念研究",
+    "Literature Review": "文献综述",
+    "Case Study": "案例研究",
+    "Policy / Official Document": "政策 / 官方文件",
+    "Standard / Guideline": "标准 / 指南",
+    "Data / Research Report": "数据 / 研究报告",
+    "Thesis / Dissertation": "学位论文",
+    "Methodological Study": "方法研究",
+    "Other": "其他",
+    "Unclassified": "未分类",
+}
+
+
+def display_literature_category(category, locale="en"):
+    language = "zh" if str(locale).lower().startswith("zh") else "en"
+    value = category if isinstance(category, str) and category in _CATEGORY_LABELS_ZH else "Unclassified"
+    return _CATEGORY_LABELS_ZH[value] if language == "zh" else value
 
 
 def _import_one(title, text, source, link, raw_bytes, extension, literatures, evidence_store, raw_dir, llm_call, locale, research_topic="", research_context=""):

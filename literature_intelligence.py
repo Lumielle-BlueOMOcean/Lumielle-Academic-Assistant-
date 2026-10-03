@@ -21,10 +21,44 @@ MAX_SYNTHESIS_ATTEMPTS = 2
 MAX_EVIDENCE_CHARS = 1800
 MAX_TRANSPORT_ATTEMPTS = 3
 TRANSPORT_RETRY_BACKOFF_SECONDS = (1, 2)
-LITERATURE_CHUNK_TOKEN_BUDGETS = (2200, 4000)
-LITERATURE_SYNTHESIS_TOKEN_BUDGETS = (2600, 4000)
+LITERATURE_CHUNK_TOKEN_BUDGETS = (2200,)
+LITERATURE_SYNTHESIS_TOKEN_BUDGETS = (2600, 2600)
+LITERATURE_REDUCTION_TOKEN_BUDGET = 1800
+MAX_SYNTHESIS_INPUT_CHARS = 20000
+MAX_REDUCTION_GROUP_CHARS = 8000
+MAX_REDUCTION_LEVELS = 4
+MAX_SOURCE_SPLIT_DEPTH = 3
+MIN_SOURCE_SPLIT_CHARS = 900
 TRANSIENT_PROVIDER_ERRORS = frozenset({"rate_limited", "timeout", "connection_error", "server_error"})
 TRANSIENT_FINISH_REASONS = frozenset({"insufficient_system_resource", "aborted"})
+LITERATURE_CATEGORIES = (
+    "Empirical Study", "Theoretical / Conceptual Study", "Literature Review", "Case Study",
+    "Policy / Official Document", "Standard / Guideline", "Data / Research Report",
+    "Thesis / Dissertation", "Methodological Study", "Other", "Unclassified",
+)
+CATEGORY_ALIASES = {
+    "empirical study": "Empirical Study", "empirical": "Empirical Study", "survey study": "Empirical Study",
+    "empirical research": "Empirical Study",
+    "theoretical study": "Theoretical / Conceptual Study", "theoretical": "Theoretical / Conceptual Study",
+    "conceptual study": "Theoretical / Conceptual Study", "theoretical / conceptual study": "Theoretical / Conceptual Study",
+    "literature review": "Literature Review", "review": "Literature Review", "systematic review": "Literature Review",
+    "meta-analysis": "Literature Review", "case study": "Case Study", "case report": "Case Study",
+    "policy / official document": "Policy / Official Document", "policy document": "Policy / Official Document",
+    "official document": "Policy / Official Document", "standard / guideline": "Standard / Guideline",
+    "standard": "Standard / Guideline", "guideline": "Standard / Guideline",
+    "data / research report": "Data / Research Report", "data report": "Data / Research Report",
+    "research report": "Data / Research Report", "methodological study": "Methodological Study",
+    "methodology": "Methodological Study", "methods paper": "Methodological Study",
+    "thesis / dissertation": "Thesis / Dissertation", "thesis": "Thesis / Dissertation",
+    "dissertation": "Thesis / Dissertation",
+    "other": "Other", "unclassified": "Unclassified",
+    "实证研究": "Empirical Study", "理论 / 概念研究": "Theoretical / Conceptual Study",
+    "理论研究": "Theoretical / Conceptual Study", "文献综述": "Literature Review",
+    "案例研究": "Case Study", "政策 / 官方文件": "Policy / Official Document",
+    "标准 / 指南": "Standard / Guideline", "数据 / 研究报告": "Data / Research Report",
+    "学位论文": "Thesis / Dissertation", "方法研究": "Methodological Study",
+    "其他": "Other", "未分类": "Unclassified",
+}
 
 
 def _json_object(response):
@@ -40,23 +74,24 @@ class _StructuredCallFailure(LLMOutputError):
         self.diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
 
 
-def build_chunk_extraction_prompt(title, chunk, index, total, locale="en", retry=False):
+def build_chunk_extraction_prompt(title, chunk, index, total, locale="en", retry=False, *, source_locator=None):
+    locator = str(source_locator or index)
     if locale == "zh":
         retry_note = "上一次输出无效。请仅根据本分块重新提取并输出合法 JSON。\n" if retry else ""
         return (
             "你是严谨的学术文献分析器。只提取本分块明确陈述的内容，不推测缺失结论，也不补全其他分块的信息。\n"
             f"文献标题：{title}\n本分块：{index}/{total}\n"
-            "尽可能提取本分块实际支持的研究问题、理论、方法、样本、数据、结果、明确主张、局限、结论和重要定义。缺少的文字字段使用空字符串，没有主张使用空数组。每项主张尽可能附带原文短引句；evidence_text 必须是原文连续短引文。不得编造事实或引文。严格返回以下完整 JSON 形状：\n"
+            "尽可能提取本分块实际支持的研究问题、理论、方法、样本、数据、结果、明确主张、局限、结论和重要定义。缺少的文字字段使用空字符串，没有主张使用空数组。保持简洁，不要重复原文；最多列出 6 条主张，每个字段建议不超过 300 字。每项主张尽可能附带原文短引句；evidence_text 必须是原文中不超过 300 字的连续短引文。不得编造事实或引文。严格返回以下完整 JSON 形状：\n"
             '{"research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[{"section":"","claim":"","evidence_text":""}],"limitations":"","conclusion":"","definitions":""}\n'
-            + retry_note + f"[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
+            + retry_note + f"Source locator: {locator} ({len(chunk)} chars)\n[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
         )
     retry_note = "The previous output was invalid. Re-extract only from this chunk and return valid JSON.\n" if retry else ""
     return (
         "You are a careful academic literature analyst. Extract only information explicitly stated in this source chunk. Do not infer missing conclusions or complete material from other chunks.\n"
         f"Title: {title}\nSource chunk: {index}/{total}\n"
-        "Extract only the academic dimensions supported by this chunk. Use an empty string for text fields with no support and an empty array when there are no claims. Any evidence_text must be a short exact quotation copied from this source chunk. Do not invent facts or quotations. Return exactly this complete JSON shape:\n"
+        "Extract only the academic dimensions supported by this chunk. Use an empty string for text fields with no support and an empty array when there are no claims. Keep the extraction concise and avoid repeating the source; provide at most 6 claims and aim for no more than 300 characters per field. Any evidence_text must be a short exact quotation of at most 300 characters copied contiguously from this source chunk. Do not invent facts or quotations. Return exactly this complete JSON shape:\n"
         '{"research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[{"section":"","claim":"","evidence_text":""}],"limitations":"","conclusion":"","definitions":""}\n'
-        + retry_note + f"[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
+        + retry_note + f"Source locator: {locator} ({len(chunk)} chars)\n[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
     )
 
 
@@ -66,25 +101,25 @@ def build_synthesis_prompt(title, extractions, locale="en", retry=False, *, rese
         for index, item in enumerate(extractions, 1)
     )
     if locale == "zh":
-        retry_note = "上次输出无效，请只输出合法 JSON；rating 必须为 1–5 整数，没有支持内容的字段使用空字符串。\n" if retry else ""
+        retry_note = "上次输出无效或超过长度限制。本次必须进一步压缩各字段，只保留最重要内容，并完整关闭 JSON 对象；rating 必须为 1–5 整数，没有支持内容的字段使用空字符串。\n" if retry else ""
         return (
             "[DOCUMENT SYNTHESIS]\n"
             "根据以下完整文献的有序分块提取结果形成整篇文献档案。合并重复内容；若源文献不同部分存在矛盾，应保留并标明矛盾，不要自行裁决；不得编造。\n"
             "rating 仅表示该文献与当前研究项目的相关性和实用性；quality_assessment 单独评估严谨性、证据强度、局限，以及原文支持的时效性，不得将两者混为一项。\n"
             f"文献标题：{title}\n" + retry_note
-            + "仅输出完整 JSON 对象。rating 为 1–5 整数，category 缺失时使用 Other；没有材料支持的文字字段使用空字符串，不能编造，至少一个学术分析字段必须有实际内容。严格采用此形状：\n"
-            + '{"rating":4,"category":"Other","research_question":"","methods":"","sample":"","key_findings":"","limitations":"","quality_assessment":"","relevance_reason":"","summary":""}\n'
+            + "category 必须返回以下精确英文值之一：Empirical Study、Theoretical / Conceptual Study、Literature Review、Case Study、Policy / Official Document、Standard / Guideline、Data / Research Report、Thesis / Dissertation、Methodological Study、Other、Unclassified。Only use Other when the literature has been assessed and genuinely fits no listed category; use Unclassified when type evidence is insufficient. rating 为 1–5 整数；无材料支持字段使用空字符串，不编造。文字字段保持简洁，summary 不超过 1200 字。至少一个学术分析字段必须有实际内容。严格采用此形状：\n"
+            + '{"rating":4,"category":"Empirical Study","research_question":"","methods":"","sample":"","key_findings":"","limitations":"","quality_assessment":"","relevance_reason":"","summary":""}\n'
             + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
             "[ORDERED CHUNK EXTRACTIONS]\n" + ordered
         )
-    retry_note = "The previous output was invalid. Return valid JSON; rating must be an integer from 1 to 5, and unsupported text fields must be empty strings.\n" if retry else ""
+    retry_note = "The previous output was invalid or exceeded the output limit. Further compress every field, keep only the most important content, and close the JSON object completely; rating must be an integer from 1 to 5, and unsupported text fields must be empty strings.\n" if retry else ""
     return (
         "[DOCUMENT SYNTHESIS]\n"
         "Build one profile for the complete literature document from all ordered chunk extractions below. Merge duplicates, preserve conflicts present in the source instead of resolving them, and do not fabricate.\n"
         "The rating measures relevance and usefulness to the current research project. Assess intrinsic quality separately in quality_assessment: rigor, evidence strength, limitations, and timeliness only when supported by the source.\n"
         f"Title: {title}\n" + retry_note
-        + "Return one complete JSON object. rating must be an integer from 1 to 5; use category Other if absent. Use empty strings for unsupported text fields, do not invent content, and ensure at least one academic analysis field contains meaningful content. Use exactly this shape:\n"
-        + '{"rating":4,"category":"Other","research_question":"","methods":"","sample":"","key_findings":"","limitations":"","quality_assessment":"","relevance_reason":"","summary":""}\n'
+        + "Choose category only from Empirical Study, Theoretical / Conceptual Study, Literature Review, Case Study, Policy / Official Document, Standard / Guideline, Data / Research Report, Thesis / Dissertation, Methodological Study, Other, or Unclassified. Only use Other when the literature has been assessed and genuinely fits no listed category; use Unclassified when category evidence is insufficient. Rating must be an integer from 1 to 5. Leave unsupported fields empty, do not invent content, keep text concise, and keep summary within 1200 characters. At least one academic analysis field must contain meaningful content. Use exactly this shape:\n"
+        + '{"rating":4,"category":"Empirical Study","research_question":"","methods":"","sample":"","key_findings":"","limitations":"","quality_assessment":"","relevance_reason":"","summary":""}\n'
         + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
         "[ORDERED CHUNK EXTRACTIONS]\n" + ordered
     )
@@ -244,9 +279,11 @@ def _response_diagnostic(result, *, retry_count=0, top_level_shape=None):
     }
 
 
-def _call_json_with_retry(llm_call, prompt_factory, attempts=2, validator=None, *, token_budgets=(2200, 4000)):
+def _call_json_with_retry(
+    llm_call, prompt_factory, attempts=2, validator=None, *, token_budgets=(2200,), retry_on_length=True,
+):
     business_attempts = max(1, min(2, int(attempts)))
-    budgets = tuple(max(1, int(value)) for value in token_budgets) or (2200, 4000)
+    budgets = tuple(max(1, int(value)) for value in token_budgets) or (2200,)
     last_stage = "invalid_structured_output"
     last_diagnostic = {}
     for attempt in range(business_attempts):
@@ -269,7 +306,7 @@ def _call_json_with_retry(llm_call, prompt_factory, attempts=2, validator=None, 
             last_stage = "truncated_output"
             last_diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries)
             last_diagnostic["failure_code"] = last_stage
-            if attempt + 1 < business_attempts:
+            if retry_on_length and attempt + 1 < business_attempts:
                 continue
             break
         if finish_reason != "stop":
@@ -388,6 +425,18 @@ def _first_text_alias(value, aliases):
     return ""
 
 
+def _first_exact_text_alias(value, aliases):
+    """Read a provenance quote without trimming, flattening, or rewriting its text."""
+    for alias in aliases:
+        if alias not in value:
+            continue
+        raw = value[alias]
+        if raw is None:
+            return ""
+        return raw if isinstance(raw, str) else None
+    return ""
+
+
 def normalize_chunk_extraction(value):
     """Normalize optional per-chunk dimensions while requiring meaningful content."""
     if not isinstance(value, dict):
@@ -422,7 +471,7 @@ def normalize_chunk_extraction(value):
                 "evidence_text": ("evidence_text", "evidence", "quote", "quotation", "source_quote"),
             }
             for name, fields in aliases.items():
-                text = _first_text_alias(claim, fields)
+                text = _first_exact_text_alias(claim, fields) if name == "evidence_text" else _first_text_alias(claim, fields)
                 if text is None:
                     return None
                 item[name] = text
@@ -457,14 +506,16 @@ def normalize_profile(value):
     if not 1 <= rating <= 5:
         return None
 
-    category = "Other"
+    category = "Unclassified"
     for alias in ("category", "type", "literature_type"):
         if alias not in value or value[alias] is None:
             continue
         raw_category = value[alias]
         if not isinstance(raw_category, str):
             return None
-        category = raw_category.strip() or "Other"
+        candidate = raw_category.strip()
+        if candidate:
+            category = CATEGORY_ALIASES.get(candidate.casefold(), "Unclassified")
         break
     profile = {}
     for key in _PROFILE_TEXT_FIELDS:
@@ -476,6 +527,147 @@ def normalize_profile(value):
         return None
     profile.update({"rating": rating, "category": category, "analysis_status": "ok"})
     return profile
+
+
+def split_source_chunk_for_retry(text):
+    """Split source text into two exact ordered pieces, preferring natural boundaries."""
+    if not isinstance(text, str) or len(text) < 2:
+        raise ValueError("source text is too short to split")
+    midpoint = len(text) // 2
+    lower = max(1, int(len(text) * 0.20))
+    upper = min(len(text) - 1, int(len(text) * 0.80))
+    patterns = (
+        r"\n[ \t]*\n",
+        r"(?<=[.!?。！？])\s+",
+        r"\r?\n",
+        r"\s+",
+    )
+    for pattern in patterns:
+        candidates = [match.end() for match in re.finditer(pattern, text) if lower <= match.end() <= upper]
+        if candidates:
+            split_at = min(candidates, key=lambda position: (abs(position - midpoint), position))
+            return text[:split_at], text[split_at:]
+    return text[:midpoint], text[midpoint:]
+
+
+def build_reduction_prompt(title, extractions, level, locale="en", retry=False):
+    """Ask for a compact ordered digest of extraction data without evidence quotations."""
+    projection = []
+    for item in extractions:
+        extraction = item.get("extraction", item) if isinstance(item, dict) else {}
+        locator = item.get("source_locator", "") if isinstance(item, dict) else ""
+        if not isinstance(extraction, dict):
+            continue
+        projection.append({
+            "source_locator": str(locator),
+            **{field: extraction.get(field, "") for field in _CHUNK_TEXT_FIELDS},
+            "claims": [
+                {"section": claim.get("section", ""), "claim": claim.get("claim", "")}
+                for claim in extraction.get("claims", []) if isinstance(claim, dict)
+            ],
+        })
+    ordered = json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
+    if locale == "zh":
+        retry_note = "上次输出无效，请保持内容简洁并修正 JSON。\n" if retry else ""
+        return (
+            "[DOCUMENT SYNTHESIS REDUCTION]\n"
+            f"文献：{title}；归并层级：{level}。按输入顺序合并以下文献提取摘要，去除重复；若信息冲突则保留冲突，不要裁决或编造。"
+            "只保留后续整篇档案所需的研究问题、理论、方法、样本、数据、结果、主张、局限、结论与定义。尽量简短。"
+            "输入不包含证据引文；不得生成 evidence_text。仅输出完整 JSON，形状为：\n"
+            '{"research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[{"section":"","claim":"","evidence_text":""}],"limitations":"","conclusion":"","definitions":""}\n'
+            + retry_note + "[ORDERED DIGESTS]\n" + ordered
+        )
+    retry_note = "The previous output was invalid. Keep the digest concise and correct the JSON.\n" if retry else ""
+    return (
+        "[DOCUMENT SYNTHESIS REDUCTION]\n"
+        f"Literature: {title}; reduction level: {level}. Merge these ordered extraction digests, remove duplicates, preserve source conflicts without resolving them, and do not fabricate. "
+        "Retain only research questions, theory, methods, samples, data, results, claims, limitations, conclusions, and definitions needed for the final full-document profile. Keep it compact. "
+        "The input contains no evidence quotations; do not create evidence_text. Return only a complete JSON object with this shape:\n"
+        '{"research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[{"section":"","claim":"","evidence_text":""}],"limitations":"","conclusion":"","definitions":""}\n'
+        + retry_note + "[ORDERED DIGESTS]\n" + ordered
+    )
+
+
+def _reduction_extraction(value):
+    normalized = normalize_chunk_extraction(value)
+    if normalized is None:
+        return None
+    normalized["claims"] = [
+        {"section": item["section"], "claim": item["claim"], "evidence_text": ""}
+        for item in normalized["claims"]
+    ]
+    return normalized
+
+
+def _serialized_extractions_size(extractions):
+    return len(json.dumps(extractions, ensure_ascii=False, separators=(",", ":")))
+
+
+def _pack_reduction_groups(extractions, max_chars=MAX_REDUCTION_GROUP_CHARS):
+    groups = []
+    current = []
+    current_size = 2
+    for item in extractions:
+        item_size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":"))) + 1
+        if current and current_size + item_size > max_chars:
+            groups.append(current)
+            current = []
+            current_size = 2
+        current.append(item)
+        current_size += item_size
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _reduce_extraction_group(llm_call, title, group, level, locale):
+    try:
+        reduced = _call_json_with_retry(
+            llm_call,
+            lambda retry: build_reduction_prompt(title, group, level, locale, retry),
+            MAX_CHUNK_ATTEMPTS,
+            validator=_reduction_extraction,
+            token_budgets=(LITERATURE_REDUCTION_TOKEN_BUDGET,),
+            retry_on_length=False,
+        )
+        locator = group[0].get("source_locator", "") if len(group) == 1 else f"reduction {level}"
+        return [{"source_locator": locator, "extraction": reduced}]
+    except _StructuredCallFailure as exc:
+        if exc.failure_code == "truncated_output" and len(group) > 1:
+            midpoint = len(group) // 2
+            return (
+                _reduce_extraction_group(llm_call, title, group[:midpoint], level, locale)
+                + _reduce_extraction_group(llm_call, title, group[midpoint:], level, locale)
+            )
+        diagnostic = dict(exc.diagnostic)
+        diagnostic.update({"stage": "synthesis_reduction", "reduction_level": level})
+        diagnostic["failure_code"] = "synthesis_reduction_failure"
+        diagnostic["reduction_failure_code"] = exc.failure_code
+        raise _StructuredCallFailure("synthesis_reduction_failure", "synthesis_reduction_failure", diagnostic) from None
+
+
+def _hierarchically_reduce_extractions(llm_call, title, extractions, locale):
+    current = list(extractions)
+    for level in range(1, MAX_REDUCTION_LEVELS + 1):
+        if _serialized_extractions_size(current) <= MAX_SYNTHESIS_INPUT_CHARS:
+            return current
+        previous_size = _serialized_extractions_size(current)
+        next_level = []
+        for group in _pack_reduction_groups(current):
+            next_level.extend(_reduce_extraction_group(llm_call, title, group, level, locale))
+        next_size = _serialized_extractions_size(next_level)
+        if len(next_level) >= len(current) and next_size >= previous_size:
+            raise _StructuredCallFailure(
+                "synthesis_reduction_failure", "synthesis_reduction_failure",
+                {"stage": "synthesis_reduction", "reduction_level": level, "failure_code": "synthesis_reduction_failure"},
+            )
+        current = next_level
+        if next_size <= MAX_SYNTHESIS_INPUT_CHARS:
+            return current
+    raise _StructuredCallFailure(
+        "synthesis_reduction_failure", "synthesis_reduction_failure",
+        {"stage": "synthesis_reduction", "reduction_level": MAX_REDUCTION_LEVELS, "failure_code": "synthesis_reduction_failure"},
+    )
 
 
 def analyze_literature_document(document_text, title, llm_call, *, locale="en", max_chars=DEFAULT_CHUNK_CHARS, research_topic="", research_context=""):
@@ -495,64 +687,92 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
     chunks = chunk_document_text(document_text, max_chars=max_chars)
     extractions = []
     evidence = []
-    for index, chunk in enumerate(chunks, 1):
+
+    def extract_tree(source_chunk, chunk_index, locator, split_depth):
         try:
             parsed = _call_json_with_retry(
                 llm_call,
-                lambda retry, chunk=chunk, index=index: build_chunk_extraction_prompt(title, chunk, index, len(chunks), locale, retry),
+                lambda retry: build_chunk_extraction_prompt(
+                    title, source_chunk, chunk_index, len(chunks), locale, retry, source_locator=locator,
+                ),
                 MAX_CHUNK_ATTEMPTS,
                 validator=_validate_chunk_extraction,
-                token_budgets=LITERATURE_CHUNK_TOKEN_BUDGETS,
+                token_budgets=(LITERATURE_CHUNK_TOKEN_BUDGETS[0],),
+                retry_on_length=False,
             )
+            return [(parsed, source_chunk, locator)]
         except _StructuredCallFailure as exc:
+            can_split = (
+                exc.failure_code == "truncated_output"
+                and split_depth < MAX_SOURCE_SPLIT_DEPTH
+                and len(source_chunk) >= MIN_SOURCE_SPLIT_CHARS * 2
+            )
+            if can_split:
+                left, right = split_source_chunk_for_retry(source_chunk)
+                if left and right:
+                    return (
+                        extract_tree(left, chunk_index, f"{locator}.1", split_depth + 1)
+                        + extract_tree(right, chunk_index, f"{locator}.2", split_depth + 1)
+                    )
             diagnostic = {
                 "stage": "chunk",
-                "chunk_index": index,
+                "chunk_index": chunk_index,
                 "chunks_total": len(chunks),
-                "failure_code": exc.failure_code,
+                "source_locator": locator,
+                "source_chars": len(source_chunk),
+                "split_depth": split_depth,
                 **exc.diagnostic,
+                "failure_code": exc.failure_code,
             }
+            raise _StructuredCallFailure(exc.failure_stage, exc.failure_code, diagnostic) from None
+
+    for index, chunk in enumerate(chunks, 1):
+        try:
+            leaves = extract_tree(chunk, index, str(index), 0)
+        except _StructuredCallFailure as exc:
             return {
                 "status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks),
                 "failed_chunk": index, "failure_stage": exc.failure_stage,
                 "failure_code": exc.failure_code,
-                "diagnostic": diagnostic,
+                "diagnostic": exc.diagnostic,
                 "message": "A literature source chunk could not be analyzed; no partial analysis was stored.",
             }
-        extraction = parsed
-        extractions.append(extraction)
-        for claim in extraction["claims"]:
-            claim_text = str(claim.get("claim", "") or "").strip()
-            quote = str(claim.get("evidence_text", "") or "").strip()
-            # Store only quotations that can be located verbatim in this source chunk.
-            if not claim_text or not quote or quote not in chunk:
-                continue
-            evidence.append({
-                "literature_id": "",
-                "chunk_index": index,
-                "section": str(claim.get("section", "") or "").strip(),
-                "claim": claim_text[:500],
-                "evidence_text": quote[:MAX_EVIDENCE_CHARS],
-                "source_locator": f"chunk {index}",
-            })
+        for extraction, source_chunk, locator in leaves:
+            extractions.append({"source_locator": locator, "extraction": extraction})
+            for claim in extraction["claims"]:
+                claim_text = str(claim.get("claim", "") or "").strip()
+                quote = claim.get("evidence_text", "")
+                # Validate and retain the original quote unchanged; never store a clipped paraphrase.
+                if not claim_text or not isinstance(quote, str) or not quote or len(quote) > MAX_EVIDENCE_CHARS or quote not in source_chunk:
+                    continue
+                evidence.append({
+                    "literature_id": "",
+                    "chunk_index": index,
+                    "section": str(claim.get("section", "") or "").strip(),
+                    "claim": claim_text[:500],
+                    "evidence_text": quote,
+                    "source_locator": f"chunk {locator}",
+                })
     try:
+        synthesis_inputs = _hierarchically_reduce_extractions(llm_call, title, extractions, locale)
         profile_raw = _call_json_with_retry(
             llm_call,
             lambda retry: build_synthesis_prompt(
-                title, extractions, locale, retry,
+                title, synthesis_inputs, locale, retry,
                 research_topic=research_topic, research_context=research_context,
             ),
             MAX_SYNTHESIS_ATTEMPTS,
             validator=normalize_profile,
             token_budgets=LITERATURE_SYNTHESIS_TOKEN_BUDGETS,
+            retry_on_length=True,
         )
     except _StructuredCallFailure as exc:
         diagnostic = {
-            "stage": "synthesis",
+            "stage": exc.diagnostic.get("stage", "synthesis"),
             "chunk_index": None,
             "chunks_total": len(chunks),
-            "failure_code": exc.failure_code,
             **exc.diagnostic,
+            "failure_code": exc.failure_code,
         }
         return {
             "status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks),

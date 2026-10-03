@@ -245,7 +245,7 @@ class LiteraturePartialSchemaTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["profile"]["rating"], 4)
-        self.assertEqual(result["profile"]["category"], "Other")
+        self.assertEqual(result["profile"]["category"], "Unclassified")
         self.assertEqual(result["profile"]["methods"], "")
         self.assertEqual(sum("[SOURCE CHUNK " in prompt for prompt in calls), 1)
         self.assertEqual(sum("[DOCUMENT SYNTHESIS]" in prompt for prompt in calls), 1)
@@ -326,7 +326,7 @@ class LiteraturePartialSchemaTests(unittest.TestCase):
         profile = normalize({"rating": "4", "summary": "Synthesized"})
 
         self.assertEqual(profile["rating"], 4)
-        self.assertEqual(profile["category"], "Other")
+        self.assertEqual(profile["category"], "Unclassified")
         self.assertEqual(profile["methods"], "")
         self.assertEqual(profile["summary"], "Synthesized")
 
@@ -371,7 +371,7 @@ class LiteraturePartialSchemaTests(unittest.TestCase):
         self.assertEqual(sum("[SOURCE CHUNK " in prompt for prompt in prompts), 3)
         self.assertEqual(len(result["evidence"]), 1)
         self.assertEqual(result["evidence"][0]["evidence_text"], "EXACT_QUOTE_SENTINEL")
-        self.assertEqual(result["profile"]["category"], "Other")
+        self.assertEqual(result["profile"]["category"], "Unclassified")
 
         existing = {"id": "same-lit-id", "title": "DeepSeek fixture", "analysis": {"summary": "old"}}
         updated, evidence_store, success = apply_analysis_to_literature_record(existing, {}, result)

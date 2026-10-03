@@ -57,7 +57,14 @@ from format_support import (
 from word_export_support import render_manuscript_docx
 from research_ui_support import render_research_foundation
 from academic_context_support import attach_chapter_grounding
-from literature_ui_support import render_legacy_reanalysis, render_literature_ingestion
+from literature_ui_support import (
+    display_literature_category,
+    literature_importance_control,
+    literature_summary_for_display,
+    render_legacy_reanalysis,
+    render_literature_ingestion,
+    toggle_literature_importance,
+)
 from format_ui_support import render_format_spec_controls
 from outline_support import (
     extract_docx_manuscript_text,
@@ -1464,28 +1471,30 @@ def module3_literature():
         # 统计概览
         cats = {}
         for lit in literatures:
-            category = lit.get("category", "Other")
+            category = lit.get("category", "Unclassified")
             if lit.get("analysis_status") == "unavailable":
                 category = "Unrated"
+            else:
+                category = display_literature_category(category, "en")
             cats[category] = cats.get(category, 0) + 1
-        st.caption("Category stats: " + " | ".join([f"{k} × {v}" for k, v in cats.items()]))
+        st.caption("Literature type stats: " + " | ".join([f"{k} × {v}" for k, v in cats.items()]))
 
         for idx, lit in enumerate(literatures):
             with st.container(border=True):
                 stars = "⭐" * int(lit.get("rating", 0))
-                star_prefix = "⭐⭐⭐ " if lit.get("important", False) else ""
-                c_head, c_star, c_del = st.columns([6, 1, 1])
+                important_prefix = "📌 " if lit.get("important", False) else ""
+                c_head, c_star, c_del = st.columns([6, 2, 1])
                 with c_head:
-                    st.markdown(f"#### {star_prefix}{lit['title']}")
-                    display_category = "Unrated" if lit.get("analysis_status") == "unavailable" else lit.get("category", "Other")
-                    st.markdown(f"**Relevance to current research**: {stars} | **Category**: `{display_category}`")
+                    st.markdown(f"#### {important_prefix}{lit['title']}")
+                    display_category = "Unrated" if lit.get("analysis_status") == "unavailable" else display_literature_category(lit.get("category", "Unclassified"), "en")
+                    st.markdown(f"**Relevance to current research**: {stars} | **Literature type**: `{display_category}`")
                     if lit.get("analysis_status") == "unavailable":
                         st.caption("AI rating unavailable for this imported reference.")
                     with st.expander("👁️ View LLM Summary & Original Text", expanded=False):
                         st.markdown(f"**Key findings**: {lit.get('analysis',{}).get('key_findings','-')}")
                         st.markdown(f"**Relevance reason**: {lit.get('analysis',{}).get('relevance_reason','-')}")
                         st.markdown(f"**Quality assessment**: {lit.get('analysis',{}).get('quality_assessment','-')}")
-                        st.markdown(f"**Abstract**: {lit.get('analysis',{}).get('summary', lit['summary'][:200])}")
+                        st.markdown(f"**Abstract**: {literature_summary_for_display(lit, 'en')}")
                         # 本地文件查看：直接调用系统默认文档查看工具打开
                         fp = lit.get("file_path", "")
                         if fp and os.path.exists(fp):
@@ -1520,8 +1529,9 @@ def module3_literature():
                             "en", research_topic=research_topic, research_context=research_context,
                         )
                 with c_star:
-                    if st.button("🌟", key=f"litstar_{lit['id']}"):
-                        lit['important'] = not lit.get('important', False)
+                    label, help_text = literature_importance_control(lit, "en")
+                    if st.button(label, key=f"litstar_{lit['id']}", help=help_text):
+                        toggle_literature_importance(lit)
                         save_json_file("literatures.json", literatures)
                         st.rerun()
                 with c_del:

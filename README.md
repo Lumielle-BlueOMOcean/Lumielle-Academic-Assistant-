@@ -118,6 +118,9 @@ DeepSeek App/web free chat is separate from the Open Platform API. API access de
 - Failure messages now distinguish provider calls, malformed or empty output, schema validation, and full-document synthesis without exposing raw provider errors. / 失败提示现在区分服务调用、格式异常或空内容、结构校验和全文合并阶段，且不暴露原始服务错误。
 - Research Grounding section controls are bulk-selection shortcuts and defaults for new facts, not hard gates; every fact can be selected independently. / 科研基座分区 Grounding 控件现在用于批量选择并设置新事实默认值，不再是硬门禁；每条事实始终可以独立选择。
 - Literature structured analysis now detects truncated output, applies bounded retries for transient provider failures, normalizes common schema variants deterministically, and reports safe per-file batch diagnostics. Exact source-quote matching remains required for evidence. / 文献结构化分析现在可识别输出截断，对暂时性服务故障进行有界重试，确定性规范化常见结构变体，并按文件报告安全诊断；证据仍必须精确匹配原文引文。
+- Long literature chunks are now split at ordered source boundaries after length-limited responses, and oversized extraction sets are compacted through bounded hierarchical synthesis without increasing model token budgets. / 文献分块遇到长度限制时会按原文顺序拆分，过长的提取集合会经过有界分层归并；模型 token 预算不因此提高。
+- Literature categories now distinguish Unclassified (insufficient category evidence) from Other (assessed, but no listed category fits); category labels are localized in the Chinese library. / 文献分类区分“未分类”（分类依据不足）与“其他”（已评估但不适用其他类别），并在中文版文献库中显示本地化名称。
+- Incomplete literature analyses no longer display an imported-text prefix as an AI summary. The library now uses a pin icon and explicit control help for important references. / 文献分析未完成时不再把导入原文开头显示为 AI 摘要；重点文献改用图钉图标，并提供明确的操作说明。
 
 ### v1.1.0 — 2026-09-29
 

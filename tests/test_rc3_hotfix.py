@@ -364,10 +364,10 @@ class LiteratureRobustnessRc3Tests(unittest.TestCase):
                 synthesis = literature.build_synthesis_prompt("Study", [{"results": "A"}], locale)
                 for field in ('"research_question":""', '"evidence_text":""', '"claims":['):
                     self.assertIn(field, chunk)
-                for field in ('"rating":4', '"category":"Other"', '"summary":""'):
+                for field in ('"rating":4', '"category":"Empirical Study"', '"summary":""'):
                     self.assertIn(field, synthesis)
 
-    def test_length_response_retries_once_with_larger_chunk_budget(self):
+    def test_unsplittable_short_chunk_length_fails_without_budget_escalation(self):
         calls = []
 
         def llm(prompt, **kwargs):
@@ -381,12 +381,11 @@ class LiteratureRobustnessRc3Tests(unittest.TestCase):
         with patch.object(literature.time, "sleep"):
             result = analyze_literature_document("EXACT SOURCE QUOTE", "Study", llm, max_chars=500)
         chunk_budgets = [kwargs["max_tokens"] for prompt, kwargs in calls if "[SOURCE CHUNK" in prompt]
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(len(chunk_budgets), 2)
-        self.assertGreater(chunk_budgets[1], chunk_budgets[0])
+        self.assertEqual(result["failure_code"], "truncated_output")
+        self.assertEqual(len(chunk_budgets), 1)
         self.assertGreater(chunk_budgets[0], 1400)
 
-    def test_synthesis_length_retry_uses_its_own_larger_budget(self):
+    def test_synthesis_length_retry_uses_the_same_fixed_budget(self):
         calls = []
 
         def llm(prompt, **kwargs):
@@ -401,7 +400,7 @@ class LiteratureRobustnessRc3Tests(unittest.TestCase):
         result = analyze_literature_document("EXACT SOURCE QUOTE", "Study", llm, max_chars=500)
         budgets = [kwargs["max_tokens"] for prompt, kwargs in calls if "[DOCUMENT SYNTHESIS]" in prompt]
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(budgets, [2600, 4000])
+        self.assertEqual(budgets, [2600, 2600])
 
     def test_repeated_length_response_fails_as_truncated_output_with_safe_diagnostic(self):
         calls = []
@@ -416,7 +415,7 @@ class LiteratureRobustnessRc3Tests(unittest.TestCase):
         self.assertEqual(result["diagnostic"]["finish_reason"], "length")
         self.assertEqual(result["diagnostic"]["chunk_index"], 1)
         self.assertNotIn("PRIVATE SOURCE TEXT", repr(result))
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
 
     def test_all_transient_attempts_are_bounded_and_diagnostic_reports_retries(self):
         calls = []
