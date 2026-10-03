@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 
@@ -12,12 +13,18 @@ from context_digest_support import balanced_excerpt
 from document_support import DEFAULT_CHUNK_CHARS, chunk_document_text
 from relevance_support import multilingual_terms
 from writing_support import LLMOutputError, require_valid_llm_output
-from structured_output_support import parse_first_json_value
+from structured_output_support import classify_provider_exception, parse_first_json_value
 
 
 MAX_CHUNK_ATTEMPTS = 2
 MAX_SYNTHESIS_ATTEMPTS = 2
 MAX_EVIDENCE_CHARS = 1800
+MAX_TRANSPORT_ATTEMPTS = 3
+TRANSPORT_RETRY_BACKOFF_SECONDS = (1, 2)
+LITERATURE_CHUNK_TOKEN_BUDGETS = (2200, 4000)
+LITERATURE_SYNTHESIS_TOKEN_BUDGETS = (2600, 4000)
+TRANSIENT_PROVIDER_ERRORS = frozenset({"rate_limited", "timeout", "connection_error", "server_error"})
+TRANSIENT_FINISH_REASONS = frozenset({"insufficient_system_resource", "aborted"})
 
 
 def _json_object(response):
@@ -26,9 +33,11 @@ def _json_object(response):
 
 
 class _StructuredCallFailure(LLMOutputError):
-    def __init__(self, failure_stage):
+    def __init__(self, failure_stage, failure_code=None, diagnostic=None):
         super().__init__(failure_stage)
         self.failure_stage = failure_stage
+        self.failure_code = failure_code or failure_stage
+        self.diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
 
 
 def build_chunk_extraction_prompt(title, chunk, index, total, locale="en", retry=False):
@@ -37,14 +46,16 @@ def build_chunk_extraction_prompt(title, chunk, index, total, locale="en", retry
         return (
             "你是严谨的学术文献分析器。只提取本分块明确陈述的内容，不推测缺失结论，也不补全其他分块的信息。\n"
             f"文献标题：{title}\n本分块：{index}/{total}\n"
-            "尽可能提取研究问题、理论、方法、样本、数据、结果、明确主张、局限、结论和重要定义。只返回本分块实际支持的字段；不适用于本分块的字段可以省略，claims 可以省略或为空数组。每项主张尽可能附带原文短引句；不得编造事实或引文。只输出 JSON 对象，各字段使用 research_question、theory、method、sample、data、results、claims、limitations、conclusion、definitions。claims 为含 section、claim、evidence_text 的数组。\n"
+            "尽可能提取本分块实际支持的研究问题、理论、方法、样本、数据、结果、明确主张、局限、结论和重要定义。缺少的文字字段使用空字符串，没有主张使用空数组。每项主张尽可能附带原文短引句；evidence_text 必须是原文连续短引文。不得编造事实或引文。严格返回以下完整 JSON 形状：\n"
+            '{"research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[{"section":"","claim":"","evidence_text":""}],"limitations":"","conclusion":"","definitions":""}\n'
             + retry_note + f"[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
         )
     retry_note = "The previous output was invalid. Re-extract only from this chunk and return valid JSON.\n" if retry else ""
     return (
         "You are a careful academic literature analyst. Extract only information explicitly stated in this source chunk. Do not infer missing conclusions or complete material from other chunks.\n"
         f"Title: {title}\nSource chunk: {index}/{total}\n"
-        "Extract whichever of the research question, theory, method, sample, data, results, explicit claims, limitations, conclusion, and important definitions this chunk actually supports. Omit fields that do not apply to this chunk; claims may be omitted or an empty array. Attach a short exact source quotation to a claim when possible. Do not invent facts or quotations. Return one JSON object using research_question, theory, method, sample, data, results, claims, limitations, conclusion, and definitions. claims is an array of {section, claim, evidence_text}.\n"
+        "Extract only the academic dimensions supported by this chunk. Use an empty string for text fields with no support and an empty array when there are no claims. Any evidence_text must be a short exact quotation copied from this source chunk. Do not invent facts or quotations. Return exactly this complete JSON shape:\n"
+        '{"research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[{"section":"","claim":"","evidence_text":""}],"limitations":"","conclusion":"","definitions":""}\n'
         + retry_note + f"[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
     )
 
@@ -55,98 +66,326 @@ def build_synthesis_prompt(title, extractions, locale="en", retry=False, *, rese
         for index, item in enumerate(extractions, 1)
     )
     if locale == "zh":
-        retry_note = "上次输出无效，请只输出合法 JSON；rating 必须为 1–5 整数，未提供的文字字段可以省略。\n" if retry else ""
+        retry_note = "上次输出无效，请只输出合法 JSON；rating 必须为 1–5 整数，没有支持内容的字段使用空字符串。\n" if retry else ""
         return (
             "[DOCUMENT SYNTHESIS]\n"
             "根据以下完整文献的有序分块提取结果形成整篇文献档案。合并重复内容；若源文献不同部分存在矛盾，应保留并标明矛盾，不要自行裁决；不得编造。\n"
             "rating 仅表示该文献与当前研究项目的相关性和实用性；quality_assessment 单独评估严谨性、证据强度、局限，以及原文支持的时效性，不得将两者混为一项。\n"
             f"文献标题：{title}\n" + retry_note
-            + "仅输出 JSON 对象。rating 为必需的 1–5 整数；category 可省略。research_question、methods、sample、key_findings、limitations、quality_assessment、relevance_reason、summary 只填写有材料支持的文字字段，没有内容的字段可以省略。\n"
+            + "仅输出完整 JSON 对象。rating 为 1–5 整数，category 缺失时使用 Other；没有材料支持的文字字段使用空字符串，不能编造，至少一个学术分析字段必须有实际内容。严格采用此形状：\n"
+            + '{"rating":4,"category":"Other","research_question":"","methods":"","sample":"","key_findings":"","limitations":"","quality_assessment":"","relevance_reason":"","summary":""}\n'
             + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
             "[ORDERED CHUNK EXTRACTIONS]\n" + ordered
         )
-    retry_note = "The previous output was invalid. Return valid JSON; rating must be an integer from 1 to 5, and unsupported text fields may be omitted.\n" if retry else ""
+    retry_note = "The previous output was invalid. Return valid JSON; rating must be an integer from 1 to 5, and unsupported text fields must be empty strings.\n" if retry else ""
     return (
         "[DOCUMENT SYNTHESIS]\n"
         "Build one profile for the complete literature document from all ordered chunk extractions below. Merge duplicates, preserve conflicts present in the source instead of resolving them, and do not fabricate.\n"
         "The rating measures relevance and usefulness to the current research project. Assess intrinsic quality separately in quality_assessment: rigor, evidence strength, limitations, and timeliness only when supported by the source.\n"
         f"Title: {title}\n" + retry_note
-        + "Return only a JSON object. rating is required and must be an integer from 1 to 5; category may be omitted. Include only supported text fields among research_question, methods, sample, key_findings, limitations, quality_assessment, relevance_reason, and summary; omit fields with no content.\n"
+        + "Return one complete JSON object. rating must be an integer from 1 to 5; use category Other if absent. Use empty strings for unsupported text fields, do not invent content, and ensure at least one academic analysis field contains meaningful content. Use exactly this shape:\n"
+        + '{"rating":4,"category":"Other","research_question":"","methods":"","sample":"","key_findings":"","limitations":"","quality_assessment":"","relevance_reason":"","summary":""}\n'
         + f"[GLOBAL RESEARCH TOPIC]\n{research_topic}\n\n[RESEARCH PLANNING CONTEXT]\n{research_context}\n\n"
         "[ORDERED CHUNK EXTRACTIONS]\n" + ordered
     )
 
 
-def _checked_call(llm_call, prompt):
-    try:
-        response = llm_call(prompt, max_tokens=1400, json_mode=True)
-    except Exception:
-        # Provider details may contain request data or credentials; keep them out of results/UI.
-        raise _StructuredCallFailure("provider_call") from None
-    if not isinstance(response, str) or not response.strip():
-        raise _StructuredCallFailure("empty_structured_output")
-    try:
-        return require_valid_llm_output(response).strip()
-    except LLMOutputError:
-        # Application adapters encode provider errors as known, credential-safe strings.
-        raise _StructuredCallFailure("provider_call") from None
+_PROVIDER_ERROR_CODES = TRANSIENT_PROVIDER_ERRORS | frozenset({
+    "authentication_failed", "insufficient_balance", "model_not_available",
+    "invalid_request", "provider_error", "incomplete_response", "content_filtered",
+    "insufficient_system_resource", "aborted",
+})
+_SAFE_FINISH_REASONS = frozenset({
+    "stop", "length", "content_filter", "insufficient_system_resource", "aborted",
+})
 
 
-def _call_json_with_retry(llm_call, prompt_factory, attempts=2, validator=None):
-    last_stage = "invalid_structured_output"
-    for attempt in range(attempts):
+def _safe_finish_reason(value):
+    if not isinstance(value, str):
+        return None
+    return value if value in _SAFE_FINISH_REASONS else "unknown"
+
+
+def _coerce_structured_result(value):
+    if isinstance(value, str):
+        if not value.strip():
+            return {
+                "content": "", "finish_reason": "stop", "structured_mode": "legacy",
+                "http_status": None, "error_code": None,
+            }
         try:
-            response = _checked_call(llm_call, prompt_factory(attempt == 1))
+            content = require_valid_llm_output(value).strip()
+        except LLMOutputError:
+            raise _StructuredCallFailure("provider_call", "provider_error") from None
+        return {
+            "content": content, "finish_reason": "stop", "structured_mode": "legacy",
+            "http_status": None, "error_code": None,
+        }
+    if not isinstance(value, dict) or "content" not in value:
+        raise _StructuredCallFailure("provider_call", "incomplete_response")
+    content = value.get("content")
+    mode = value.get("structured_mode")
+    status = value.get("http_status")
+    error_code = value.get("error_code")
+    return {
+        "content": content if isinstance(content, str) else "",
+        "finish_reason": _safe_finish_reason(value.get("finish_reason")),
+        "structured_mode": mode if isinstance(mode, str) and mode in {"native", "compatibility", "legacy"} else "unknown",
+        "http_status": status if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599 else None,
+        "error_code": error_code if isinstance(error_code, str) and error_code in _PROVIDER_ERROR_CODES else ("provider_error" if error_code else None),
+    }
+
+
+def _safe_exception_status(exc):
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599 else None
+
+
+def _checked_call(llm_call, prompt, max_tokens):
+    try:
+        value = llm_call(prompt, max_tokens=max_tokens, json_mode=True, return_metadata=True)
+    except Exception as exc:
+        diagnostic = {
+            "finish_reason": None,
+            "http_status": _safe_exception_status(exc),
+            "response_chars": 0,
+            "structured_mode": "unknown",
+        }
+        raise _StructuredCallFailure("provider_call", classify_provider_exception(exc), diagnostic) from None
+    try:
+        return _coerce_structured_result(value)
+    except _StructuredCallFailure as exc:
+        if exc.diagnostic:
+            raise
+        diagnostic = {
+            "finish_reason": None,
+            "http_status": None,
+            "response_chars": 0,
+            "structured_mode": "unknown",
+        }
+        raise _StructuredCallFailure(exc.failure_stage, exc.failure_code, diagnostic) from None
+
+
+def _retryable_provider_error(code):
+    return code in TRANSIENT_PROVIDER_ERRORS or code in TRANSIENT_FINISH_REASONS
+
+
+def _call_with_transport_retry(llm_call, prompt, max_tokens):
+    retry_count = 0
+    for transport_attempt in range(MAX_TRANSPORT_ATTEMPTS):
+        try:
+            result = _checked_call(llm_call, prompt, max_tokens)
         except _StructuredCallFailure as exc:
-            if exc.failure_stage == "provider_call":
-                # A transport/authentication failure is not a schema correction request.
-                raise
-            last_stage = exc.failure_stage
+            code = exc.failure_code or "provider_error"
+            diagnostic = dict(exc.diagnostic)
+            if _retryable_provider_error(code) and transport_attempt < MAX_TRANSPORT_ATTEMPTS - 1:
+                time.sleep(TRANSPORT_RETRY_BACKOFF_SECONDS[transport_attempt])
+                retry_count += 1
+                continue
+            diagnostic["retry_count"] = retry_count
+            diagnostic["failure_code"] = code
+            raise _StructuredCallFailure("provider_call", code, diagnostic) from None
+
+        code = result.get("error_code")
+        finish_reason = result.get("finish_reason")
+        transient_code = finish_reason if finish_reason in TRANSIENT_FINISH_REASONS else code
+        if transient_code:
+            if _retryable_provider_error(transient_code) and transport_attempt < MAX_TRANSPORT_ATTEMPTS - 1:
+                time.sleep(TRANSPORT_RETRY_BACKOFF_SECONDS[transport_attempt])
+                retry_count += 1
+                continue
+            diagnostic = _response_diagnostic(result, retry_count=retry_count)
+            diagnostic["failure_code"] = transient_code
+            raise _StructuredCallFailure("provider_call", transient_code, diagnostic)
+        return result, retry_count
+    raise _StructuredCallFailure("provider_call", "provider_error", {"retry_count": retry_count})
+
+
+def _safe_top_level_shape(value):
+    if not isinstance(value, dict):
+        return {"_top_level": "list" if isinstance(value, list) else type(value).__name__[:24]}
+    shape = {}
+    allowed_keys = {
+        alias.casefold()
+        for aliases in _CHUNK_FIELD_ALIASES.values()
+        for alias in aliases
+    } | {"claims", "rating", "category", "type", "literature_type"}
+    for key, item in list(value.items())[:24]:
+        if not isinstance(key, str) or key.casefold() not in allowed_keys:
             continue
-        parsed = parse_first_json_value(response)
+        if item is None:
+            kind = "null"
+        elif isinstance(item, bool):
+            kind = "bool"
+        elif isinstance(item, str):
+            kind = "str"
+        elif isinstance(item, dict):
+            kind = "dict"
+        elif isinstance(item, list):
+            kind = "list"
+        elif isinstance(item, (int, float)):
+            kind = "number"
+        else:
+            kind = "other"
+        shape[key] = kind
+    return shape
+
+
+def _response_diagnostic(result, *, retry_count=0, top_level_shape=None):
+    return {
+        "finish_reason": result.get("finish_reason"),
+        "http_status": result.get("http_status"),
+        "response_chars": len(result.get("content", "")),
+        "structured_mode": result.get("structured_mode", "unknown"),
+        "retry_count": retry_count,
+        "top_level_shape": top_level_shape if top_level_shape is not None else {},
+    }
+
+
+def _call_json_with_retry(llm_call, prompt_factory, attempts=2, validator=None, *, token_budgets=(2200, 4000)):
+    business_attempts = max(1, min(2, int(attempts)))
+    budgets = tuple(max(1, int(value)) for value in token_budgets) or (2200, 4000)
+    last_stage = "invalid_structured_output"
+    last_diagnostic = {}
+    for attempt in range(business_attempts):
+        try:
+            result, transport_retries = _call_with_transport_retry(
+                llm_call, prompt_factory(attempt > 0), budgets[min(attempt, len(budgets) - 1)],
+            )
+        except _StructuredCallFailure:
+            # Provider/transport failures already consumed their bounded retries.
+            # Do not add a schema-correction call on top of a failed provider call.
+            raise
+
+        content = result["content"]
+        finish_reason = result.get("finish_reason")
+        if finish_reason == "content_filter":
+            diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries)
+            diagnostic["failure_code"] = "content_filtered"
+            raise _StructuredCallFailure("content_filtered", "content_filtered", diagnostic)
+        if finish_reason == "length":
+            last_stage = "truncated_output"
+            last_diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries)
+            last_diagnostic["failure_code"] = last_stage
+            if attempt + 1 < business_attempts:
+                continue
+            break
+        if finish_reason != "stop":
+            last_stage = "incomplete_response"
+            last_diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries)
+            last_diagnostic["failure_code"] = last_stage
+            raise _StructuredCallFailure(last_stage, last_stage, last_diagnostic)
+        if not content.strip():
+            last_stage = "empty_structured_output"
+            last_diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries)
+            last_diagnostic["failure_code"] = last_stage
+            continue
+
+        parsed = parse_first_json_value(content)
         if parsed is None or not isinstance(parsed, dict):
             last_stage = "invalid_structured_output"
+            last_diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries)
+            last_diagnostic["top_level_shape"] = _safe_top_level_shape(parsed) if parsed is not None else {}
+            last_diagnostic["failure_code"] = last_stage
             continue
         if not parsed:
             last_stage = "empty_structured_output"
+            last_diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries, top_level_shape={})
+            last_diagnostic["failure_code"] = last_stage
             continue
-        if validator is not None:
-            validated = validator(parsed)
-            if validated is None:
-                last_stage = "schema_validation_failure"
-                continue
-            return validated
-        return parsed
-    raise _StructuredCallFailure(last_stage)
+        try:
+            validated = validator(parsed) if validator is not None else parsed
+        except Exception:
+            validated = None
+        if validated is None:
+            last_stage = "schema_validation_failure"
+            last_diagnostic = _response_diagnostic(
+                result, retry_count=attempt + transport_retries, top_level_shape=_safe_top_level_shape(parsed),
+            )
+            last_diagnostic["failure_code"] = last_stage
+            continue
+        return validated
+    raise _StructuredCallFailure(last_stage, last_stage, last_diagnostic)
 
 
 _CHUNK_TEXT_FIELDS = (
     "research_question", "theory", "method", "sample", "data", "results",
     "limitations", "conclusion", "definitions",
 )
+_CHUNK_FIELD_ALIASES = {
+    "research_question": ("research_question", "research_questions", "question", "questions"),
+    "theory": ("theory", "theoretical_framework", "framework"),
+    "method": ("method", "methods", "methodology"),
+    "sample": ("sample", "participants", "subjects"),
+    "data": ("data", "dataset", "datasets", "data_source", "data_sources"),
+    "results": ("results", "findings", "key_findings"),
+    "limitations": ("limitations", "limitation"),
+    "conclusion": ("conclusion", "conclusions"),
+    "definitions": ("definitions", "definition", "key_definitions"),
+}
 _PROFILE_TEXT_FIELDS = (
     "research_question", "methods", "sample", "key_findings", "limitations",
     "quality_assessment", "relevance_reason", "summary",
 )
+_PROFILE_FIELD_ALIASES = {
+    "research_question": ("research_question", "research_questions", "question", "questions"),
+    "methods": ("methods", "method", "methodology"),
+    "sample": ("sample", "participants", "subjects"),
+    "key_findings": ("key_findings", "findings", "results"),
+    "limitations": ("limitations", "limitation"),
+    "quality_assessment": ("quality_assessment", "quality", "quality_evaluation", "assessment"),
+    "relevance_reason": ("relevance_reason", "relevance", "relevance_to_topic"),
+    "summary": ("summary", "abstract", "overview"),
+}
+_MAX_NORMALIZED_FIELD_CHARS = 6000
+_MAX_NORMALIZED_DEPTH = 6
+_MAX_NORMALIZED_CLAIMS = 200
 
 
-def _normalize_chunk_text(value):
+def _normalize_chunk_text(value, depth=0):
+    if depth > _MAX_NORMALIZED_DEPTH:
+        return None
     if value is None:
         return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, list):
+    if isinstance(value, (str, int, float, bool)):
+        return str(value).strip()[:_MAX_NORMALIZED_FIELD_CHARS]
+    if isinstance(value, (list, tuple)):
         parts = []
         for item in value:
-            if item is None:
-                continue
-            if not isinstance(item, (str, int, float, bool)):
+            text = _normalize_chunk_text(item, depth + 1)
+            if text is None:
                 return None
-            text = str(item).strip()
             if text:
                 parts.append(text)
-        return "; ".join(parts)
+        return "; ".join(parts)[:_MAX_NORMALIZED_FIELD_CHARS]
+    if isinstance(value, dict):
+        parts = []
+        keys = sorted(value, key=lambda item: (str(item).casefold(), str(item)))
+        for key in keys:
+            label = str(key).strip()[:80]
+            if not label:
+                continue
+            text = _normalize_chunk_text(value[key], depth + 1)
+            if text is None:
+                return None
+            if text:
+                parts.append(f"{label}: {text}")
+        return "; ".join(parts)[:_MAX_NORMALIZED_FIELD_CHARS]
     return None
+
+
+def _first_text_alias(value, aliases):
+    for alias in aliases:
+        if alias not in value:
+            continue
+        text = _normalize_chunk_text(value[alias])
+        if text is None:
+            return None
+        if text:
+            return text
+    return ""
 
 
 def normalize_chunk_extraction(value):
@@ -155,7 +394,7 @@ def normalize_chunk_extraction(value):
         return None
     normalized = {}
     for name in _CHUNK_TEXT_FIELDS:
-        text = _normalize_chunk_text(value.get(name))
+        text = _first_text_alias(value, _CHUNK_FIELD_ALIASES[name])
         if text is None:
             return None
         normalized[name] = text
@@ -163,20 +402,32 @@ def normalize_chunk_extraction(value):
     raw_claims = value.get("claims")
     if raw_claims is None:
         raw_claims = []
+    if isinstance(raw_claims, str):
+        raw_claims = [raw_claims]
+    elif isinstance(raw_claims, dict):
+        raw_claims = [raw_claims]
     if not isinstance(raw_claims, list):
+        return None
+    if len(raw_claims) > _MAX_NORMALIZED_CLAIMS:
         return None
     claims = []
     for claim in raw_claims:
-        if not isinstance(claim, dict):
+        if isinstance(claim, str):
+            item = {"section": "", "claim": claim.strip(), "evidence_text": ""}
+        elif isinstance(claim, dict):
+            item = {}
+            aliases = {
+                "section": ("section", "dimension", "type"),
+                "claim": ("claim", "statement", "assertion", "content", "text"),
+                "evidence_text": ("evidence_text", "evidence", "quote", "quotation", "source_quote"),
+            }
+            for name, fields in aliases.items():
+                text = _first_text_alias(claim, fields)
+                if text is None:
+                    return None
+                item[name] = text
+        else:
             return None
-        item = {}
-        for name in ("section", "claim", "evidence_text"):
-            field = claim.get(name)
-            if field is None:
-                field = ""
-            if not isinstance(field, str):
-                return None
-            item[name] = field.strip()
         if item["claim"]:
             claims.append(item)
     normalized["claims"] = claims
@@ -206,31 +457,41 @@ def normalize_profile(value):
     if not 1 <= rating <= 5:
         return None
 
-    raw_category = value.get("category")
-    if raw_category is None:
-        category = "Other"
-    elif isinstance(raw_category, str):
+    category = "Other"
+    for alias in ("category", "type", "literature_type"):
+        if alias not in value or value[alias] is None:
+            continue
+        raw_category = value[alias]
+        if not isinstance(raw_category, str):
+            return None
         category = raw_category.strip() or "Other"
-    else:
-        return None
+        break
     profile = {}
     for key in _PROFILE_TEXT_FIELDS:
-        field = value.get(key)
+        field = _first_text_alias(value, _PROFILE_FIELD_ALIASES[key])
         if field is None:
-            field = ""
-        if not isinstance(field, str):
             return None
-        profile[key] = field.strip()
+        profile[key] = field
     if not any(profile.values()):
         return None
-    profile.update({"rating": rating, "category": category.strip(), "analysis_status": "ok"})
+    profile.update({"rating": rating, "category": category, "analysis_status": "ok"})
     return profile
 
 
 def analyze_literature_document(document_text, title, llm_call, *, locale="en", max_chars=DEFAULT_CHUNK_CHARS, research_topic="", research_context=""):
     """Analyze every ordered chunk, then synthesize a profile and provenance-bearing evidence."""
     if not isinstance(document_text, str) or not document_text.strip():
-        return {"status": "error", "profile": None, "evidence": [], "chunks_total": 0, "failed_chunk": 0, "message": "No extractable text was provided."}
+        return {
+            "status": "error", "profile": None, "evidence": [], "chunks_total": 0, "failed_chunk": 0,
+            "failure_stage": "empty_source", "failure_code": "empty_source",
+            "diagnostic": {
+                "stage": "input", "chunk_index": None, "chunks_total": 0,
+                "failure_code": "empty_source", "finish_reason": None, "http_status": None,
+                "response_chars": 0, "structured_mode": "unknown", "retry_count": 0,
+                "top_level_shape": {},
+            },
+            "message": "No extractable text was provided.",
+        }
     chunks = chunk_document_text(document_text, max_chars=max_chars)
     extractions = []
     evidence = []
@@ -241,12 +502,22 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
                 lambda retry, chunk=chunk, index=index: build_chunk_extraction_prompt(title, chunk, index, len(chunks), locale, retry),
                 MAX_CHUNK_ATTEMPTS,
                 validator=_validate_chunk_extraction,
+                token_budgets=LITERATURE_CHUNK_TOKEN_BUDGETS,
             )
         except _StructuredCallFailure as exc:
+            diagnostic = {
+                "stage": "chunk",
+                "chunk_index": index,
+                "chunks_total": len(chunks),
+                "failure_code": exc.failure_code,
+                **exc.diagnostic,
+            }
             return {
                 "status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks),
                 "failed_chunk": index, "failure_stage": exc.failure_stage,
-                "failure_code": exc.failure_stage, "message": "A literature source chunk could not be analyzed; no partial analysis was stored.",
+                "failure_code": exc.failure_code,
+                "diagnostic": diagnostic,
+                "message": "A literature source chunk could not be analyzed; no partial analysis was stored.",
             }
         extraction = parsed
         extractions.append(extraction)
@@ -273,12 +544,21 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
             ),
             MAX_SYNTHESIS_ATTEMPTS,
             validator=normalize_profile,
+            token_budgets=LITERATURE_SYNTHESIS_TOKEN_BUDGETS,
         )
     except _StructuredCallFailure as exc:
+        diagnostic = {
+            "stage": "synthesis",
+            "chunk_index": None,
+            "chunks_total": len(chunks),
+            "failure_code": exc.failure_code,
+            **exc.diagnostic,
+        }
         return {
             "status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks),
             "failed_chunk": "synthesis", "failure_stage": "document_synthesis",
-            "failure_code": exc.failure_stage,
+            "failure_code": exc.failure_code,
+            "diagnostic": diagnostic,
             "message": "The complete literature profile could not be synthesized; prior analysis was kept.",
         }
     profile = profile_raw

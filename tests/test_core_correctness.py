@@ -13,7 +13,12 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from structured_output_support import create_completion_with_json_fallback, structured_request_options
+from structured_output_support import (
+    create_completion_with_json_fallback,
+    structured_error_result,
+    structured_request_options,
+    structured_response_result,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1485,6 +1490,8 @@ class AppStructuredRequestTests(unittest.TestCase):
             "time": time,
             "create_completion_with_json_fallback": create_completion_with_json_fallback,
             "structured_request_options": structured_request_options,
+            "structured_error_result": structured_error_result,
+            "structured_response_result": structured_response_result,
         })
 
     def _client(self, create):

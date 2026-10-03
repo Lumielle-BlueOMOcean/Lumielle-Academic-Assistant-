@@ -20,7 +20,9 @@ import llm_connection_support
 from structured_output_support import (
     create_completion_with_json_fallback,
     parse_first_json_value,
+    structured_error_result,
     structured_request_options,
+    structured_response_result,
 )
 from document_support import DEFAULT_CHUNK_CHARS, extract_document_text, is_document_parse_error, parse_document_in_chunks
 from memory_support import update_chapter_memory
@@ -300,9 +302,11 @@ def detect_aigc(text: str) -> dict:
 # ============================================================
 # 3. LLM 核心调用层（多配置支持）
 # ============================================================
-def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_name, temp=0.7, json_mode=False):
+def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_name, temp=0.7, json_mode=False, return_metadata=False):
     """底层 API 调用；结构化请求只在明确不支持 JSON 参数时兼容降级。"""
     if not api_key:
+        if json_mode and return_metadata:
+            return structured_error_result(RuntimeError("missing API key"), error_code="authentication_failed")
         return "API 密钥缺失，请在[基础环境配置]中补全。"
     try:
         client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0 if json_mode else 2)
@@ -316,13 +320,20 @@ def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_nam
             req_params["max_tokens"] = max_tokens
         if json_mode:
             req_params.update(structured_request_options(base_url))
+            mode_state = {"mode": "native"}
             try:
-                res, _structured_mode = create_completion_with_json_fallback(
-                    client.chat.completions.create, req_params
+                res, structured_mode = create_completion_with_json_fallback(
+                    client.chat.completions.create, req_params,
+                    mode_callback=lambda mode: mode_state.update(mode=mode),
                 )
-                content = res.choices[0].message.content
+                result = structured_response_result(res, structured_mode)
+                if return_metadata:
+                    return result
+                content = result["content"]
                 return content if isinstance(content, str) and content.strip() else ""
-            except Exception:
+            except Exception as exc:
+                if return_metadata:
+                    return structured_error_result(exc, mode_state["mode"])
                 return "API 连续调用失败: 结构化请求失败"
 
         for attempt in range(3):
@@ -346,6 +357,8 @@ def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_nam
                     return f"API 连续调用失败: {e}"
     except Exception as e:
         if json_mode:
+            if return_metadata:
+                return structured_error_result(e)
             return "API 连续调用失败: 结构化请求初始化失败"
         return f"OpenAI 客户端构造异常: {e}"
 
@@ -363,7 +376,7 @@ def get_active_profile():
             return p
     return profiles[0] if profiles else None
 
-def dispatch_llm_call(prompt, system_prompt=None, max_tokens=None, temp=0.7, profile_id=None, json_mode=False):
+def dispatch_llm_call(prompt, system_prompt=None, max_tokens=None, temp=0.7, profile_id=None, json_mode=False, return_metadata=False):
     """路由分发器。指定 profile_id 可调特定模型；否则使用当前激活配置。"""
     profiles = get_all_profiles()
     if not profiles:
@@ -375,8 +388,7 @@ def dispatch_llm_call(prompt, system_prompt=None, max_tokens=None, temp=0.7, pro
         prof = get_active_profile()
     if not prof:
         raise LLMOutputError("未找到有效的 LLM 配置。")
-    return checked_llm_call(
-        call_llm_api,
+    call_arguments = dict(
         prompt=prompt,
         system_prompt=system_prompt,
         max_tokens=max_tokens,
@@ -385,6 +397,12 @@ def dispatch_llm_call(prompt, system_prompt=None, max_tokens=None, temp=0.7, pro
         model_name=prof.get("model", ""),
         temp=temp,
         json_mode=json_mode,
+    )
+    if return_metadata:
+        return call_llm_api(**call_arguments, return_metadata=True)
+    return checked_llm_call(
+        call_llm_api,
+        **call_arguments,
     )
 
 # ============================================================

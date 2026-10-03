@@ -66,14 +66,14 @@ class ResearchGroundingCascadeTests(unittest.TestCase):
 
         self.assertEqual([fact["id"] for fact in selected], ["included"])
 
-    def test_parent_gate_rejects_legacy_fact_enabled_under_disabled_section(self):
+    def test_section_default_does_not_gate_an_explicitly_enabled_fact(self):
         base = create_default_research_base()
         base["sections"]["methods"].update({
             "allow_writing_grounding": False,
             "modules": [{"id": "legacy-on", "title": "Sampling", "content": "source", "tags": ["sampling"], "allow_writing_grounding": True}],
         })
 
-        self.assertEqual(select_research_grounding_for_chapter(base, "sampling"), [])
+        self.assertEqual([fact["id"] for fact in select_research_grounding_for_chapter(base, "sampling")], ["legacy-on"])
 
     def test_newly_parsed_facts_inherit_parent_state(self):
         for enabled in (False, True):
@@ -86,14 +86,14 @@ class ResearchGroundingCascadeTests(unittest.TestCase):
                 self.assertEqual(result["status"], "ok")
                 self.assertEqual(result["facts"][0]["allow_writing_grounding"], enabled)
 
-    def test_smart_inbox_grounding_cannot_bypass_disabled_destination_section(self):
+    def test_smart_inbox_fact_choice_is_not_gated_by_section_default(self):
         pending = {"facts": [{"title": "Reviewed fact", "content": "fact"}]}
 
         accepted = accept_smart_inbox_facts(
             pending, "methods", [], "", True, section_enabled=False,
         )
 
-        self.assertFalse(accepted[0]["allow_writing_grounding"])
+        self.assertTrue(accepted[0]["allow_writing_grounding"])
 
     def test_ui_sync_updates_child_widget_state_for_each_fact(self):
         section = self.section(False)
@@ -113,10 +113,10 @@ class ResearchGroundingCascadeTests(unittest.TestCase):
             "research_fact_allow_methods_1": True,
         })
 
-    def test_bilingual_section_grounding_ui_cascades_and_disables_children(self):
-        for locale, parent_label, count_label in (
-            ("en", "Allow this section's relevant facts in chapter writing", "Writing grounding: 1 / 2 facts enabled"),
-            ("zh", "允许本板块的相关事实参与正文 Grounding", "正文 Grounding：1 / 2 条事实已启用"),
+    def test_bilingual_section_bulk_controls_keep_children_independently_selectable(self):
+        for locale, enable_label, disable_label, count_label in (
+            ("en", "Enable all", "Disable all", "Writing grounding: 1 / 2 facts enabled"),
+            ("zh", "全部启用", "全部取消", "正文 Grounding：1 / 2 条事实已启用"),
         ):
             with self.subTest(locale=locale), tempfile.TemporaryDirectory() as temp_dir:
                 app_path = Path(temp_dir) / "grounding_app.py"
@@ -127,8 +127,8 @@ class ResearchGroundingCascadeTests(unittest.TestCase):
                         "import streamlit as st",
                         "from research_ui_support import _render_section",
                         "if '_working_section' not in st.session_state:",
-                        "    st.session_state['_working_section'] = {'id': 'methods', 'name_en': 'Research Methods', 'name_zh': '研究方法', 'allow_writing_grounding': True, 'modules': [",
-                        "        {'id': 'a', 'title': 'Fact A', 'type': 'fact', 'content': 'A', 'tags': [], 'allow_writing_grounding': True},",
+                        "    st.session_state['_working_section'] = {'id': 'methods', 'name_en': 'Research Methods', 'name_zh': '研究方法', 'allow_writing_grounding': False, 'modules': [",
+                        "        {'id': 'a', 'title': 'Fact A', 'type': 'fact', 'content': 'A', 'tags': [], 'allow_writing_grounding': False},",
                         "        {'id': 'b', 'title': 'Fact B', 'type': 'fact', 'content': 'B', 'tags': [], 'allow_writing_grounding': False},",
                         "    ]}",
                         "section = st.session_state['_working_section']",
@@ -141,45 +141,43 @@ class ResearchGroundingCascadeTests(unittest.TestCase):
                 )
                 app = AppTest.from_file(str(app_path), default_timeout=30).run()
                 self.assertFalse(app.exception)
-                parent = next(box for box in app.checkbox if box.key == "research_grounding_methods")
-                self.assertEqual(parent.label, parent_label)
                 children = [box for box in app.checkbox if box.key.startswith("research_fact_allow_methods_")]
                 self.assertEqual(len(children), 2)
-                self.assertFalse(any(box.disabled for box in children))
+                self.assertTrue(all(not box.disabled and not box.value for box in children))
+                self.assertTrue(any(button.label == enable_label for button in app.button))
+                self.assertTrue(any(button.label == disable_label for button in app.button))
 
-                parent.set_value(False)
+                children[1].set_value(True)
                 app.run()
-                children = [box for box in app.checkbox if box.key.startswith("research_fact_allow_methods_")]
-                self.assertTrue(all(box.disabled and not box.value for box in children))
-                self.assertFalse(app.session_state["_saved_section"]["allow_writing_grounding"])
-
-                next(box for box in app.checkbox if box.key == "research_grounding_methods").set_value(True)
+                self.assertEqual([box.value for box in app.checkbox if box.key.startswith("research_fact_allow_methods_")], [False, True])
+                self.assertTrue(any(count_label in item.value for item in app.caption))
+                next(button for button in app.button if button.label == enable_label).click()
                 app.run()
                 children = [box for box in app.checkbox if box.key.startswith("research_fact_allow_methods_")]
                 self.assertTrue(all(not box.disabled and box.value for box in children))
-                self.assertTrue(app.session_state["_saved_section"]["allow_writing_grounding"])
                 self.assertEqual([fact["allow_writing_grounding"] for fact in app.session_state["_saved_section"]["modules"]], [True, True])
-                self.assertIn(_TEXT[locale]["grounding_status"].format(enabled=2, total=2), [item.value for item in app.caption])
 
-                children[1].set_value(False)
+                next(button for button in app.button if button.label == disable_label).click()
                 app.run()
-                self.assertTrue(any(count_label in item.value for item in app.caption))
+                children = [box for box in app.checkbox if box.key.startswith("research_fact_allow_methods_")]
+                self.assertTrue(all(not box.disabled and not box.value for box in children))
+                self.assertEqual([fact["allow_writing_grounding"] for fact in app.session_state["_saved_section"]["modules"]], [False, False])
 
                 next(field for field in app.text_input if field.key == "research_manual_title_methods").set_value("Manual fact")
                 next(field for field in app.text_area if field.key == "research_manual_content_methods").set_value("Manual content")
                 next(button for button in app.button if button.key == "research_manual_add_methods").click()
                 app.run()
-                self.assertTrue(app.session_state["_saved_section"]["modules"][-1]["allow_writing_grounding"])
-
-                next(box for box in app.checkbox if box.key == "research_grounding_methods").set_value(False)
-                app.run()
-                next(field for field in app.text_input if field.key == "research_manual_title_methods").set_value("Manual disabled fact")
-                next(field for field in app.text_area if field.key == "research_manual_content_methods").set_value("Manual disabled content")
-                next(button for button in app.button if button.key == "research_manual_add_methods").click()
-                app.run()
                 self.assertFalse(app.session_state["_saved_section"]["modules"][-1]["allow_writing_grounding"])
 
-    def test_smart_inbox_ui_cannot_enable_fact_when_destination_parent_is_off(self):
+                next(button for button in app.button if button.label == enable_label).click()
+                app.run()
+                next(field for field in app.text_input if field.key == "research_manual_title_methods").set_value("Enabled default fact")
+                next(field for field in app.text_area if field.key == "research_manual_content_methods").set_value("Enabled default content")
+                next(button for button in app.button if button.key == "research_manual_add_methods").click()
+                app.run()
+                self.assertTrue(app.session_state["_saved_section"]["modules"][-1]["allow_writing_grounding"])
+
+    def test_smart_inbox_ui_can_enable_fact_when_section_default_is_off(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_path = Path(temp_dir) / "inbox_app.py"
             app_path.write_text(
@@ -209,10 +207,10 @@ class ResearchGroundingCascadeTests(unittest.TestCase):
 
             facts = app.session_state["_saved_base"]["sections"]["methods"]["modules"]
             self.assertEqual(len(facts), 1)
-            self.assertFalse(facts[0]["allow_writing_grounding"])
+            self.assertTrue(facts[0]["allow_writing_grounding"])
 
     def test_grounding_copy_explains_parent_child_semantics_in_both_locales(self):
-        self.assertIn("individual facts", _TEXT["en"]["grounding_help"].lower())
+        self.assertIn("independently selectable", _TEXT["en"]["grounding_help"].lower())
         self.assertIn("事实", _TEXT["zh"]["grounding_help"])
         self.assertIn("grounding_status", _TEXT["en"])
         self.assertIn("grounding_status", _TEXT["zh"])
@@ -252,13 +250,13 @@ class LiteraturePartialSchemaTests(unittest.TestCase):
         self.assertEqual(sum("[SOURCE CHUNK " in prompt for prompt in calls), 1)
         self.assertEqual(sum("[DOCUMENT SYNTHESIS]" in prompt for prompt in calls), 1)
 
-    def test_text_lists_join_scalar_items_but_nested_objects_are_rejected(self):
+    def test_text_lists_and_nested_objects_are_deterministically_flattened(self):
         normalize = getattr(literature_intelligence, "normalize_chunk_extraction", None)
         self.assertTrue(callable(normalize))
-        normalized = normalize({"method": ["Survey", "Interview", 2], "results": None})
-        self.assertEqual(normalized["method"], "Survey; Interview; 2")
-        self.assertIsNone(literature_intelligence._validate_chunk_extraction({"method": {"nested": "value"}}))
-        self.assertIsNone(literature_intelligence._validate_chunk_extraction({"method": ["Survey", {"nested": "value"}]}))
+        normalized = normalize({"method": ["Survey", "Interview", 2, {"nested": "value"}], "results": None})
+        self.assertEqual(normalized["method"], "Survey; Interview; 2; nested: value")
+        self.assertEqual(normalize({"method": {"nested": "value"}})["method"], "nested: value")
+        self.assertEqual(literature_intelligence._validate_chunk_extraction({"method": ["Survey", {"nested": "value"}]})["method"], "Survey; nested: value")
 
     def test_partial_claim_can_synthesize_without_creating_evidence(self):
         calls = []
@@ -272,6 +270,17 @@ class LiteraturePartialSchemaTests(unittest.TestCase):
 
         result = analyze_literature_document("The source describes an intervention.", "Study", llm, max_chars=200)
 
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["evidence"], [])
+
+    def test_claim_string_is_normalized_to_one_claim_without_evidence(self):
+        def llm(prompt, **_kwargs):
+            if "[DOCUMENT SYNTHESIS]" in prompt:
+                self.assertIn("plain string claim", prompt)
+                return json.dumps({"rating": 3, "summary": "A supported profile"})
+            return json.dumps({"method": "Survey", "claims": "plain string claim"})
+
+        result = analyze_literature_document("Survey source", "Study", llm, max_chars=200)
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["evidence"], [])
 
@@ -302,7 +311,6 @@ class LiteraturePartialSchemaTests(unittest.TestCase):
             ({"claims": []}, "schema_validation_failure"),
             ({"research_question": "", "method": "", "claims": []}, "schema_validation_failure"),
             ({"status": "ok"}, "schema_validation_failure"),
-            ({"method": "Survey", "claims": "plain string"}, "schema_validation_failure"),
         ):
             with self.subTest(response=response):
                 result = analyze_literature_document(

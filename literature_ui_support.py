@@ -82,14 +82,205 @@ _REANALYSIS_FAILURE_MESSAGES = {
 }
 
 
-def failure_message(result, locale="en", *, reanalysis=False):
-    """Map an internal analysis stage to concise localized copy without raw details."""
+_FAILURE_GROUPS = {
+    "schema_validation_failure": "schema",
+    "invalid_structured_output": "invalid_json",
+    "empty_structured_output": "empty",
+    "truncated_output": "truncated",
+    "content_filtered": "filtered",
+    "rate_limited": "temporary",
+    "timeout": "temporary",
+    "connection_error": "temporary",
+    "server_error": "temporary",
+    "insufficient_system_resource": "temporary",
+    "aborted": "temporary",
+    "authentication_failed": "configuration",
+    "insufficient_balance": "configuration",
+    "model_not_available": "configuration",
+    "invalid_request": "configuration",
+    "provider_error": "provider",
+    "incomplete_response": "provider",
+    "source_extraction_failure": "source",
+    "empty_source": "source",
+}
+
+
+def _result_failure_code(result):
+    if not isinstance(result, dict):
+        return "provider_call"
+    return str(result.get("failure_code") or result.get("failure_stage") or "provider_call")
+
+
+def _failure_detail(result, locale="en"):
     language = "zh" if str(locale).lower().startswith("zh") else "en"
-    messages = _REANALYSIS_FAILURE_MESSAGES if reanalysis else _FAILURE_MESSAGES
-    return messages[language].get(
-        result.get("failure_stage") if isinstance(result, dict) else None,
-        _LABELS[language]["reanalyze_failed" if reanalysis else "unavailable"],
+    code = _result_failure_code(result)
+    diagnostic = result.get("diagnostic", {}) if isinstance(result, dict) else {}
+    diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
+    status = diagnostic.get("http_status")
+    valid_status = isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599
+    status_text = f"（HTTP {status}）" if language == "zh" and valid_status else f" (HTTP {status})" if valid_status else ""
+    chunk_index = diagnostic.get("chunk_index")
+    chunks_total = diagnostic.get("chunks_total")
+    valid_chunk_position = (
+        isinstance(chunk_index, int) and not isinstance(chunk_index, bool)
+        and isinstance(chunks_total, int) and not isinstance(chunks_total, bool)
     )
+    chunk_text = (
+        f"（第 {chunk_index}/{chunks_total} 分块）" if language == "zh" and valid_chunk_position
+        else f" (chunk {chunk_index}/{chunks_total})" if valid_chunk_position
+        else ""
+    )
+    if language == "zh":
+        return {
+            "schema_validation_failure": "结构化数据不兼容" + chunk_text,
+            "invalid_structured_output": "结构化 JSON 格式无效" + chunk_text,
+            "empty_structured_output": "模型返回了空分析内容" + chunk_text,
+            "truncated_output": "输出达到长度限制，扩大预算重试后仍未完成" + chunk_text,
+            "content_filtered": "模型内容安全过滤阻止了本次分析" + chunk_text,
+            "rate_limited": "AI 服务暂时繁忙或请求受限，系统已自动重试" + status_text,
+            "timeout": "AI 服务响应超时，系统已自动重试" + status_text,
+            "connection_error": "暂时无法连接 AI 服务，系统已自动重试" + status_text,
+            "server_error": "AI 服务暂时不可用，系统已自动重试" + status_text,
+            "insufficient_system_resource": "AI 服务资源暂时不足，系统已自动重试" + status_text,
+            "aborted": "AI 服务中断了本次请求，系统已自动重试" + status_text,
+            "authentication_failed": "AI 认证失败，请检查模型配置后重试" + status_text,
+            "insufficient_balance": "AI 服务账户余额不足，请检查模型账户后重试" + status_text,
+            "model_not_available": "当前模型不可用，请检查模型配置" + status_text,
+            "invalid_request": "AI 请求配置无效，请检查模型配置" + status_text,
+            "provider_error": "AI 服务返回了无法识别的错误" + status_text,
+            "incomplete_response": "AI 服务返回不完整，请稍后重试" + status_text,
+            "provider_call": "AI 服务调用失败，请检查模型配置后重试" + status_text,
+            "source_extraction_failure": "原文提取失败",
+            "empty_source": "没有可分析的原文",
+        }.get(code, "AI 分析失败" + chunk_text + status_text)
+    return {
+        "schema_validation_failure": "Incompatible structured data" + chunk_text,
+        "invalid_structured_output": "Malformed structured JSON" + chunk_text,
+        "empty_structured_output": "The model returned empty analysis" + chunk_text,
+        "truncated_output": "Output reached its length limit and remained incomplete after a larger-budget retry" + chunk_text,
+        "content_filtered": "The model's content filter blocked this analysis" + chunk_text,
+        "rate_limited": "The AI service is busy or rate-limited; automatic retries were attempted" + status_text,
+        "timeout": "The AI service timed out; automatic retries were attempted" + status_text,
+        "connection_error": "The AI service could not be reached; automatic retries were attempted" + status_text,
+        "server_error": "The AI service is temporarily unavailable; automatic retries were attempted" + status_text,
+        "insufficient_system_resource": "The AI service temporarily lacked resources; automatic retries were attempted" + status_text,
+        "aborted": "The AI service interrupted the request; automatic retries were attempted" + status_text,
+        "authentication_failed": "AI authentication failed; check the model configuration" + status_text,
+        "insufficient_balance": "The AI provider account has insufficient balance" + status_text,
+        "model_not_available": "The selected model is unavailable; check the model configuration" + status_text,
+        "invalid_request": "The AI request configuration is invalid; check the model settings" + status_text,
+        "provider_error": "The AI service returned an unclassified error" + status_text,
+        "incomplete_response": "The AI service returned an incomplete response" + status_text,
+        "provider_call": "The AI service call failed; check the model configuration" + status_text,
+        "source_extraction_failure": "Source text extraction failed",
+        "empty_source": "No source text was available to analyze",
+    }.get(code, "AI analysis failed" + chunk_text + status_text)
+
+
+def failure_message(result, locale="en", *, reanalysis=False):
+    """Map safe failure codes and diagnostics to localized user-facing copy."""
+    language = "zh" if str(locale).lower().startswith("zh") else "en"
+    # Preserve established copy for older callers that only supply a stage.
+    if isinstance(result, dict) and not result.get("failure_code"):
+        messages = _REANALYSIS_FAILURE_MESSAGES if reanalysis else _FAILURE_MESSAGES
+        legacy = messages[language].get(result.get("failure_stage"))
+        if legacy:
+            return legacy
+    detail = _failure_detail(result, language)
+    if reanalysis:
+        return (
+            f"{detail}；原有档案与证据保持不变。" if language == "zh"
+            else f"{detail}; existing profile and evidence were preserved."
+        )
+    if language == "zh":
+        return f"原始资料已保存，但{detail}；未保存部分档案或证据。"
+    return f"The source was saved, but {detail}; no partial profile or evidence was stored."
+
+
+def format_batch_outcome(item, locale="en"):
+    """Render one filename-bound status without exposing model response contents."""
+    language = "zh" if str(locale).lower().startswith("zh") else "en"
+    filename = str(item.get("filename", "file")) if isinstance(item, dict) else "file"
+    result = item.get("result", {}) if isinstance(item, dict) else {}
+    if isinstance(item, dict) and item.get("success"):
+        return f"{filename} — 分析成功" if language == "zh" else f"{filename} — analyzed successfully"
+    detail = _failure_detail(result, language)
+    if isinstance(item, dict) and item.get("source_saved"):
+        return f"{filename} — 仅保存原文：{detail}" if language == "zh" else f"{filename} — original saved only: {detail}"
+    return f"{filename} — 分析失败：{detail}" if language == "zh" else f"{filename} — analysis failed: {detail}"
+
+
+def summarize_literature_batch(items, locale="en"):
+    """Summarize analyzed records separately from saved-original-only outcomes."""
+    language = "zh" if str(locale).lower().startswith("zh") else "en"
+    outcomes = items if isinstance(items, (list, tuple)) else []
+    analyzed = sum(bool(item.get("success")) for item in outcomes if isinstance(item, dict))
+    source_only = sum(
+        not bool(item.get("success")) and bool(item.get("source_saved"))
+        for item in outcomes if isinstance(item, dict)
+    )
+    if language == "zh":
+        summary = f"本批次共 {len(outcomes)} 篇：成功分析 {analyzed}，仅保存原文 {source_only}。"
+        names = {
+            "schema": "结构化数据不兼容", "invalid_json": "JSON 格式无效", "empty": "空分析结果",
+            "truncated": "输出达到长度限制", "temporary": "服务暂时不可用/请求受限",
+            "configuration": "模型配置或账户问题", "filtered": "内容安全过滤", "provider": "其他服务错误",
+            "source": "原文提取失败",
+        }
+        counts = {}
+        for item in outcomes:
+            if not isinstance(item, dict) or item.get("success"):
+                continue
+            code = _result_failure_code(item.get("result", {}))
+            group = _FAILURE_GROUPS.get(code, "source" if code == "source_extraction_failure" else "provider")
+            counts[group] = counts.get(group, 0) + 1
+        if counts:
+            details = "、".join(f"{names[group]} {count}" for group, count in counts.items())
+            summary += f"\n失败原因：{details}。"
+        return summary
+    summary = f"Batch: {len(outcomes)} files; analyzed {analyzed}; original only {source_only}."
+    names = {
+        "schema": "incompatible structured data", "invalid_json": "invalid JSON", "empty": "empty analysis",
+        "truncated": "length-limited output", "temporary": "temporary service/rate-limit issue",
+        "configuration": "model configuration/account issue", "filtered": "content filter", "provider": "other provider error",
+        "source": "source extraction failure",
+    }
+    counts = {}
+    for item in outcomes:
+        if not isinstance(item, dict) or item.get("success"):
+            continue
+        code = _result_failure_code(item.get("result", {}))
+        group = _FAILURE_GROUPS.get(code, "source" if code == "source_extraction_failure" else "provider")
+        counts[group] = counts.get(group, 0) + 1
+    if counts:
+        summary += "\nFailure reasons: " + "; ".join(f"{names[group]} {count}" for group, count in counts.items()) + "."
+    return summary
+
+
+def _safe_batch_notice(items):
+    """Keep only filename, outcome, and whitelisted safe diagnostics across rerun."""
+    diagnostic_fields = (
+        "stage", "chunk_index", "chunks_total", "failure_code", "finish_reason",
+        "http_status", "response_chars", "structured_mode", "retry_count", "top_level_shape",
+    )
+    safe = []
+    for item in items if isinstance(items, (list, tuple)) else ():
+        if not isinstance(item, dict):
+            continue
+        result = item.get("result", {}) if isinstance(item.get("result"), dict) else {}
+        raw_diagnostic = result.get("diagnostic", {}) if isinstance(result.get("diagnostic"), dict) else {}
+        diagnostic = {key: raw_diagnostic[key] for key in diagnostic_fields if key in raw_diagnostic}
+        safe.append({
+            "filename": str(item.get("filename", "file"))[:240],
+            "success": bool(item.get("success")),
+            "source_saved": bool(item.get("source_saved")),
+            "result": {
+                "failure_code": str(result.get("failure_code") or result.get("failure_stage") or "provider_call")[:80],
+                "failure_stage": str(result.get("failure_stage") or "")[:80],
+                "diagnostic": diagnostic,
+            },
+        })
+    return safe
 
 
 def _import_one(title, text, source, link, raw_bytes, extension, literatures, evidence_store, raw_dir, llm_call, locale, research_topic="", research_context=""):
@@ -113,14 +304,24 @@ def _import_one(title, text, source, link, raw_bytes, extension, literatures, ev
 def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extract_upload_text, llm_call, save_records, save_evidence, locale="en", *, research_topic="", research_context=""):
     labels = _LABELS[locale]
     st.subheader(labels["heading"])
+    previous_notice = st.session_state.pop("literature_batch_notice", None)
+    if isinstance(previous_notice, list):
+        for item in previous_notice:
+            rendered = format_batch_outcome(item, locale)
+            (st.success if item.get("success") else st.warning)(rendered)
+        st.info(summarize_literature_batch(previous_notice, locale))
     uploads = st.file_uploader(labels["upload"], type=["pdf", "docx", "txt"], accept_multiple_files=True, key="literature_full_uploads")
     if uploads and st.button(labels["import"], key="literature_full_import"):
-        added = 0
+        outcomes = []
         progress = st.progress(0)
         for index, upload in enumerate(uploads):
             text = extract_upload_text(upload)
             if is_document_parse_error(text):
-                st.warning(f"{labels['error']}: {upload.name}. {text}")
+                outcome = {
+                    "filename": upload.name, "success": False, "source_saved": False,
+                    "result": {"failure_code": "source_extraction_failure", "failure_stage": "source_extraction_failure"},
+                }
+                st.warning(f"{upload.name} — {labels['error']}.")
             else:
                 with st.spinner(upload.name):
                     evidence_store, success, result = _import_one(
@@ -128,15 +329,21 @@ def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extrac
                         Path(upload.name).suffix or ".txt", literatures, evidence_store, raw_dir, llm_call, locale,
                         research_topic, research_context,
                     )
+                outcome = {
+                    "filename": upload.name, "success": success,
+                    "source_saved": bool(literatures and literatures[-1].get("file_path")),
+                    "result": result,
+                }
+                rendered = format_batch_outcome(outcome, locale)
                 if success:
-                    st.success(labels["success"].format(chunks=result["chunks_total"], evidence=len(result["evidence"])))
+                    st.success(rendered)
                 else:
-                    st.warning(failure_message(result, locale))
-                added += 1
+                    st.warning(rendered)
+            outcomes.append(outcome)
             progress.progress((index + 1) / len(uploads))
         save_records(literatures)
         save_evidence(evidence_store)
-        st.success(labels["added"].format(count=added))
+        st.session_state["literature_batch_notice"] = _safe_batch_notice(outcomes)
         st.rerun()
 
     with st.expander(labels["paste_text"], expanded=False):
@@ -155,9 +362,13 @@ def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extrac
                 save_records(literatures)
                 save_evidence(evidence_store)
                 if success:
-                    st.success(labels["success"].format(chunks=result["chunks_total"], evidence=len(result["evidence"])))
+                    st.success(format_batch_outcome({"filename": title.strip(), "success": True}, locale))
                 else:
-                    st.warning(failure_message(result, locale))
+                    st.warning(format_batch_outcome({
+                        "filename": title.strip(), "success": False,
+                        "source_saved": bool(literatures and literatures[-1].get("file_path")),
+                        "result": result,
+                    }, locale))
                 st.rerun()
 
 

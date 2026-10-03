@@ -51,7 +51,7 @@ def create_default_research_base():
     return {"schema_version": 2, "sections": sections}
 
 
-def _normalize_fact(module, section_id, allow_grounding, source_id=None, source_chunk=None):
+def _normalize_fact(module, section_id, section_default, source_id=None, source_chunk=None):
     if not isinstance(module, dict):
         return None
     result = dict(module)
@@ -73,8 +73,12 @@ def _normalize_fact(module, section_id, allow_grounding, source_id=None, source_
     result["source_id"] = str(result.get("source_id") or source_id or "")
     chunk = result.get("source_chunk", source_chunk or 1)
     result["source_chunk"] = int(chunk) if isinstance(chunk, int) and not isinstance(chunk, bool) and chunk > 0 else int(source_chunk or 1)
-    # The explicit section toggle is authoritative; per-fact values may only narrow it.
-    result["allow_writing_grounding"] = bool(allow_grounding and result.get("allow_writing_grounding", True))
+    # Facts are the final Grounding state. The section value is only the default
+    # for legacy/new facts that do not yet carry their own explicit setting.
+    if "allow_writing_grounding" in result:
+        result["allow_writing_grounding"] = bool(result["allow_writing_grounding"])
+    else:
+        result["allow_writing_grounding"] = bool(section_default)
     binding = result.get("binding_mode", "auto")
     result["binding_mode"] = binding if binding in {"auto", "global", "chapters"} else "auto"
     chapter_ids = result.get("chapter_ids", [])
@@ -92,7 +96,7 @@ def _normalize_modules(modules, section_id, allow_grounding):
 
 
 def apply_section_grounding(section, enabled):
-    """Set the section-level grounding switch and cascade it to its current facts."""
+    """Bulk-select current facts and update the section default for future facts."""
     if not isinstance(section, dict):
         return 0
     enabled = bool(enabled)
@@ -106,6 +110,22 @@ def apply_section_grounding(section, enabled):
             changed += 1
         fact["allow_writing_grounding"] = enabled
     return changed
+
+
+def make_manual_research_fact(section_id, title, content, section_default=False):
+    """Build a manual fact using the section's current default Grounding value."""
+    return _normalize_fact({
+        "id": uuid.uuid4().hex,
+        "section": section_id,
+        "title": str(title or "").strip(),
+        "type": "fact",
+        "content": str(content or ""),
+        "tags": [],
+        "source_id": "manual",
+        "source_chunk": 1,
+        "binding_mode": "auto",
+        "chapter_ids": [],
+    }, section_id, bool(section_default), source_id="manual")
 
 
 def migrate_research_base(value):
@@ -418,8 +438,6 @@ def select_research_grounding_for_chapter(research_base, chapter_title, chapter_
     query = _terms(" ".join((chapter_title or "", chapter_description or "", outline_position or "")))
     eligible = []
     for section_id, section in base["sections"].items():
-        if not section.get("allow_writing_grounding", False):
-            continue
         for fact in section.get("modules", []):
             if not fact.get("allow_writing_grounding", section.get("allow_writing_grounding", False)):
                 continue
@@ -505,8 +523,8 @@ def build_chapter_research_context(research_base, chapter_title, chapter_descrip
     }
 
 
-def accept_smart_inbox_facts(pending, section_id, tags, role, allow_grounding, *, section_enabled=True):
-    """Apply reviewed Smart Inbox fields to normalized facts before persistence."""
+def accept_smart_inbox_facts(pending, section_id, tags, role, allow_grounding, *, section_enabled=None):
+    """Apply reviewed fields; the fact-level Grounding choice is authoritative."""
     if not isinstance(pending, dict):
         return []
     source_title = str((pending.get("source") or {}).get("title", ""))
@@ -521,7 +539,7 @@ def accept_smart_inbox_facts(pending, section_id, tags, role, allow_grounding, *
             + [str(value).strip() for value in tags if str(value).strip()]
         ))
         fact["role"] = str(role or "").strip()[:240]
-        fact["allow_writing_grounding"] = bool(section_enabled and allow_grounding)
+        fact["allow_writing_grounding"] = bool(allow_grounding)
         fact["source_title"] = source_title
         accepted.append(fact)
     return accepted
