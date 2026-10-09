@@ -611,7 +611,7 @@ def _validate_chunk_extraction_result(value, *, allow_no_relevant_content=True):
     if status == "no_relevant_content":
         required_empty_shape = set(_CHUNK_TEXT_FIELDS) | {"claims", "chunk_status"}
         has_complete_empty_shape = (
-            required_empty_shape.issubset(value)
+            set(value) == required_empty_shape
             and isinstance(value.get("claims"), list)
             and not claims
         )

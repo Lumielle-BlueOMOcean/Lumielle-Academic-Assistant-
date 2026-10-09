@@ -68,6 +68,32 @@ class ChunkStatusContractTests(unittest.TestCase):
         self.assertEqual(normalized["claims"], [])
         self.assertTrue(all(not normalized[field] for field in literature._CHUNK_TEXT_FIELDS))
 
+    def test_explicit_empty_chunk_requires_exact_canonical_field_set(self):
+        malformed = (
+            _empty_chunk() | {"analysis": {"method": "Survey"}},
+            _empty_chunk() | {"analysis": {}},
+            _empty_chunk() | {"unexpected_field": ""},
+            {key: value for key, value in _empty_chunk().items() if key != "definitions"},
+        )
+        validate = literature._validate_chunk_extraction_result
+        for value in malformed:
+            with self.subTest(value=value):
+                result = validate(value)
+                self.assertIsNone(result.normalized)
+                self.assertEqual(result.issue_code, "inconsistent_no_relevant_content")
+
+    def test_content_and_legacy_aliases_keep_their_existing_extra_field_behavior(self):
+        content_with_extras = _empty_chunk("content") | {
+            "method": "Survey", "analysis": {"method": "ignored wrapper value"}, "unexpected_field": "ignored"
+        }
+        normalized = literature.normalize_chunk_extraction(content_with_extras)
+        self.assertEqual(normalized["chunk_status"], "content")
+        self.assertEqual(normalized["method"], "Survey")
+
+        legacy = literature.normalize_chunk_extraction({"methodology": "Interview", "findings": "Finding A"})
+        self.assertEqual(legacy["method"], "Interview")
+        self.assertEqual(legacy["results"], "Finding A")
+
     def test_empty_without_status_and_content_status_without_content_have_issue_codes(self):
         for value, expected in (
             (_empty_chunk(status=None) | {"chunk_status": None}, "invalid_chunk_status"),
@@ -279,6 +305,62 @@ class EmptyChunkPipelineTests(unittest.TestCase):
 
     def test_reduction_rejects_empty_source_status(self):
         self.assertIsNone(literature._reduction_extraction(_empty_chunk()))
+
+    def test_extra_wrapper_on_empty_leaf_fails_closed_and_preserves_existing_record(self):
+        chunks = ["FIRST_SOURCE EXACT_OLD_QUOTE", "SECOND_SOURCE with no supported academic fields"]
+        hidden_key = "PRIVATE_DOCUMENT_TEXT_SENTINEL"
+        hidden_value = "HIDDEN_ACADEMIC_TEXT_SENTINEL"
+        chunk_two_calls = 0
+        synthesis_calls = 0
+
+        def llm(prompt, **_kwargs):
+            nonlocal chunk_two_calls, synthesis_calls
+            if "[DOCUMENT SYNTHESIS]" in prompt:
+                synthesis_calls += 1
+                return _response(_profile())
+            locator = re.search(r"Source locator: ([0-9.]+)", prompt).group(1)
+            if locator == "1":
+                return _response({"method": "Survey", "claims": [
+                    {"claim": "Old evidence claim", "evidence_text": "EXACT_OLD_QUOTE"},
+                ]})
+            chunk_two_calls += 1
+            invalid_empty = _empty_chunk() | {
+                "analysis": {"method": hidden_value}, hidden_key: "API_KEY_SENTINEL",
+            }
+            return _response(invalid_empty)
+
+        existing_record = {"id": "lit-7", "analysis": {"summary": "KEEP_OLD_PROFILE"}, "rating": 4}
+        existing_evidence = {"lit-7": [{"evidence_text": "KEEP_OLD_EVIDENCE"}]}
+        with patch.object(literature, "chunk_document_text", return_value=chunks):
+            result = literature.analyze_literature_document("COMPLETE_SOURCE_SENTINEL", "Study", llm)
+        updated_record, updated_evidence, applied = literature.apply_analysis_to_literature_record(
+            existing_record, existing_evidence, result,
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["failure_code"], "schema_validation_failure")
+        self.assertEqual(result["diagnostic"].get("schema_issue_code"), "inconsistent_no_relevant_content")
+        self.assertEqual(result["diagnostic"].get("chunk_index"), 2)
+        self.assertEqual(result["diagnostic"].get("source_locator"), "2")
+        self.assertEqual(chunk_two_calls, 2)
+        self.assertEqual(synthesis_calls, 0)
+        self.assertIsNone(result["profile"])
+        self.assertEqual(result["evidence"], [])
+        self.assertFalse(applied)
+        self.assertIs(updated_record, existing_record)
+        self.assertEqual(updated_evidence, existing_evidence)
+
+        notice = literature_ui._safe_batch_notice([{
+            "filename": "paper.pdf", "success": False, "source_saved": True, "result": result,
+        }])
+        diagnostic_text = repr(notice) + "\n" + "\n".join(
+            literature_ui._technical_diagnostic_lines(notice[0], "en")
+        )
+        self.assertIn("inconsistent_no_relevant_content", diagnostic_text)
+        self.assertNotIn(hidden_key, diagnostic_text)
+        self.assertNotIn(hidden_value, diagnostic_text)
+        self.assertNotIn("API_KEY_SENTINEL", diagnostic_text)
+        self.assertNotIn("COMPLETE_SOURCE_SENTINEL", diagnostic_text)
 
 
 class ConservativeClaimsAndDiagnosticsTests(unittest.TestCase):
