@@ -7,6 +7,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from context_digest_support import balanced_excerpt
@@ -74,23 +75,44 @@ class _StructuredCallFailure(LLMOutputError):
         self.diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
 
 
+@dataclass(frozen=True)
+class _ChunkValidationResult:
+    normalized: dict | None
+    issue_code: str | None = None
+    diagnostic: dict | None = None
+
+
 def build_chunk_extraction_prompt(title, chunk, index, total, locale="en", retry=False, *, source_locator=None):
     locator = str(source_locator or index)
     if locale == "zh":
-        retry_note = "上一次输出无效。请仅根据本分块重新提取并输出合法 JSON。\n" if retry else ""
+        retry_note = (
+            "上一次输出无效或未通过结构检查。请仅依据本分块修正；如果当前块确实没有可提取学术信息，请明确返回完整的 no_relevant_content 结构，不要编造内容以满足非空校验。\n"
+            if retry else ""
+        )
         return (
             "你是严谨的学术文献分析器。只提取本分块明确陈述的内容，不推测缺失结论，也不补全其他分块的信息。\n"
             f"文献标题：{title}\n本分块：{index}/{total}\n"
-            "尽可能提取本分块实际支持的研究问题、理论、方法、样本、数据、结果、明确主张、局限、结论和重要定义。缺少的文字字段使用空字符串，没有主张使用空数组。保持简洁，不要重复原文；最多列出 6 条主张，每个字段建议不超过 300 字。每项主张尽可能附带原文短引句；evidence_text 必须是原文中不超过 300 字的连续短引文。不得编造事实或引文。严格返回以下完整 JSON 形状：\n"
-            '{"research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[{"section":"","claim":"","evidence_text":""}],"limitations":"","conclusion":"","definitions":""}\n'
+            "必须返回 chunk_status。正文中的研究方法、理论、论点、结果、定义均应标记 content；不得仅因信息不完整、文字较短、含表格或难以分类就标为空。只有参考文献目录、出版元数据等确实不含可提取学术信息时，才使用 no_relevant_content。缺少支持的文字字段用空字符串，没有主张用空数组，不得为避免空输出而编造主张。保持简洁；最多 6 条主张，每个字段建议不超过 300 字。evidence_text 必须是本分块中不超过 300 字的原文连续短引文。\n"
+            '有主张时，每项使用字段形状 {"section":"","claim":"","evidence_text":""}；没有主张时使用空数组 []。\n'
+            "有学术内容时使用以下完整结构示例：\n"
+            '{"chunk_status":"content","research_question":"","theory":"","method":"问卷调查","sample":"","data":"","results":"","claims":[],"limitations":"","conclusion":"","definitions":""}\n'
+            "确实没有可提取学术内容时使用以下完整结构示例：\n"
+            '{"chunk_status":"no_relevant_content","research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[],"limitations":"","conclusion":"","definitions":""}\n'
             + retry_note + f"Source locator: {locator} ({len(chunk)} chars)\n[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
         )
-    retry_note = "The previous output was invalid. Re-extract only from this chunk and return valid JSON.\n" if retry else ""
+    retry_note = (
+        "The previous output was invalid or did not satisfy the schema. Re-extract only from this chunk. If it truly contains no extractable academic information, return the complete explicit no_relevant_content structure; do not invent content to satisfy the meaningful-content check.\n"
+        if retry else ""
+    )
     return (
         "You are a careful academic literature analyst. Extract only information explicitly stated in this source chunk. Do not infer missing conclusions or complete material from other chunks.\n"
         f"Title: {title}\nSource chunk: {index}/{total}\n"
-        "Extract only the academic dimensions supported by this chunk. Use an empty string for text fields with no support and an empty array when there are no claims. Keep the extraction concise and avoid repeating the source; provide at most 6 claims and aim for no more than 300 characters per field. Any evidence_text must be a short exact quotation of at most 300 characters copied contiguously from this source chunk. Do not invent facts or quotations. Return exactly this complete JSON shape:\n"
-        '{"research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[{"section":"","claim":"","evidence_text":""}],"limitations":"","conclusion":"","definitions":""}\n'
+        "Every response must include chunk_status. Academic discussion of methods, theory, claims, results, or definitions is content; do not label a chunk empty merely because it is short, incomplete, table-heavy, or difficult to classify. Use no_relevant_content only for references or publication metadata with no extractable academic information. Use empty strings for unsupported text fields and an empty claims array when none are supported. Never invent claims to avoid an empty result. Keep concise, provide at most 6 claims, and use evidence_text only for a short exact contiguous quotation (at most 300 characters) from this source chunk.\n"
+        'When a claim is present, its object uses the fields {"section":"","claim":"","evidence_text":""}; use [] when there are no claims.\n'
+        "Complete content example:\n"
+        '{"chunk_status":"content","research_question":"","theory":"","method":"Survey","sample":"","data":"","results":"","claims":[],"limitations":"","conclusion":"","definitions":""}\n'
+        "Complete no-relevant-content example:\n"
+        '{"chunk_status":"no_relevant_content","research_question":"","theory":"","method":"","sample":"","data":"","results":"","claims":[],"limitations":"","conclusion":"","definitions":""}\n'
         + retry_note + f"Source locator: {locator} ({len(chunk)} chars)\n[SOURCE CHUNK {index}/{total}]\n{chunk}\n[/SOURCE CHUNK]"
     )
 
@@ -246,7 +268,12 @@ def _safe_top_level_shape(value):
         alias.casefold()
         for aliases in _CHUNK_FIELD_ALIASES.values()
         for alias in aliases
-    } | {"claims", "rating", "category", "type", "literature_type"}
+    } | {
+        "claims", "chunk_status", "rating", "category", "type", "literature_type",
+        "methods", "key_findings", "quality_assessment", "quality", "quality_evaluation",
+        "relevance_reason", "relevance", "relevance_to_topic", "summary", "abstract", "overview",
+        "analysis", "result", "output", "extraction",
+    }
     for key, item in list(value.items())[:24]:
         if not isinstance(key, str) or key.casefold() not in allowed_keys:
             continue
@@ -264,8 +291,58 @@ def _safe_top_level_shape(value):
             kind = "number"
         else:
             kind = "other"
-        shape[key] = kind
+        shape[key.casefold()] = kind
     return shape
+
+
+def _schema_shape_diagnostics(value):
+    if not isinstance(value, dict):
+        return {"top_level_shape": _safe_top_level_shape(value), "unknown_top_level_key_count": 0}
+    allowed_keys = {
+        alias.casefold() for aliases in _CHUNK_FIELD_ALIASES.values() for alias in aliases
+    } | {
+        "claims", "chunk_status", "rating", "category", "type", "literature_type",
+        "methods", "key_findings", "quality_assessment", "quality", "quality_evaluation",
+        "relevance_reason", "relevance", "relevance_to_topic", "summary", "abstract", "overview",
+        "analysis", "result", "output", "extraction",
+    }
+    item_types = {}
+    raw_claims = value.get("claims")
+    if isinstance(raw_claims, list):
+        for item in raw_claims:
+            if item is None:
+                name = "null"
+            elif isinstance(item, bool):
+                name = "bool"
+            elif isinstance(item, str):
+                name = "str"
+            elif isinstance(item, dict):
+                name = "dict"
+            elif isinstance(item, list):
+                name = "list"
+            elif isinstance(item, (int, float)):
+                name = "number"
+            else:
+                name = "other"
+            item_types[name] = item_types.get(name, 0) + 1
+    wrappers = {}
+    for name in ("analysis", "result", "output", "extraction"):
+        if name in value:
+            item = value[name]
+            wrappers[name] = (
+                "null" if item is None else "dict" if isinstance(item, dict)
+                else "list" if isinstance(item, list) else "str" if isinstance(item, str)
+                else "bool" if isinstance(item, bool) else "number" if isinstance(item, (int, float))
+                else "other"
+            )
+    return {
+        "top_level_shape": _safe_top_level_shape(value),
+        "unknown_top_level_key_count": sum(
+            1 for key in value if not isinstance(key, str) or key.casefold() not in allowed_keys
+        ),
+        "claims_item_types": item_types,
+        "wrapper_shapes": wrappers,
+    }
 
 
 def _response_diagnostic(result, *, retry_count=0, top_level_shape=None):
@@ -321,26 +398,43 @@ def _call_json_with_retry(
             continue
 
         parsed = parse_first_json_value(content)
-        if parsed is None or not isinstance(parsed, dict):
+        is_chunk_contract = validator is _validate_chunk_extraction_result
+        if parsed == {}:
+            # Preserve the shared structured-output contract for both chunk and
+            # profile callers. Chunk validation contributes a safe schema issue,
+            # while profile normalization remains untouched.
+            validation = validator(parsed) if is_chunk_contract else None
+            last_stage = "empty_structured_output"
+            last_diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries)
+            if isinstance(validation, _ChunkValidationResult):
+                last_diagnostic.update(validation.diagnostic or {})
+                if validation.issue_code:
+                    last_diagnostic["schema_issue_code"] = validation.issue_code
+            else:
+                last_diagnostic["top_level_shape"] = {}
+            last_diagnostic["failure_code"] = last_stage
+            continue
+        if parsed is None or (not isinstance(parsed, dict) and not is_chunk_contract):
             last_stage = "invalid_structured_output"
             last_diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries)
             last_diagnostic["top_level_shape"] = _safe_top_level_shape(parsed) if parsed is not None else {}
             last_diagnostic["failure_code"] = last_stage
             continue
-        if not parsed:
-            last_stage = "empty_structured_output"
-            last_diagnostic = _response_diagnostic(result, retry_count=attempt + transport_retries, top_level_shape={})
-            last_diagnostic["failure_code"] = last_stage
-            continue
         try:
-            validated = validator(parsed) if validator is not None else parsed
+            validation = validator(parsed) if validator is not None else parsed
         except Exception:
-            validated = None
+            validation = None
+        validation_result = validation if isinstance(validation, _ChunkValidationResult) else None
+        validated = validation_result.normalized if validation_result is not None else validation
         if validated is None:
             last_stage = "schema_validation_failure"
             last_diagnostic = _response_diagnostic(
                 result, retry_count=attempt + transport_retries, top_level_shape=_safe_top_level_shape(parsed),
             )
+            if validation_result is not None:
+                last_diagnostic.update(validation_result.diagnostic or {})
+                if validation_result.issue_code:
+                    last_diagnostic["schema_issue_code"] = validation_result.issue_code
             last_diagnostic["failure_code"] = last_stage
             continue
         return validated
@@ -437,15 +531,41 @@ def _first_exact_text_alias(value, aliases):
     return ""
 
 
-def normalize_chunk_extraction(value):
-    """Normalize optional per-chunk dimensions while requiring meaningful content."""
+_CHUNK_STATUS_VALUES = frozenset({"content", "no_relevant_content"})
+_SCHEMA_ISSUE_CODES = frozenset({
+    "empty_without_explicit_status", "invalid_chunk_status", "inconsistent_no_relevant_content",
+    "invalid_claims_container", "invalid_claim_item", "invalid_academic_field",
+    "unsupported_wrapper_shape", "no_meaningful_content",
+})
+
+
+def _validate_chunk_extraction_result(value, *, allow_no_relevant_content=True):
+    """Validate a source chunk and return safe schema diagnostics on failure."""
+    diagnostics = _schema_shape_diagnostics(value)
+
+    def rejected(issue_code):
+        safe_issue_code = issue_code if issue_code in _SCHEMA_ISSUE_CODES else "unsupported_wrapper_shape"
+        return _ChunkValidationResult(None, safe_issue_code, diagnostics)
+
     if not isinstance(value, dict):
-        return None
+        return rejected("unsupported_wrapper_shape")
+
+    has_recognized_fields = any(
+        alias in value for aliases in _CHUNK_FIELD_ALIASES.values() for alias in aliases
+    ) or "claims" in value
+    if not has_recognized_fields and "chunk_status" not in value:
+        return rejected("empty_without_explicit_status" if not value else "unsupported_wrapper_shape")
+
+    explicit_status = "chunk_status" in value
+    status = value.get("chunk_status") if explicit_status else None
+    if explicit_status and (not isinstance(status, str) or status not in _CHUNK_STATUS_VALUES):
+        return rejected("invalid_chunk_status")
+
     normalized = {}
     for name in _CHUNK_TEXT_FIELDS:
         text = _first_text_alias(value, _CHUNK_FIELD_ALIASES[name])
         if text is None:
-            return None
+            return rejected("invalid_academic_field")
         normalized[name] = text
 
     raw_claims = value.get("claims")
@@ -455,35 +575,62 @@ def normalize_chunk_extraction(value):
         raw_claims = [raw_claims]
     elif isinstance(raw_claims, dict):
         raw_claims = [raw_claims]
-    if not isinstance(raw_claims, list):
-        return None
-    if len(raw_claims) > _MAX_NORMALIZED_CLAIMS:
-        return None
+    if not isinstance(raw_claims, list) or len(raw_claims) > _MAX_NORMALIZED_CLAIMS:
+        return rejected("invalid_claims_container")
+
     claims = []
     for claim in raw_claims:
+        if claim is None or claim == "" or claim == {}:
+            continue
         if isinstance(claim, str):
             item = {"section": "", "claim": claim.strip(), "evidence_text": ""}
         elif isinstance(claim, dict):
-            item = {}
             aliases = {
                 "section": ("section", "dimension", "type"),
                 "claim": ("claim", "statement", "assertion", "content", "text"),
                 "evidence_text": ("evidence_text", "evidence", "quote", "quotation", "source_quote"),
             }
-            for name, fields in aliases.items():
-                text = _first_exact_text_alias(claim, fields) if name == "evidence_text" else _first_text_alias(claim, fields)
-                if text is None:
-                    return None
-                item[name] = text
+            section = _first_text_alias(claim, aliases["section"])
+            claim_text = _first_text_alias(claim, aliases["claim"])
+            quote = _first_exact_text_alias(claim, aliases["evidence_text"])
+            if section is None or claim_text is None:
+                return rejected("invalid_claim_item")
+            item = {
+                "section": section,
+                "claim": claim_text,
+                # Evidence is a provenance token, never a value to flatten or guess.
+                "evidence_text": quote if isinstance(quote, str) else "",
+            }
         else:
-            return None
+            return rejected("invalid_claim_item")
         if item["claim"]:
             claims.append(item)
     normalized["claims"] = claims
 
-    if not any(normalized[name] for name in _CHUNK_TEXT_FIELDS) and not claims:
-        return None
-    return normalized
+    meaningful = any(normalized[name] for name in _CHUNK_TEXT_FIELDS) or bool(claims)
+    if status == "no_relevant_content":
+        required_empty_shape = set(_CHUNK_TEXT_FIELDS) | {"claims", "chunk_status"}
+        has_complete_empty_shape = (
+            required_empty_shape.issubset(value)
+            and isinstance(value.get("claims"), list)
+            and not claims
+        )
+        if meaningful or not has_complete_empty_shape:
+            return rejected("inconsistent_no_relevant_content")
+        if not allow_no_relevant_content:
+            return rejected("no_meaningful_content")
+        normalized["chunk_status"] = "no_relevant_content"
+        return _ChunkValidationResult(normalized)
+
+    if not meaningful:
+        return rejected("no_meaningful_content" if explicit_status else "empty_without_explicit_status")
+    normalized["chunk_status"] = "content"
+    return _ChunkValidationResult(normalized)
+
+
+def normalize_chunk_extraction(value):
+    """Return the canonical chunk mapping, or None when its contract is invalid."""
+    return _validate_chunk_extraction_result(value).normalized
 
 
 def _validate_chunk_extraction(value):
@@ -588,15 +735,21 @@ def build_reduction_prompt(title, extractions, level, locale="en", retry=False):
     )
 
 
-def _reduction_extraction(value):
-    normalized = normalize_chunk_extraction(value)
-    if normalized is None:
-        return None
+def _reduction_extraction_result(value):
+    result = _validate_chunk_extraction_result(value, allow_no_relevant_content=False)
+    if result.normalized is None:
+        return result
+    normalized = result.normalized
     normalized["claims"] = [
         {"section": item["section"], "claim": item["claim"], "evidence_text": ""}
         for item in normalized["claims"]
     ]
-    return normalized
+    return _ChunkValidationResult(normalized)
+
+
+def _reduction_extraction(value):
+    """Keep legacy mapping behavior while rejecting source-only empty statuses."""
+    return _reduction_extraction_result(value).normalized
 
 
 def _serialized_extractions_size(extractions):
@@ -626,7 +779,7 @@ def _reduce_extraction_group(llm_call, title, group, level, locale):
             llm_call,
             lambda retry: build_reduction_prompt(title, group, level, locale, retry),
             MAX_CHUNK_ATTEMPTS,
-            validator=_reduction_extraction,
+            validator=_reduction_extraction_result,
             token_budgets=(LITERATURE_REDUCTION_TOKEN_BUDGET,),
             retry_on_length=False,
         )
@@ -687,6 +840,18 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
     chunks = chunk_document_text(document_text, max_chars=max_chars)
     extractions = []
     evidence = []
+    processed_source_locators = []
+    empty_source_locators = []
+
+    def source_coverage_diagnostic():
+        limit = 500
+        return {
+            "processed_source_locator_count": len(processed_source_locators),
+            "processed_source_locators": processed_source_locators[:limit],
+            "empty_source_locator_count": len(empty_source_locators),
+            "empty_source_locators": empty_source_locators[:limit],
+            "source_locator_list_truncated": len(processed_source_locators) > limit or len(empty_source_locators) > limit,
+        }
 
     def extract_tree(source_chunk, chunk_index, locator, split_depth):
         try:
@@ -696,7 +861,7 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
                     title, source_chunk, chunk_index, len(chunks), locale, retry, source_locator=locator,
                 ),
                 MAX_CHUNK_ATTEMPTS,
-                validator=_validate_chunk_extraction,
+                validator=_validate_chunk_extraction_result,
                 token_budgets=(LITERATURE_CHUNK_TOKEN_BUDGETS[0],),
                 retry_on_length=False,
             )
@@ -738,6 +903,10 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
                 "message": "A literature source chunk could not be analyzed; no partial analysis was stored.",
             }
         for extraction, source_chunk, locator in leaves:
+            processed_source_locators.append(locator)
+            if extraction.get("chunk_status") == "no_relevant_content":
+                empty_source_locators.append(locator)
+                continue
             extractions.append({"source_locator": locator, "extraction": extraction})
             for claim in extraction["claims"]:
                 claim_text = str(claim.get("claim", "") or "").strip()
@@ -753,6 +922,20 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
                     "evidence_text": quote,
                     "source_locator": f"chunk {locator}",
                 })
+    if not extractions:
+        diagnostic = {
+            "stage": "chunk",
+            "chunk_index": None,
+            "chunks_total": len(chunks),
+            "failure_code": "no_academic_content",
+            **source_coverage_diagnostic(),
+        }
+        return {
+            "status": "error", "profile": None, "evidence": [], "chunks_total": len(chunks),
+            "failed_chunk": 0, "failure_stage": "no_academic_content",
+            "failure_code": "no_academic_content", "diagnostic": diagnostic,
+            "message": "No extractable academic content was found; no profile or rating was created.",
+        }
     try:
         synthesis_inputs = _hierarchically_reduce_extractions(llm_call, title, extractions, locale)
         profile_raw = _call_json_with_retry(
@@ -782,7 +965,10 @@ def analyze_literature_document(document_text, title, llm_call, *, locale="en", 
             "message": "The complete literature profile could not be synthesized; prior analysis was kept.",
         }
     profile = profile_raw
-    return {"status": "ok", "profile": profile, "evidence": evidence, "chunks_total": len(chunks), "failed_chunk": 0, "message": ""}
+    return {
+        "status": "ok", "profile": profile, "evidence": evidence, "chunks_total": len(chunks),
+        "failed_chunk": 0, "diagnostic": source_coverage_diagnostic(), "message": "",
+    }
 
 
 def build_literature_profile_digest(literatures, max_chars=12000, locale="en"):

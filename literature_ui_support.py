@@ -54,6 +54,7 @@ _FAILURE_MESSAGES = {
         "invalid_structured_output": "The source was saved, but the AI returned malformed structured data. Retry; no partial profile or evidence was stored.",
         "empty_structured_output": "The source was saved, but the AI returned empty analysis data. Retry; no partial profile or evidence was stored.",
         "schema_validation_failure": "The source was saved, but the AI data did not match the literature-analysis schema. Retry; no partial profile or evidence was stored.",
+        "no_academic_content": "The source was saved, but no analyzable academic content was extracted; no literature rating or profile was created.",
         "document_synthesis": "Chunk analysis completed, but full-document synthesis failed. The source was kept; no partial profile or evidence was stored.",
         "synthesis_reduction_failure": "The ordered chunk analyses could not be compacted safely for full-document synthesis. The source was kept; no partial profile or evidence was stored.",
     },
@@ -62,6 +63,7 @@ _FAILURE_MESSAGES = {
         "invalid_structured_output": "原始资料已保存，但 AI 返回的数据格式异常。请重试；未保存部分档案或证据。",
         "empty_structured_output": "原始资料已保存，但 AI 返回了空的分析数据。请重试；未保存部分档案或证据。",
         "schema_validation_failure": "原始资料已保存，但 AI 返回内容不符合文献分析格式。请重试；未保存部分档案或证据。",
+        "no_academic_content": "原文已保存，但 AI 未从该文献中提取到可分析的学术内容，因此没有生成文献评级与档案。",
         "document_synthesis": "文献分块已处理，但整篇档案合并失败。原始资料已保留，未保存部分档案或证据。",
         "synthesis_reduction_failure": "无法在安全限制内归并全部文献分块。原始资料已保留，未保存部分档案或证据。",
     },
@@ -73,6 +75,7 @@ _REANALYSIS_FAILURE_MESSAGES = {
         "invalid_structured_output": "The AI returned malformed structured data during re-analysis. Existing profile and evidence were preserved.",
         "empty_structured_output": "The AI returned empty analysis data during re-analysis. Existing profile and evidence were preserved.",
         "schema_validation_failure": "The AI data did not match the literature-analysis schema. Existing profile and evidence were preserved.",
+        "no_academic_content": "No analyzable academic content was extracted during re-analysis. Existing profile and evidence were preserved.",
         "document_synthesis": "Full-document synthesis failed during re-analysis. Existing profile and evidence were preserved.",
         "synthesis_reduction_failure": "The ordered chunk analyses could not be compacted safely. Existing profile and evidence were preserved.",
     },
@@ -81,6 +84,7 @@ _REANALYSIS_FAILURE_MESSAGES = {
         "invalid_structured_output": "重新分析时 AI 返回的数据格式异常；原有档案与证据保持不变。",
         "empty_structured_output": "重新分析时 AI 返回了空的分析数据；原有档案与证据保持不变。",
         "schema_validation_failure": "重新分析时 AI 返回内容不符合文献分析格式；原有档案与证据保持不变。",
+        "no_academic_content": "重新分析未提取到可分析的学术内容；原有档案与证据保持不变。",
         "document_synthesis": "文献分块已处理，但整篇档案合并失败；原有档案与证据保持不变。",
         "synthesis_reduction_failure": "无法在安全限制内归并全部文献分块；原有档案与证据保持不变。",
     },
@@ -108,13 +112,56 @@ _FAILURE_GROUPS = {
     "incomplete_response": "provider",
     "source_extraction_failure": "source",
     "empty_source": "source",
+    "no_academic_content": "empty_academic",
 }
+
+_SCHEMA_ISSUE_CODES = frozenset({
+    "empty_without_explicit_status", "invalid_chunk_status", "inconsistent_no_relevant_content",
+    "invalid_claims_container", "invalid_claim_item", "invalid_academic_field",
+    "unsupported_wrapper_shape", "no_meaningful_content",
+})
+_SCHEMA_ISSUE_LABELS = {
+    "en": {
+        "empty_without_explicit_status": "academic fields are empty without an explicit empty-chunk status",
+        "invalid_chunk_status": "chunk_status is missing an allowed value",
+        "inconsistent_no_relevant_content": "no_relevant_content conflicts with the normalized fields or empty schema",
+        "invalid_claims_container": "claims is not a supported list or single claim",
+        "invalid_claim_item": "invalid claim item",
+        "invalid_academic_field": "an academic text field could not be normalized safely",
+        "unsupported_wrapper_shape": "unsupported top-level JSON wrapper or shape",
+        "no_meaningful_content": "content was selected but no academic information or claim was present",
+    },
+    "zh": {
+        "empty_without_explicit_status": "学术字段为空，但未明确标记为空分块",
+        "invalid_chunk_status": "chunk_status 缺失或不属于允许值",
+        "inconsistent_no_relevant_content": "no_relevant_content 与字段内容或空结构不一致",
+        "invalid_claims_container": "claims 不是受支持的列表或单条主张",
+        "invalid_claim_item": "主张条目结构无效",
+        "invalid_academic_field": "学术文本字段无法安全规范化",
+        "unsupported_wrapper_shape": "顶层 JSON 包装或结构不受支持",
+        "no_meaningful_content": "已标记为 content，但没有学术信息或有效主张",
+    },
+}
+_SAFE_RESULT_FAILURE_CODES = frozenset(_FAILURE_GROUPS) | frozenset({
+    "document_synthesis", "schema_validation_failure", "provider_call", "no_academic_content",
+})
+_SAFE_TOP_LEVEL_KEYS = frozenset({
+    "research_question", "research_questions", "question", "questions", "theory", "theoretical_framework", "framework",
+    "method", "methods", "methodology", "sample", "participants", "subjects", "data", "dataset", "datasets",
+    "data_source", "data_sources", "results", "findings", "key_findings", "limitations", "limitation",
+    "conclusion", "conclusions", "definitions", "definition", "key_definitions", "claims", "chunk_status",
+    "rating", "category", "type", "literature_type", "quality_assessment", "quality", "quality_evaluation",
+    "relevance_reason", "relevance", "relevance_to_topic", "summary", "abstract", "overview",
+    "analysis", "result", "output", "extraction",
+})
+_SAFE_DIAGNOSTIC_KINDS = frozenset({"null", "bool", "str", "dict", "list", "number", "other"})
 
 
 def _result_failure_code(result):
     if not isinstance(result, dict):
         return "provider_call"
-    return str(result.get("failure_code") or result.get("failure_stage") or "provider_call")
+    code = result.get("failure_code") or result.get("failure_stage") or "provider_call"
+    return code if isinstance(code, str) and code in _SAFE_RESULT_FAILURE_CODES else "provider_call"
 
 
 def _failure_detail(result, locale="en"):
@@ -155,6 +202,7 @@ def _failure_detail(result, locale="en"):
             "schema_validation_failure": "结构化数据不兼容" + chunk_text,
             "invalid_structured_output": "结构化 JSON 格式无效" + chunk_text,
             "empty_structured_output": "模型返回了空分析内容" + chunk_text,
+            "no_academic_content": "AI 未从该文献中提取到可分析的学术内容，因此没有生成文献评级与档案",
             "truncated_output": truncated_detail + chunk_text + locator_text,
             "synthesis_reduction_failure": reduction_detail,
             "content_filtered": "模型内容安全过滤阻止了本次分析" + chunk_text,
@@ -193,6 +241,7 @@ def _failure_detail(result, locale="en"):
         "schema_validation_failure": "Incompatible structured data" + chunk_text,
         "invalid_structured_output": "Malformed structured JSON" + chunk_text,
         "empty_structured_output": "The model returned empty analysis" + chunk_text,
+        "no_academic_content": "no academic content suitable for analysis was extracted, so no literature rating or profile was created",
         "truncated_output": truncated_detail + chunk_text + locator_text,
         "synthesis_reduction_failure": "The chunk analyses could not be compacted within bounded synthesis limits",
         "content_filtered": "The model's content filter blocked this analysis" + chunk_text,
@@ -240,6 +289,8 @@ def failure_message(result, locale="en", *, reanalysis=False):
             else f"{detail}; existing profile and evidence were preserved."
         )
     if language == "zh":
+        if _result_failure_code(result) == "no_academic_content":
+            return f"原文已保存，但 {detail}。"
         return f"原始资料已保存，但{detail}；未保存部分档案或证据。"
     return f"The source was saved, but {detail}; no partial profile or evidence was stored."
 
@@ -270,6 +321,7 @@ def summarize_literature_batch(items, locale="en"):
         summary = f"本批次共 {len(outcomes)} 篇：成功分析 {analyzed}，仅保存原文 {source_only}。"
         names = {
             "schema": "结构化数据不兼容", "invalid_json": "JSON 格式无效", "empty": "空分析结果",
+            "empty_academic": "未提取到学术内容",
             "truncated": "输出达到长度限制", "reduction": "分块摘要归并失败", "temporary": "服务暂时不可用/请求受限",
             "configuration": "模型配置或账户问题", "filtered": "内容安全过滤", "provider": "其他服务错误",
             "source": "原文提取失败",
@@ -288,6 +340,7 @@ def summarize_literature_batch(items, locale="en"):
     summary = f"Batch: {len(outcomes)} files; analyzed {analyzed}; original only {source_only}."
     names = {
         "schema": "incompatible structured data", "invalid_json": "invalid JSON", "empty": "empty analysis",
+        "empty_academic": "no academic content extracted",
         "truncated": "length-limited output", "reduction": "chunk reduction failure", "temporary": "temporary service/rate-limit issue",
         "configuration": "model configuration/account issue", "filtered": "content filter", "provider": "other provider error",
         "source": "source extraction failure",
@@ -304,60 +357,131 @@ def summarize_literature_batch(items, locale="en"):
     return summary
 
 
+def _safe_diagnostic(raw_diagnostic):
+    """Copy only enumerated values and structural counts; never retain model text."""
+    raw = raw_diagnostic if isinstance(raw_diagnostic, dict) else {}
+    diagnostic = {}
+    for key in ("chunk_index", "chunks_total", "http_status", "response_chars", "retry_count", "source_chars", "split_depth", "reduction_level", "unknown_top_level_key_count"):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000_000:
+            if key != "http_status" or 100 <= value <= 599:
+                diagnostic[key] = value
+    locator = raw.get("source_locator")
+    if isinstance(locator, str) and re.fullmatch(r"\d+(?:\.\d+)*", locator):
+        diagnostic["source_locator"] = locator
+    stage = raw.get("stage")
+    if isinstance(stage, str) and stage in {"input", "chunk", "synthesis", "synthesis_reduction"}:
+        diagnostic["stage"] = stage
+    finish_reason = raw.get("finish_reason")
+    if isinstance(finish_reason, str) and finish_reason in {"stop", "length", "content_filter", "insufficient_system_resource", "aborted", "unknown"}:
+        diagnostic["finish_reason"] = finish_reason
+    structured_mode = raw.get("structured_mode")
+    if isinstance(structured_mode, str) and structured_mode in {"native", "compatibility", "legacy", "unknown"}:
+        diagnostic["structured_mode"] = structured_mode
+    failure_code = raw.get("failure_code")
+    if isinstance(failure_code, str) and failure_code in _SAFE_RESULT_FAILURE_CODES:
+        diagnostic["failure_code"] = failure_code
+    schema_issue = raw.get("schema_issue_code")
+    if isinstance(schema_issue, str) and schema_issue in _SCHEMA_ISSUE_CODES:
+        diagnostic["schema_issue_code"] = schema_issue
+    top_shape = raw.get("top_level_shape")
+    if isinstance(top_shape, dict):
+        diagnostic["top_level_shape"] = {
+            key.casefold(): kind
+            for key, kind in list(top_shape.items())[:32]
+            if isinstance(key, str) and key.casefold() in _SAFE_TOP_LEVEL_KEYS
+            and isinstance(kind, str) and kind in _SAFE_DIAGNOSTIC_KINDS
+        }
+    for key in ("claims_item_types", "wrapper_shapes"):
+        source = raw.get(key)
+        if not isinstance(source, dict):
+            continue
+        allowed_names = {"null", "bool", "str", "dict", "list", "number", "other"} if key == "claims_item_types" else {"analysis", "result", "output", "extraction"}
+        normalized = {}
+        for name, value in list(source.items())[:16]:
+            if not isinstance(name, str) or name.casefold() not in allowed_names:
+                continue
+            if key == "claims_item_types" and isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
+                normalized[name.casefold()] = value
+            elif key == "wrapper_shapes" and isinstance(value, str) and value in _SAFE_DIAGNOSTIC_KINDS:
+                normalized[name.casefold()] = value
+        diagnostic[key] = normalized
+    return diagnostic
+
+
 def _safe_batch_notice(items):
     """Keep only filename, outcome, and whitelisted safe diagnostics across rerun."""
-    diagnostic_fields = (
-        "stage", "chunk_index", "chunks_total", "failure_code", "finish_reason",
-        "http_status", "response_chars", "structured_mode", "retry_count", "top_level_shape",
-        "source_locator", "source_chars", "split_depth", "reduction_level",
-    )
     safe = []
     for item in items if isinstance(items, (list, tuple)) else ():
         if not isinstance(item, dict):
             continue
         result = item.get("result", {}) if isinstance(item.get("result"), dict) else {}
         raw_diagnostic = result.get("diagnostic", {}) if isinstance(result.get("diagnostic"), dict) else {}
-        diagnostic = {}
-        for key in diagnostic_fields:
-            if key not in raw_diagnostic:
-                continue
-            value = raw_diagnostic[key]
-            if key == "source_locator":
-                if isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+)*", value):
-                    diagnostic[key] = value
-            elif key == "top_level_shape":
-                if isinstance(value, dict):
-                    diagnostic[key] = {
-                        str(name)[:60]: str(kind)[:24]
-                        for name, kind in list(value.items())[:24]
-                        if isinstance(name, str) and isinstance(kind, str)
-                    }
-            elif key in {"source_chars", "split_depth", "reduction_level", "chunk_index", "chunks_total", "http_status", "response_chars", "retry_count"}:
-                if isinstance(value, int) and not isinstance(value, bool):
-                    diagnostic[key] = value
-            elif key == "stage":
-                if isinstance(value, str) and value in {"input", "chunk", "synthesis", "synthesis_reduction"}:
-                    diagnostic[key] = value
-            elif key == "finish_reason":
-                if isinstance(value, str) and value in {"stop", "length", "content_filter", "insufficient_system_resource", "aborted", "unknown"}:
-                    diagnostic[key] = value
-            elif key == "structured_mode":
-                if isinstance(value, str) and value in {"native", "compatibility", "legacy", "unknown"}:
-                    diagnostic[key] = value
-            elif key == "failure_code":
-                if isinstance(value, str) and re.fullmatch(r"[a-z_]{1,80}", value):
-                    diagnostic[key] = value
+        stage = result.get("failure_stage")
         safe.append({
             "filename": str(item.get("filename", "file"))[:240],
             "success": bool(item.get("success")),
             "source_saved": bool(item.get("source_saved")),
             "result": {
-                "failure_code": str(result.get("failure_code") or result.get("failure_stage") or "provider_call")[:80],
-                "failure_stage": str(result.get("failure_stage") or "")[:80],
-                "diagnostic": diagnostic,
+                "failure_code": _result_failure_code(result),
+                "failure_stage": stage if isinstance(stage, str) and stage in _SAFE_RESULT_FAILURE_CODES | {"input", "chunk", "synthesis", "synthesis_reduction"} else "",
+                "diagnostic": _safe_diagnostic(raw_diagnostic),
             },
         })
     return safe
+
+
+def _technical_diagnostic_lines(item, locale="en"):
+    language = "zh" if str(locale).lower().startswith("zh") else "en"
+    safe_item = _safe_batch_notice([item])
+    if not safe_item:
+        return []
+    result = safe_item[0]["result"]
+    diagnostic = result["diagnostic"]
+    labels = {
+        "en": {"stage": "Failure stage", "position": "Failure position", "category": "Failure category", "schema": "Schema reason", "finish": "Finish reason", "locator": "Source locator", "shape": "Top-level shape", "claims": "Claim item types", "wrapper": "Known wrapper", "unknown": "Unknown top-level key count"},
+        "zh": {"stage": "失败阶段", "position": "失败位置", "category": "失败类别", "schema": "结构原因", "finish": "完成原因", "locator": "源分块", "shape": "顶层字段类型", "claims": "主张条目类型", "wrapper": "已知包装字段", "unknown": "未知顶层字段数"},
+    }[language]
+    lines = []
+    stage = diagnostic.get("stage") or result.get("failure_stage")
+    if stage:
+        lines.append(f"{labels['stage']}: {stage}")
+    chunk_index = diagnostic.get("chunk_index")
+    chunks_total = diagnostic.get("chunks_total")
+    if isinstance(chunk_index, int) and isinstance(chunks_total, int):
+        lines.append(f"{labels['position']}: {chunk_index}/{chunks_total}")
+    failure_code = result.get("failure_code")
+    if failure_code:
+        lines.append(f"{labels['category']}: {failure_code}")
+    issue = diagnostic.get("schema_issue_code")
+    if issue:
+        lines.append(f"{labels['schema']}: {_SCHEMA_ISSUE_LABELS[language][issue]}")
+    if diagnostic.get("finish_reason"):
+        lines.append(f"{labels['finish']}: {diagnostic['finish_reason']}")
+    if diagnostic.get("source_locator"):
+        lines.append(f"{labels['locator']}: {diagnostic['source_locator']}")
+    shape = diagnostic.get("top_level_shape", {})
+    if shape:
+        lines.append(f"{labels['shape']}: " + ", ".join(f"{key}={kind}" for key, kind in shape.items()))
+    claims = diagnostic.get("claims_item_types", {})
+    if claims:
+        lines.append(f"{labels['claims']}: " + ", ".join(f"{kind}={count}" for kind, count in claims.items()))
+    wrappers = diagnostic.get("wrapper_shapes", {})
+    if wrappers:
+        lines.append(f"{labels['wrapper']}: " + ", ".join(f"{key}={kind}" for key, kind in wrappers.items()))
+    if "unknown_top_level_key_count" in diagnostic:
+        lines.append(f"{labels['unknown']}: {diagnostic['unknown_top_level_key_count']}")
+    return lines
+
+
+def _render_technical_diagnostic(st, item, locale="en"):
+    lines = _technical_diagnostic_lines(item, locale)
+    if not lines:
+        return
+    label = "技术诊断（不含原文）" if str(locale).lower().startswith("zh") else "Technical diagnostics (no source text)"
+    with st.expander(label, expanded=False):
+        for line in lines:
+            st.caption(line)
 
 
 def literature_summary_for_display(literature, locale="en"):
@@ -435,11 +559,13 @@ def _import_one(title, text, source, link, raw_bytes, extension, literatures, ev
 def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extract_upload_text, llm_call, save_records, save_evidence, locale="en", *, research_topic="", research_context=""):
     labels = _LABELS[locale]
     st.subheader(labels["heading"])
-    previous_notice = st.session_state.pop("literature_batch_notice", None)
+    previous_notice = st.session_state.get("literature_batch_notice")
     if isinstance(previous_notice, list):
         for item in previous_notice:
             rendered = format_batch_outcome(item, locale)
             (st.success if item.get("success") else st.warning)(rendered)
+            if not item.get("success"):
+                _render_technical_diagnostic(st, item, locale)
         st.info(summarize_literature_batch(previous_notice, locale))
     uploads = st.file_uploader(labels["upload"], type=["pdf", "docx", "txt"], accept_multiple_files=True, key="literature_full_uploads")
     if uploads and st.button(labels["import"], key="literature_full_import"):
@@ -495,11 +621,13 @@ def render_literature_ingestion(st, literatures, evidence_store, raw_dir, extrac
                 if success:
                     st.success(format_batch_outcome({"filename": title.strip(), "success": True}, locale))
                 else:
-                    st.warning(format_batch_outcome({
+                    outcome = {
                         "filename": title.strip(), "success": False,
                         "source_saved": bool(literatures and literatures[-1].get("file_path")),
                         "result": result,
-                    }, locale))
+                    }
+                    st.session_state["literature_batch_notice"] = _safe_batch_notice([outcome])
+                    st.warning(format_batch_outcome(outcome, locale))
                 st.rerun()
 
 
@@ -528,6 +656,10 @@ def render_legacy_reanalysis(st, literature, literatures, evidence_store, raw_di
         updated, new_store, success = apply_analysis_to_literature_record(literature, evidence_store, result)
         if not success:
             st.warning(failure_message(result, locale, reanalysis=True))
+            _render_technical_diagnostic(st, {
+                "filename": str(literature.get("title", "literature")),
+                "success": False, "source_saved": True, "result": result,
+            }, locale)
             return
         literature.update(updated)
         save_records(literatures)

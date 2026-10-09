@@ -229,7 +229,7 @@ class LiteraturePartialSchemaTests(unittest.TestCase):
         self.assertEqual(normalized, {
             "research_question": "", "theory": "", "method": "Interview", "sample": "",
             "data": "", "results": "", "claims": [], "limitations": "", "conclusion": "",
-            "definitions": "",
+            "definitions": "", "chunk_status": "content",
         })
 
     def test_partial_academic_chunk_is_accepted_without_retry(self):
