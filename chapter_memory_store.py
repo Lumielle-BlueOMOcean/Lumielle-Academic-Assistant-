@@ -27,6 +27,34 @@ def database_path(data_dir) -> str:
     return str(Path(data_dir) / DATABASE_NAME)
 
 
+def clear_chapter_memory_store(data_dir):
+    """Atomically clear Memory V2 rows without changing drafts or legacy summaries."""
+    path = database_path(data_dir)
+    if not os.path.exists(path):
+        return {"cleared": True, "chapters_cleared": 0, "items_cleared": 0, "error_code": None}
+    connection = None
+    try:
+        connection = sqlite3.connect(path, timeout=5)
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("BEGIN IMMEDIATE")
+        chapters = connection.execute("SELECT COUNT(*) FROM chapter_memories").fetchone()[0]
+        items = connection.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0]
+        connection.execute("DELETE FROM memory_items")
+        connection.execute("DELETE FROM chapter_memories")
+        connection.commit()
+        return {"cleared": True, "chapters_cleared": chapters, "items_cleared": items, "error_code": None}
+    except (sqlite3.DatabaseError, OSError, ValueError):
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.DatabaseError:
+                pass
+        return {"cleared": False, "chapters_cleared": 0, "items_cleared": 0, "error_code": "database_error"}
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def initialize_memory_store(data_dir) -> str:
     """Create the local store and its two business tables if they do not exist."""
     root = Path(data_dir)

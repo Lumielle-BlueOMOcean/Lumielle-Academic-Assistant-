@@ -1,7 +1,7 @@
 """Bilingual, low-configuration chapter-memory controls for Streamlit."""
 
 from chapter_memory_store import read_chapter_memory, set_memory_item_confirmation
-from chapter_memory_support import _leaf_nodes, refresh_chapter_memory_snapshot, structured_memory_llm_call
+from chapter_memory_support import MemoryBuildError, _leaf_nodes, refresh_chapter_memory_snapshot, structured_memory_llm_call
 
 
 _TEXT = {
@@ -30,7 +30,10 @@ _TEXT = {
         "empty": "The saved chapter has no text to analyze.",
         "updated": "Chapter memory updated.",
         "reused": "This saved chapter already has current memory.",
-        "preview": "What will this writing use?",
+        "preview": "Expected context for this chapter",
+        "actual": "Most recent generation actually used",
+        "actual_none": "No actual chapter-generation request is recorded in this session yet.",
+        "prompt_hash": "Prompt hash",
         "preview_selected": "Selected memory items: {count}",
         "preview_missing": "Chapters needing memory: {count}",
         "preview_sources": "Context chapters: {chapters}",
@@ -63,7 +66,10 @@ _TEXT = {
         "empty": "当前没有可分析的已保存正文。",
         "updated": "本章记忆已更新。",
         "reused": "已保存正文已有对应版本的记忆。",
-        "preview": "本次写作会参考什么？",
+        "preview": "本章预计参考内容",
+        "actual": "最近一次生成实际使用的内容",
+        "actual_none": "本会话尚无实际章节生成请求记录。",
+        "prompt_hash": "Prompt 哈希",
         "preview_selected": "选用的记忆条目：{count}",
         "preview_missing": "需要建立或更新记忆的章节：{count}",
         "preview_sources": "本次参考章节：{chapters}",
@@ -107,6 +113,35 @@ _REVIEW_TEXT = {
 
 def _locale_text(locale):
     return _TEXT["zh" if locale == "zh" else "en"]
+
+
+def render_context_manifest_summary(st, locale="en"):
+    """Show the current preview separately from the last successful generation."""
+    text = _locale_text(locale)
+    preview = st.session_state.get("chapter_context_preview_manifest") or {}
+    actual = st.session_state.get("last_generation_context_manifest") or {}
+
+    def render_manifest(label, manifest, *, actual_generation=False):
+        st.markdown(f"#### 👁️ {label}")
+        if actual_generation and not manifest:
+            st.caption(text["actual_none"])
+            return
+        st.caption(text["preview_selected"].format(count=len(manifest.get("selected_memory_ids", []))))
+        st.caption(text["preview_missing"].format(count=len(manifest.get("missing_or_stale_chapters", []))))
+        selected_titles = [row.get("title") or row.get("chapter_id", "") for row in manifest.get("selected_chapters", [])]
+        missing_titles = [row.get("title") or row.get("chapter_id", "") for row in manifest.get("missing_or_stale_chapters", [])]
+        omitted_titles = [row.get("title") or row.get("chapter_id", "") for row in manifest.get("omitted_chapters", [])]
+        separator = "、" if locale == "zh" else ", "
+        st.caption(text["preview_sources"].format(chapters=separator.join(selected_titles) if selected_titles else text["preview_none"]))
+        st.caption(text["preview_omitted"].format(chapters=separator.join(omitted_titles) if omitted_titles else text["preview_none"]))
+        if missing_titles:
+            prefix = "缺少或需要更新记忆的章节：" if locale == "zh" else "Chapters missing current memory: "
+            st.caption(prefix + separator.join(missing_titles))
+        if actual_generation and manifest.get("prompt_hash"):
+            st.caption(f"{text['prompt_hash']}: {manifest['prompt_hash']}")
+
+    render_manifest(text["preview"], preview)
+    render_manifest(text["actual"], actual, actual_generation=True)
 
 
 def render_chapter_memory_panel(
@@ -163,17 +198,7 @@ def render_chapter_memory_panel(
         else:
             st.success(text["reused"] if result["reused"] else text["updated"])
 
-    st.markdown(f"#### 👁️ {text['preview']}")
-    manifest = st.session_state.get("chapter_context_manifest") or {}
-    st.caption(text["preview_selected"].format(count=len(manifest.get("selected_memory_ids", []))))
-    st.caption(text["preview_missing"].format(count=len(manifest.get("missing_or_stale_chapters", []))))
-    selected_titles = [row.get("title") or row.get("chapter_id", "") for row in manifest.get("selected_chapters", [])]
-    missing_titles = [row.get("title") or row.get("chapter_id", "") for row in manifest.get("missing_or_stale_chapters", [])]
-    omitted_titles = [row.get("title") or row.get("chapter_id", "") for row in manifest.get("omitted_chapters", [])]
-    st.caption(text["preview_sources"].format(chapters="、".join(selected_titles) if locale == "zh" and selected_titles else ", ".join(selected_titles) if selected_titles else text["preview_none"]))
-    st.caption(text["preview_omitted"].format(chapters="、".join(omitted_titles) if locale == "zh" and omitted_titles else ", ".join(omitted_titles) if omitted_titles else text["preview_none"]))
-    if missing_titles:
-        st.caption(("缺少或需要更新记忆的章节：" if locale == "zh" else "Chapters missing current memory: ") + ("、".join(missing_titles) if locale == "zh" else ", ".join(missing_titles)))
+    render_context_manifest_summary(st, locale=locale)
 
     if outline and isinstance(drafts, dict):
         with st.expander(text["batch"], expanded=False):

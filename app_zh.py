@@ -33,7 +33,7 @@ from chapter_memory_support import (
     save_manifest_for_prompt,
     structured_memory_llm_call,
 )
-from chapter_memory_store import initialize_memory_store
+from chapter_memory_store import clear_chapter_memory_store, initialize_memory_store
 from chapter_memory_ui import render_chapter_memory_panel, render_pending_candidate_reviews
 from chapter_consistency import review_chapter_candidate
 from literature_support import clear_literature_library
@@ -597,8 +597,14 @@ def render_global_sidebar():
                         delete_source_files=c_literature_sources,
                         save_evidence=lambda evidence: save_json_file("literature_evidence.json", evidence),
                     )
+                memory_report = None
+                if "drafts_summary.json" in sel_files:
+                    store_result = clear_chapter_memory_store(DATA_DIR)
+                    memory_report = {"store_cleared": bool(store_result.get("cleared")), "legacy_cleared": False}
+                    if memory_report["store_cleared"]:
+                        memory_report["legacy_cleared"] = bool(save_json_file("drafts_summary.json", {}))
                 for fname in sel_files:
-                    if fname == "literatures.json":
+                    if fname in {"literatures.json", "drafts_summary.json"}:
                         continue
                     if fname in default_files:
                         save_json_file(fname, default_files[fname])
@@ -613,6 +619,12 @@ def render_global_sidebar():
                                 pass
                 if literature_report and not literature_report["records_cleared"]:
                     clear_notice = ("error", "其他所选数据已清除，但文献库记录未能清除。")
+                elif memory_report and (not memory_report["store_cleared"] or not memory_report["legacy_cleared"]):
+                    if not memory_report["store_cleared"]:
+                        message = "Memory V2 SQLite 记忆库清除失败；旧版摘要已保留。其他所选项目可能已清除。"
+                    else:
+                        message = "Memory V2 已清除，但旧版摘要无法重置。其他所选项目可能已清除。"
+                    clear_notice = ("error", message)
                 elif literature_report and c_literature_sources:
                     message = (
                         f"已清除 {len(sel_files)} 项数据。文献库记录已清空；"
@@ -625,6 +637,8 @@ def render_global_sidebar():
                         "success",
                         f"已清除 {len(sel_files)} 项数据。文献库记录已清空；已保留导入的原始文件。",
                     )
+                elif memory_report:
+                    clear_notice = ("success", f"已清除 {len(sel_files)} 项数据。Memory V2 与旧版摘要已清除；正文草稿已保留。")
                 else:
                     clear_notice = ("success", f"已清除 {len(sel_files)} 项数据！")
                 st.session_state["global_clear_notice"] = clear_notice
@@ -1879,7 +1893,7 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
     wc_info = None
     for attempt in range(max_attempts):
         prompt = build_chapter_prompt(sandwich, prompts, correction_note)
-        st.session_state["chapter_context_manifest"] = save_manifest_for_prompt(sandwich, prompt)
+        st.session_state["last_generation_context_manifest"] = save_manifest_for_prompt(sandwich, prompt)
         last_res = require_valid_llm_output(
             dispatch_llm_call(prompt, max_tokens=4000)
         )
@@ -2011,7 +2025,7 @@ def render_single_chapter_editor(tree):
             st.markdown("🧪 **本章为本人实验/方法/数据章节**")
 
         sandwich = build_context_sandwich(sel_id)
-        st.session_state["chapter_context_manifest"] = sandwich.get("context_manifest", {})
+        st.session_state["chapter_context_preview_manifest"] = sandwich.get("context_manifest", {})
         with st.expander("👁️ 全局上下文", expanded=False):
             st.markdown(f"**【全局课题】**：{sandwich['global_topic']}")
             st.markdown(f"**【预期总字数】**：{sandwich['target_word_count']}")

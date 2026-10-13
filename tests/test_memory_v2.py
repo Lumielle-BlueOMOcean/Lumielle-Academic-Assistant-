@@ -733,7 +733,7 @@ class GenerationReviewWiringV2Tests(unittest.TestCase):
                 self.assertEqual(result[2]["status"], "pass")
                 self.assertEqual(len(calls), 2)
                 self.assertEqual(calls[0][0], "Exact generated prompt")
-                self.assertEqual(namespace["st"].session_state["chapter_context_manifest"]["prompt_characters"], len("Exact generated prompt"))
+                self.assertEqual(namespace["st"].session_state["last_generation_context_manifest"]["prompt_characters"], len("Exact generated prompt"))
 
     def test_hard_conflict_skips_semantic_call_and_requires_review(self):
         calls = []

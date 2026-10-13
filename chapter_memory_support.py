@@ -472,17 +472,18 @@ def build_context_sandwich_v2(
                     "source_quote": item["source_quote"],
                     "is_boundary": False,
                 })
-            if not state["items"]:
-                summary = state["narrative_summary"]
+            summary = state["narrative_summary"]
+            if isinstance(summary, str) and summary.strip():
                 entries.append({
                     "memory_id": None,
                     "chapter_id": chapter_id,
                     "chapter_title": chapter.get("title", ""),
                     "side": side,
-                    "priority": max(1, 10 - distance),
-                    "text": f"[{chapter.get('title', '')}] {summary}",
+                    "priority": -1000 + (1 / (distance + 1)),
+                    "text": f"[{chapter.get('title', '')}] {summary.strip()}",
                     "confirmed": False,
                     "is_boundary": False,
+                    "is_summary": True,
                 })
         else:
             missing.append({"chapter_id": chapter_id, "title": chapter.get("title", ""), "status": state["status"]})
@@ -576,7 +577,8 @@ def fit_context_sandwich_to_prompt(sandwich, prompt_builder, max_estimated_token
             manifest.setdefault("omitted_memory_ids", []).append(entry["memory_id"])
             manifest.setdefault("omission_reasons", {})[str(entry["memory_id"])] = "prompt_budget"
         else:
-            manifest.setdefault("omission_reasons", {})[f"{entry.get('chapter_id')}:excerpt"] = "prompt_budget"
+            kind = "summary" if entry.get("is_summary") else "excerpt"
+            manifest.setdefault("omission_reasons", {})[f"{entry.get('chapter_id')}:{kind}"] = "prompt_budget"
     manifest["selected_memory_ids"] = [entry["memory_id"] for entry in included if entry.get("memory_id") is not None]
     manifest["omitted_memory_ids"] = list(dict.fromkeys(manifest.get("omitted_memory_ids", [])))
     selected_chapters = {}

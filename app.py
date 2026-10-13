@@ -33,7 +33,7 @@ from chapter_memory_support import (
     save_manifest_for_prompt,
     structured_memory_llm_call,
 )
-from chapter_memory_store import initialize_memory_store
+from chapter_memory_store import clear_chapter_memory_store, initialize_memory_store
 from chapter_memory_ui import render_chapter_memory_panel, render_pending_candidate_reviews
 from chapter_consistency import review_chapter_candidate
 from literature_support import clear_literature_library
@@ -601,8 +601,14 @@ def render_global_sidebar():
                         delete_source_files=c_literature_sources,
                         save_evidence=lambda evidence: save_json_file("literature_evidence.json", evidence),
                     )
+                memory_report = None
+                if "drafts_summary.json" in sel_files:
+                    store_result = clear_chapter_memory_store(DATA_DIR)
+                    memory_report = {"store_cleared": bool(store_result.get("cleared")), "legacy_cleared": False}
+                    if memory_report["store_cleared"]:
+                        memory_report["legacy_cleared"] = bool(save_json_file("drafts_summary.json", {}))
                 for fname in sel_files:
-                    if fname == "literatures.json":
+                    if fname in {"literatures.json", "drafts_summary.json"}:
                         continue
                     if fname in default_files:
                         save_json_file(fname, default_files[fname])
@@ -620,6 +626,12 @@ def render_global_sidebar():
                         "error",
                         "Other selected data items were cleared, but the literature records could not be cleared.",
                     )
+                elif memory_report and (not memory_report["store_cleared"] or not memory_report["legacy_cleared"]):
+                    if not memory_report["store_cleared"]:
+                        message = "The Chapter Memory V2 SQLite store could not be cleared; legacy summaries were kept. Other selected items may have been cleared."
+                    else:
+                        message = "Chapter Memory V2 was cleared, but legacy summaries could not be reset. Other selected items may have been cleared."
+                    clear_notice = ("error", message)
                 elif literature_report and c_literature_sources:
                     message = (
                         f"Cleared {len(sel_files)} data item(s). Literature records cleared; "
@@ -632,6 +644,8 @@ def render_global_sidebar():
                         "success",
                         f"Cleared {len(sel_files)} data item(s). Literature records cleared; imported source files were kept.",
                     )
+                elif memory_report:
+                    clear_notice = ("success", f"Cleared {len(sel_files)} data item(s). Chapter Memory V2 and legacy summaries were cleared; saved chapter drafts were kept.")
                 else:
                     clear_notice = ("success", f"Cleared {len(sel_files)} data item(s)!")
                 st.session_state["global_clear_notice"] = clear_notice
@@ -1891,7 +1905,7 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
     wc_info = None
     for attempt in range(max_attempts):
         prompt = build_chapter_prompt(sandwich, prompts, correction_note)
-        st.session_state["chapter_context_manifest"] = save_manifest_for_prompt(sandwich, prompt)
+        st.session_state["last_generation_context_manifest"] = save_manifest_for_prompt(sandwich, prompt)
         last_res = require_valid_llm_output(
             dispatch_llm_call(prompt, max_tokens=4000)
         )
@@ -2023,7 +2037,7 @@ def render_single_chapter_editor(tree):
             st.markdown("🧪 **This chapter covers my own experiment/method/data**")
 
         sandwich = build_context_sandwich(sel_id)
-        st.session_state["chapter_context_manifest"] = sandwich.get("context_manifest", {})
+        st.session_state["chapter_context_preview_manifest"] = sandwich.get("context_manifest", {})
         with st.expander("👁️ Global Context", expanded=False):
             st.markdown(f"**[Global topic]**: {sandwich['global_topic']}")
             st.markdown(f"**[Target total words]**: {sandwich['target_word_count']}")

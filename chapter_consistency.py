@@ -3,16 +3,136 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 
 from structured_output_support import parse_first_json_value
 
 
 _CITATION = re.compile(r"\[(\d+)\]")
 _LINK = re.compile(r"!?\[[^\]\n]+\]\([^\)\n]*\)")
+_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+_NUMBER = re.compile(
+    r"(?<![\w.])(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>%|percent(?:age)?(?:\s+points?)?|"
+    r"million(?:\s+(?:yuan|dollars?|USD|CNY))?|billion(?:\s+(?:yuan|dollars?|USD|CNY))?|"
+    r"thousand(?:\s+(?:yuan|dollars?|USD|CNY))?|trillion(?:\s+(?:yuan|dollars?|USD|CNY))?|"
+    r"yuan|dollars?|USD|CNY|participants?|respondents?|people|items?|人|名|个|万|亿|千)?",
+    re.IGNORECASE,
+)
+_ENTITY = re.compile(r"\b[A-Z][A-Za-z0-9&.-]{2,}\b")
+_ENTITY_STOPWORDS = {
+    "the", "annual", "revenue", "operating", "net", "gross", "profit",
+    "income", "turnover", "participants", "participant", "sample", "size",
+    "rate", "accuracy", "error", "completion", "company", "corporation",
+    "institute", "university", "study", "research",
+}
+_SCOPE_STOPWORDS = {
+    "a", "an", "the", "in", "on", "for", "of", "by", "from", "at", "to",
+    "was", "were", "is", "are", "reached", "reported", "recorded", "stood",
+    "totaled", "amounted", "measured", "value", "valued", "with", "and", "as",
+}
+_METRICS = (
+    ("annual_revenue", re.compile(r"\bannual\s+revenue\b|年度收入|年收入", re.IGNORECASE)),
+    ("operating_revenue", re.compile(r"\boperating\s+revenue\b|营业收入", re.IGNORECASE)),
+    ("net_profit", re.compile(r"\bnet\s+profit\b|净利润", re.IGNORECASE)),
+    ("operating_profit", re.compile(r"\boperating\s+profit\b|营业利润", re.IGNORECASE)),
+    ("sample_size", re.compile(r"\bsample\s+size\b|\bnumber\s+of\s+participants\b|\bparticipants\b|样本量|受试者数量", re.IGNORECASE)),
+    ("completion_rate", re.compile(r"\bcompletion\s+rate\b|完成率", re.IGNORECASE)),
+    ("accuracy", re.compile(r"\baccuracy\b|准确率", re.IGNORECASE)),
+    ("error_rate", re.compile(r"\berror\s+rate\b|误差率", re.IGNORECASE)),
+    ("revenue", re.compile(r"\bannual\s+revenue\b|\brevenue\b|\bturnover\b|年收入|销售额", re.IGNORECASE)),
+    ("profit", re.compile(r"\bprofit\b|利润", re.IGNORECASE)),
+)
 
 
 def _without_links(text):
     return _LINK.sub("", str(text or ""))
+
+
+def _sentence_for_span(text, start, end):
+    left = max((text.rfind(mark, 0, start) for mark in ".!?。！？\n"), default=-1) + 1
+    stops = [position for mark in ".!?。！？\n" if (position := text.find(mark, end)) >= 0]
+    right = min(stops) if stops else len(text)
+    return text[left:right].strip()
+
+
+def _metric_mentions(text):
+    matches = []
+    for metric, pattern in _METRICS:
+        matches.extend((match.start(), match.end(), metric) for match in pattern.finditer(text))
+    selected = []
+    for start, end, metric in sorted(matches, key=lambda item: (item[0], -(item[1] - item[0]))):
+        if any(start < previous_end and end > previous_start for previous_start, previous_end, _ in selected):
+            continue
+        selected.append((start, end, metric))
+    return [(metric, _sentence_for_span(text, start, end)) for start, end, metric in selected]
+
+
+def _comparison_scope_signature(sentence, entity_anchors):
+    remaining = _YEAR.sub(" ", sentence)
+    remaining = _NUMBER.sub(" ", remaining)
+    for _, pattern in _METRICS:
+        remaining = pattern.sub(" ", remaining)
+    for anchor in entity_anchors:
+        remaining = re.sub(rf"\b{re.escape(anchor)}\b", " ", remaining, flags=re.IGNORECASE)
+    return {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z]{2,}|[\u3400-\u9fff]{2,}", remaining)
+        if token.casefold() not in _SCOPE_STOPWORDS
+    }
+
+
+def _single_numeric_value(sentence):
+    matches = list(_NUMBER.finditer(_YEAR.sub(" ", sentence)))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    unit = " ".join((match.group("unit") or "").casefold().split())
+    if unit in {"percent", "percentage"}:
+        unit = "%"
+    elif unit in {"percent point", "percent points", "percentage point", "percentage points"}:
+        unit = "percentage points"
+    return (Decimal(match.group("number")), unit)
+
+
+def _explicit_metric_conflict(reference_text, candidate_text):
+    """Return true only for the same named metric, named entity, and explicit year."""
+    reference_text = str(reference_text or "")
+    candidate_text = str(candidate_text or "")
+    reference_mentions = _metric_mentions(reference_text)
+    candidate_mentions = _metric_mentions(candidate_text)
+    for metric, reference_sentence in reference_mentions:
+        reference_years = {match.group(0) for match in _YEAR.finditer(reference_sentence)}
+        if len(reference_years) != 1:
+            continue
+        reference_entities = {
+            token.casefold() for token in _ENTITY.findall(reference_sentence)
+            if token.casefold() not in _ENTITY_STOPWORDS
+        }
+        if not reference_entities:
+            continue
+        reference_value = _single_numeric_value(reference_sentence)
+        if reference_value is None:
+            continue
+        reference_scope = _comparison_scope_signature(reference_sentence, reference_entities)
+        for candidate_metric, candidate_sentence in candidate_mentions:
+            if candidate_metric != metric:
+                continue
+            candidate_years = {match.group(0) for match in _YEAR.finditer(candidate_sentence)}
+            if candidate_years != reference_years:
+                continue
+            candidate_entities = {
+                token.casefold() for token in _ENTITY.findall(candidate_sentence)
+                if token.casefold() not in _ENTITY_STOPWORDS
+            }
+            if not reference_entities.intersection(candidate_entities):
+                continue
+            shared_entities = reference_entities.intersection(candidate_entities)
+            if _comparison_scope_signature(candidate_sentence, shared_entities) != reference_scope:
+                continue
+            candidate_value = _single_numeric_value(candidate_sentence)
+            if candidate_value is not None and candidate_value[1] == reference_value[1] and candidate_value[0] != reference_value[0]:
+                return True
+    return False
 
 
 def check_deterministic_consistency(candidate, valid_reference_count=0, confirmed_items=()):
@@ -23,28 +143,20 @@ def check_deterministic_consistency(candidate, valid_reference_count=0, confirme
         if number < 1 or number > int(valid_reference_count or 0):
             conflicts.append({"code": "invalid_citation", "citation": match.group(0), "reason": "Citation has no reference in this chapter."})
 
-    # Compare numbers only when a confirmed statement and candidate share a concrete subject token.
+    # Hard-check only explicit metric comparisons with the same named entity and year.
+    # Topic overlap or unrelated numbers are left to the semantic review.
     for item in confirmed_items or ():
         if not isinstance(item, dict) or not item.get("confirmed_for_writing"):
             continue
         statement = str(item.get("statement") or "")
         quote = str(item.get("source_quote") or "")
-        subject_tokens = {
-            token.casefold()
-            for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u3400-\u9fff]{2,}", statement)
-            if token.casefold() not in {"the", "and", "with", "from", "that", "this"}
-        }
-        candidate_folded = str(candidate or "").casefold()
-        shared = [token for token in subject_tokens if token in candidate_folded]
-        source_numbers = set(re.findall(r"(?<!\w)\d+(?:\.\d+)?%?", quote))
-        if shared and source_numbers:
-            candidate_numbers = set(re.findall(r"(?<!\w)\d+(?:\.\d+)?%?", candidate_folded))
-            if candidate_numbers and not source_numbers.intersection(candidate_numbers):
-                conflicts.append({
-                    "code": "confirmed_number_conflict",
-                    "memory_id": item.get("id"),
-                    "reason": "A number tied to a confirmed subject differs from its source passage.",
-                })
+        reference_text = quote if quote.strip() else statement
+        if _explicit_metric_conflict(reference_text, candidate):
+            conflicts.append({
+                "code": "confirmed_number_conflict",
+                "memory_id": item.get("id"),
+                "reason": "The same named entity has a different value for the same explicitly scoped metric.",
+            })
     return {"status": "needs_review" if conflicts else "pass", "hard_conflicts": conflicts}
 
 
