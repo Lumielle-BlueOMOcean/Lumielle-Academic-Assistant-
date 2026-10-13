@@ -37,9 +37,9 @@ Pick the folder for your platform, unzip it, and double-click the launcher to st
 
 ## 🧠 核心架构：上下文三明治 / Core Architecture: The Context Sandwich
 
-写长论文时，长对话可能增加信息遗忘、修改冲突和上下文膨胀的风险。微光将全局大纲、已写章节记忆、当前章节和下游章节边界组合为章节生成上下文，帮助降低重复和前后不一致的风险。已写章节记忆会从完整章节正文按顺序分块提取，再合并为紧凑摘要；生成章节时使用的是摘要及相关边界，而不是每次都发送所有历史正文。
+写长论文时，长对话可能增加信息遗忘、修改冲突和上下文膨胀的风险。微光将全局大纲、已写章节记忆、当前章节和下游章节边界组合为章节生成上下文，帮助作者检查章节衔接。章节正文仍以 `drafts.json` 为准；记忆从完整正文按顺序分块提取，保存带原文引文和位置的简明摘要及原子信息，并按正文版本判断是否仍然有效。检索在本地完成，不需要向量模型或额外服务。生成时会对实际完整 Prompt 估算预算，并记录选用和省略的记忆；这只是保守估算，不代表任何模型的精确 token 数。
 
-Long conversations can increase the risk of information loss, revision conflicts, and context bloat. Lumielle combines the global outline, memories of written chapters, the current chapter, and downstream boundaries as context for chapter generation to help reduce repetition and inconsistency. Memories of written chapters are extracted from the complete chapter text in ordered chunks and synthesized into compact summaries; generation uses those summaries and relevant boundaries rather than resending every earlier chapter in full.
+Long conversations can increase the risk of information loss, revision conflicts, and context bloat. Lumielle combines the global outline, written-chapter memories, the current chapter, and downstream boundaries to help authors review continuity. `drafts.json` remains the source of truth for chapter text. Memories are extracted from the complete chapter in ordered chunks and stored as compact summaries and atomic items with exact source quotes and offsets; the app checks whether a memory still matches its draft. Retrieval runs locally and needs no embedding model or external service. Generation estimates the actual full prompt budget and records selected and omitted memories; this is a conservative estimate, not an exact token count for every model.
 
 ### 🥪 三明治的层次 / The Layers
 
@@ -51,7 +51,7 @@ Long conversations can increase the risk of information loss, revision conflicts
 ├─────────────────────────────────────────────┤
 │  ② 上游记忆（面包片 · 已写部分）               │
 │     Upstream memory — written chapters       │
-│     已写章节：完整正文分块提炼出的紧凑记忆      │
+│     已写章节：带原文依据的摘要与关键记忆条目    │
 │     未写章节只给大纲标题占位                    │
 ├─────────────────────────────────────────────┤
 │  🎯 当前章节（三明治的核心 = 要生成的内容）      │
@@ -59,7 +59,7 @@ Long conversations can increase the risk of information loss, revision conflicts
 ├─────────────────────────────────────────────┤
 │  ③ 下游记忆（面包片 · 边界部分）               │
 │     Downstream context — boundary only       │
-│     已写章节提供紧凑记忆，辅助回改时核对        │
+│     已写章节提供来源可查的记忆，辅助回改核对    │
 │     未写章节只给轻量大纲边界（减少越界）        │
 └─────────────────────────────────────────────┘
 ```
@@ -75,8 +75,9 @@ Long conversations can increase the risk of information loss, revision conflicts
 
 ### ⚙️ 细节设计 / Design Details
 
-- **上下游辅助核对**：已写章节的紧凑记忆和下游边界可帮助模型减少重复与冲突；生成结果仍需作者核验。/ Upstream and downstream context can help reduce repetition and conflict; generated text still needs author review.
-- **上下文预算**：上下文超过预算时会按现有取舍规则截断，并附带截断提示。/ When context exceeds its budget, the current selection policy truncates it and adds a notice.
+- **记忆状态**：已写但无记忆、旧版未验证、正文已修改和当前版本分别识别；用户可查看原文依据并主动重建历史章节记忆。/ Written drafts without memory, unverified legacy summaries, changed drafts, and current memories are distinguished; users can inspect source quotes and explicitly rebuild historical memories.
+- **上下游辅助核对**：来源可查的记忆和下游边界可帮助模型减少重复与冲突；自动审阅只提示风险，不认证学术真伪，生成结果仍需作者核验。/ Source-linked memories and downstream boundaries can help reduce repetition and conflict; automated review signals risks but does not certify academic truth.
+- **实际 Prompt 预算**：按完整章节 Prompt 进行保守估算，优先保留当前任务和已确认约束，并记录被省略的可选内容。/ A conservative estimate is applied to the complete chapter prompt, prioritizing the current task and confirmed constraints while recording optional omissions.
 - **未写章节边界**：下游未写章节只提供大纲标题，帮助当前章避免提前展开后续内容。/ Unwritten downstream chapters are represented by outline titles to help keep the current chapter in scope.
 
 这个设计为章节生成提供结构化上下文，帮助作者检查章节衔接；生成结果仍可能遗漏信息或出现冲突，需要作者核验。
@@ -109,7 +110,22 @@ DeepSeek App/web free chat is separate from the Open Platform API. API access de
 
 ## Changelog / 更新日志
 
-### v1.1.1 — Unreleased
+### v1.2.0 — Unreleased
+
+#### Added / 新增
+
+- Added a shared SQLite Memory V2 store for derived chapter summaries and source-anchored academic items; `drafts.json` remains the only authoritative chapter text. / 新增共享 SQLite 章节记忆库，保存派生摘要和有原文锚点的学术信息；`drafts.json` 继续作为正文唯一权威来源。
+- Complete chapter text is processed in ordered chunks with structured extraction, exact source-quote validation, and draft-hash freshness checks. / 章节记忆从完整正文按顺序分块结构化提取，逐条校验精确原文引文，并按正文哈希检查新鲜度。
+- Added local chapter-context retrieval, an actual full-prompt budget estimate and a per-generation context manifest, without embeddings or additional services. / 新增本地章节上下文检索、完整 Prompt 预算估算和逐次生成上下文清单，不使用 Embedding 或额外服务。
+- Added chapter-memory status and source review, individual writing confirmation, single-chapter rebuild, and user-triggered batch rebuild for existing drafts. / 新增章节记忆状态与来源查看、单条写作确认、单章重建，以及由用户主动触发的历史正文批量重建。
+- Generated candidates now receive deterministic checks and at most one structured semantic review before replacing an existing draft; review failures and risks require an explicit user choice. / 生成候选正文在替换已有草稿前会经过确定性检查和至多一次结构化语义审阅；审阅失败或发现风险时由用户明确选择后续操作。
+
+#### Fixed / 修复
+
+- Written chapters without a current Memory V2 record are no longer presented as unwritten or treated as current from a legacy free-text summary. / 已写但缺少当前 Memory V2 记录的章节不再被当作未写；旧版自由文本摘要也不会被误当作当前可信记忆。
+- Editing a draft makes an older memory stale by hash comparison; a failed memory rebuild preserves both the saved body and previous memory snapshot. / 正文修改后通过哈希比较识别旧记忆；记忆重建失败时保留已保存正文和此前记忆快照。
+
+#### Previously unreleased fixes included / 并入的未发布修复
 
 #### Fixed / 修复
 

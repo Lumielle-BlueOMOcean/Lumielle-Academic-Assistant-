@@ -263,15 +263,15 @@ class CoreCorrectnessTests(unittest.TestCase):
         support = load_project_module(self, "writing_support")
         self.assertEqual(support.count_chinese_chars("人工 智能，AI"), 7)
 
-    def test_version_is_canonical_v111_candidate(self):
+    def test_version_is_canonical_v120_candidate(self):
         version = load_project_module(self, "version")
-        self.assertEqual(version.__version__, "1.1.1")
+        self.assertEqual(version.__version__, "1.2.0")
 
     def test_readme_marks_current_release_and_keeps_release_history(self):
         version = load_project_module(self, "version")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"v{version.__version__}", readme)
-        self.assertIn("### v1.1.1 — Unreleased", readme)
+        self.assertIn("### v1.2.0 — Unreleased", readme)
         self.assertIn("Current release / 当前正式版本：v1.1.0 — 2026-09-29", readme)
         self.assertIn("### v1.0.1 — 2026-09-27", readme)
         self.assertIn("v1.0.0", readme)

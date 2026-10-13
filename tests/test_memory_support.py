@@ -2,6 +2,7 @@ import ast
 import importlib.util
 import re
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -122,32 +123,50 @@ class ChapterMemoryTests(unittest.TestCase):
         self.assertFalse(any("[MEMORY SYNTHESIS]" in prompt for prompt in calls))
 
     def test_completed_memory_is_consumed_by_context_sandwich(self):
-        memory = "FINAL_CHAPTER_FACT_SENTINEL"
-        tree = [
-            ({"id": "first", "title": "Introduction"}, 0),
-            ({"id": "current", "title": "Methods"}, 0),
-            ({"id": "last", "title": "Conclusion"}, 0),
-        ]
-        values = {
-            "prompts.json": {"global_topic": "Topic", "target_word_count": 1000},
-            "logic_tree.json": [],
-            "drafts_summary.json": {"first": memory},
-        }
-        namespace = {
-            "load_json_file": lambda name, default=None: values.get(name, default),
-            "flatten_tree_nodes": lambda _tree: tree,
-            "tree_to_compact_outline": lambda _tree: ["Introduction", "Methods", "Conclusion"],
-            "purge_thinking_text": lambda text: text,
-        }
-        for app_name in ("app.py", "app_zh.py"):
-            with self.subTest(app=app_name):
-                build_context_sandwich = load_app_function(
-                    self, app_name, "build_context_sandwich", namespace
-                )
-                sandwich = build_context_sandwich("current")
-                self.assertIn(memory, sandwich["upstream"])
+        from chapter_memory_store import initialize_memory_store, save_chapter_memory
+        from chapter_memory_support import build_context_sandwich_v2
 
-    def test_both_apps_call_the_shared_memory_pipeline(self):
+        memory = "FINAL_CHAPTER_FACT_SENTINEL"
+        body = f"The introduction records {memory}."
+        with tempfile.TemporaryDirectory() as data_dir:
+            initialize_memory_store(data_dir)
+            start = body.index(memory)
+            save_chapter_memory(data_dir, "first", body, {
+                "narrative_summary": "The introduction records a final continuity fact.",
+                "completion_status": "complete",
+                "items": [{
+                    "memory_type": "finding",
+                    "statement": "The introduction records FINAL_CHAPTER_FACT_SENTINEL.",
+                    "source_quote": memory,
+                    "source_start": start,
+                    "source_end": start + len(memory),
+                }],
+            })
+            tree = [
+                {"id": "first", "title": "Introduction"},
+                {"id": "current", "title": "Methods"},
+                {"id": "last", "title": "Conclusion"},
+            ]
+            values = {
+                "prompts.json": {"global_topic": "Topic", "target_word_count": 1000},
+                "logic_tree.json": tree,
+                "drafts.json": {"first": body},
+                "drafts_summary.json": {},
+            }
+            namespace = {
+                "load_json_file": lambda name, default=None: values.get(name, default),
+                "build_context_sandwich_v2": build_context_sandwich_v2,
+                "DATA_DIR": data_dir,
+            }
+            for app_name in ("app.py", "app_zh.py"):
+                with self.subTest(app=app_name):
+                    build_context_sandwich = load_app_function(
+                        self, app_name, "build_context_sandwich", namespace
+                    )
+                    sandwich = build_context_sandwich("current")
+                    self.assertIn(memory, sandwich["upstream"])
+
+    def test_both_apps_route_draft_writes_through_shared_memory_boundary(self):
         for app_name in ("app.py", "app_zh.py"):
             source = (ROOT / app_name).read_text(encoding="utf-8")
             with self.subTest(app=app_name):
@@ -155,26 +174,29 @@ class ChapterMemoryTests(unittest.TestCase):
                 imported = {
                     alias.name
                     for node in app_tree.body
-                    if isinstance(node, ast.ImportFrom) and node.module == "memory_support"
+                    if isinstance(node, ast.ImportFrom) and node.module == "chapter_memory_support"
                     for alias in node.names
                 }
-                calls = [
+                writes = [
                     node for node in ast.walk(app_tree)
                     if isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Name)
-                    and node.func.id == "update_chapter_memory"
+                    and node.func.id == "save_json_file"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "drafts.json"
                 ]
-                self.assertIn("update_chapter_memory", imported)
-                self.assertEqual(len(calls), 3)
+                self.assertIn("save_draft_and_maybe_refresh_memory", imported)
+                self.assertEqual(len(writes), 1)
 
 
 class VersionTests(unittest.TestCase):
     def test_candidate_version_keeps_v110_as_current_release(self):
         version = load_project_module(self, "version")
-        self.assertEqual(version.__version__, "1.1.1")
+        self.assertEqual(version.__version__, "1.2.0")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("Current release / 当前正式版本：v1.1.0 — 2026-09-29", readme)
-        self.assertIn("### v1.1.1 — Unreleased", readme)
+        self.assertIn("### v1.2.0 — Unreleased", readme)
         self.assertIn("v1.1.0 — 2026-09-29", readme)
 
 

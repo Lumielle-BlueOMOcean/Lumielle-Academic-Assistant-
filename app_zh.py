@@ -25,7 +25,17 @@ from structured_output_support import (
     structured_response_result,
 )
 from document_support import DEFAULT_CHUNK_CHARS, extract_document_text, is_document_parse_error, parse_document_in_chunks
-from memory_support import update_chapter_memory
+from chapter_memory_support import (
+    ContextBudgetError,
+    build_context_sandwich_v2,
+    fit_context_sandwich_to_prompt,
+    save_draft_and_maybe_refresh_memory,
+    save_manifest_for_prompt,
+    structured_memory_llm_call,
+)
+from chapter_memory_store import initialize_memory_store
+from chapter_memory_ui import render_chapter_memory_panel, render_pending_candidate_reviews
+from chapter_consistency import review_chapter_candidate
 from literature_support import clear_literature_library
 from literature_intelligence import (
     analyze_literature_document,
@@ -187,6 +197,12 @@ def save_json_file(filename, data):
 
 for fname, dval in default_files.items():
     load_json_file(fname, dval)
+
+try:
+    initialize_memory_store(DATA_DIR)
+    MEMORY_STORE_UNAVAILABLE = False
+except Exception:
+    MEMORY_STORE_UNAVAILABLE = True
 
 # ============================================================
 # 2. 本地 AIGC 检测引擎
@@ -471,121 +487,21 @@ def generate_mermaid_td(nodes, parent_id=None):
 # 5. 究极双向上下文三明治（完全重构版）
 # ============================================================
 def build_context_sandwich(current_node_id, max_chars=20000):
-    """
-    重构后的上下文三明治（全量版）：
-    - 全局逻辑大纲：整棵逻辑树实时压缩，作为最顶层罗盘
-    - 上游记忆：当前节点之前【已写】章节的完整记忆全量带上（不截断），未写章节只给大纲标题占位
-    - 下游已写：全量提供完整记忆（用于回头修改中间章节时保持与下游一致，防冲突）
-    - 下游未写：只给轻量大纲边界（防剧透/越界）
-    - 兜底保护：总字符超 max_chars 时按「离当前节点远近」取舍（已写记忆优先保留）
-    """
+    """Build local Memory V2 context from saved drafts and their current snapshots."""
     prompts = load_json_file("prompts.json", {})
-    global_topic = prompts.get("global_topic", "未设定课题")
-    target_wc = prompts.get("target_word_count", 5000)
-
     tree = load_json_file("logic_tree.json", [])
-    flat = flatten_tree_nodes(tree)
-
-    global_outline = "\n".join(tree_to_compact_outline(tree))
-
-    upstream_written = []      # 上游已写章节的完整记忆
-    upstream_outline = []      # 上游未写章节的大纲占位（仅标题）
-    downstream_written = []    # 下游已写章节的完整记忆
-    downstream_boundary = []   # 下游未写章节的大纲边界（仅标题）
-    current_node_title = ""
-    current_node_desc = ""
-    current_node = {"word_count": 0}
-    current_depth = -1
-    hit_current = False
-    drafts_summary = load_json_file("drafts_summary.json", {})
-    current_children_ids = set()
-
-    for node, depth in flat:
-        nid = node.get("id")
-        title = node.get("title", "")
-
-        if nid == current_node_id:
-            hit_current = True
-            current_node_title = title
-            current_node_desc = node.get("desc", "")
-            current_node = node
-            current_depth = depth
-            # 记录当前节点自己的直系子节点 id（仅用于跳过自身子节点）
-            current_children_ids = {c.get("id") for c in (node.get("children") or []) if isinstance(c, dict)}
-            continue
-
-        if not hit_current:
-            if nid in drafts_summary and drafts_summary[nid]:
-                upstream_written.append(f"- 【上游已写·{title}】{purge_thinking_text(str(drafts_summary[nid]))}")
-            else:
-                upstream_outline.append(title)
-        else:
-            # 只跳过当前节点【自己的】直系子节点（当前节点为父节点时才可能触发；叶子节点无子节点，不误伤其他深层节点）
-            if nid in current_children_ids:
-                continue
-            if nid in drafts_summary and drafts_summary[nid]:
-                # 下游已写：完整记忆，防冲突（回头修改中间章节时 LLM 必须知晓下游已写内容）
-                downstream_written.append(f"- 【下游已写·{title}】{purge_thinking_text(str(drafts_summary[nid]))}")
-            else:
-                # 下游未写：轻量边界，防剧透/越界
-                downstream_boundary.append(title)
-
-    # ---- 上游拼接：已写全量 + 未写占位合并为一行（不挤占窗口） ----
-    up_parts = list(upstream_written)
-    if upstream_outline:
-        up_parts.append(f"- 【上游其余大纲章节（未写）】{'、'.join(upstream_outline[:30])}")
-    up_str = "\n".join(up_parts) if up_parts else "无（当前为首个已写章节）"
-
-    # ---- 下游拼接：已写全量 + 未写边界（轻量） ----
-    down_parts = []
-    if downstream_written:
-        # 修改场景提示：下游已有内容，当前章修改必须与之保持一致
-        down_parts.append("【⚠️ 下游已有已写章节，修改/生成当前章时必须与下列下游内容保持一致，禁止与之矛盾或重复】")
-        down_parts.extend(downstream_written)
-    if downstream_boundary:
-        down_parts.append(f"- 【下游未写章节边界（防剧透）】{'、'.join(downstream_boundary[:30])}")
-    down_str = "\n".join(down_parts) if down_parts else "无（当前为最终章节）"
-
-    # ---- 兜底保护：超长论文时按离当前节点远近取舍 ----
-    if len(up_str) + len(down_str) > max_chars:
-        # 预算分配：上游 60%、下游 40%
-        up_budget = int(max_chars * 0.6)
-        down_budget = int(max_chars * 0.4)
-        if len(up_str) > up_budget:
-            # 保留尾部（最近的）已写记忆，并加截断说明
-            lines = up_str.split("\n")
-            keep = []
-            used = 0
-            for ln in reversed(lines):
-                if used + len(ln) > up_budget:
-                    break
-                keep.insert(0, ln)
-                used += len(ln)
-            keep.insert(0, f"【上下文已按预算截断，保留最近 {len(keep)-1} 条上游记忆，完整上游共 {len(lines)} 条】")
-            up_str = "\n".join(keep)
-        if len(down_str) > down_budget:
-            lines = down_str.split("\n")
-            keep = []
-            used = 0
-            for ln in lines:
-                if used + len(ln) > down_budget:
-                    break
-                keep.append(ln)
-                used += len(ln)
-            keep.insert(0, f"【下游已按预算截断，保留前 {len(keep)-1} 条下游信息，完整下游共 {len(lines)} 条】")
-            down_str = "\n".join(keep)
-
-    return {
-        "global_topic": global_topic,
-        "target_word_count": target_wc,
-        "global_outline": global_outline,
-        "current_title": current_node_title,
-        "current_desc": current_node_desc,
-        "current_word_count": current_node.get("word_count", 0) or 0,
-        "current_refs": current_node.get("references", []) or [],
-        "upstream": up_str,
-        "downstream": down_str
-    }
+    drafts = load_json_file("drafts.json", {})
+    legacy_summaries = load_json_file("drafts_summary.json", {})
+    return build_context_sandwich_v2(
+        current_node_id,
+        tree,
+        drafts,
+        DATA_DIR,
+        legacy_summaries=legacy_summaries,
+        global_topic=prompts.get("global_topic", ""),
+        target_word_count=prompts.get("target_word_count", 5000),
+        locale="zh",
+    )
 
 # ============================================================
 # 6. 全局侧边栏（研究课题 + 预期字数 + 导航）
@@ -598,6 +514,8 @@ def render_global_sidebar():
         if level in {"success", "warning", "error"}:
             getattr(st.sidebar, level)(message)
     st.sidebar.title("🎓 Lumielle Academic Assistant")
+    if MEMORY_STORE_UNAVAILABLE:
+        st.sidebar.warning("章节记忆暂时不可用。已保存正文仍可继续使用；本地数据目录恢复可用后可重试记忆更新。")
     st.sidebar.markdown("---")
     st.sidebar.subheader("🌍 全局研究设置")
 
@@ -1952,26 +1870,80 @@ def build_chapter_prompt(sandwich, prompts, correction_note=None):
 
 
 def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, tolerance=0.5):
-    """自动纠偏生成：生成后统计字数，偏差超过 tolerance 则带反馈重写，最多 max_attempts 次"""
+    """Generate and length-correct a candidate, then review that final candidate once."""
+    if sandwich.get("prompt_budget_error"):
+        raise LLMOutputError(sandwich.get("prompt_budget_message") or "必需写作要求超过安全上下文预算。")
     target = int(sandwich.get("current_word_count", 0) or 0)
     correction_note = None
     last_res = ""
+    wc_info = None
     for attempt in range(max_attempts):
-        res = require_valid_llm_output(
-            dispatch_llm_call(build_chapter_prompt(sandwich, prompts, correction_note), max_tokens=4000)
+        prompt = build_chapter_prompt(sandwich, prompts, correction_note)
+        st.session_state["chapter_context_manifest"] = save_manifest_for_prompt(sandwich, prompt)
+        last_res = require_valid_llm_output(
+            dispatch_llm_call(prompt, max_tokens=4000)
         )
-        last_res = res
         if target <= 0:
-            return res, None  # 未分配字数，不纠偏
-        actual = count_chinese_chars(res)
+            break
+        actual = count_chinese_chars(last_res)
         deviation = abs(actual - target) / target
         if deviation <= tolerance:
-            return res, {"attempts": attempt + 1, "actual": actual, "target": target, "deviation": deviation}
+            wc_info = {"attempts": attempt + 1, "actual": actual, "target": target, "deviation": deviation}
+            break
         correction_note = (
             f"上一轮生成约 {actual} 字，目标 {target} 字，偏差 {deviation:.0%} 超过允许范围（{tolerance:.0%}）。"
             f"第 {attempt + 1}/{max_attempts} 次重写，请调整篇幅：过短则补充论证与细节，过长则精简冗余。"
         )
-    return last_res, {"attempts": max_attempts, "actual": count_chinese_chars(last_res), "target": target, "deviation": abs(count_chinese_chars(last_res) - target) / target if target else None}
+    if target > 0 and wc_info is None:
+        actual = count_chinese_chars(last_res)
+        wc_info = {"attempts": max_attempts, "actual": actual, "target": target, "deviation": abs(actual - target) / target}
+    consistency_call = lambda prompt, **kwargs: dispatch_llm_call(
+        prompt, system_prompt="你审阅章节中的明显一致性风险，只返回规定的 JSON。", **kwargs
+    )
+    consistency = review_chapter_candidate(
+        last_res,
+        sandwich,
+        len(sandwich.get("current_refs", []) or []),
+        consistency_call,
+        locale="zh",
+        confirmed_items=sandwich.get("confirmed_memory_items", []),
+    )
+    return last_res, wc_info, consistency
+
+
+def persist_generated_candidate(chapter_id, candidate, locale):
+    """Save a reviewed candidate first, then refresh its derived memory snapshot."""
+    drafts = load_json_file("drafts.json", {})
+    reference_maps = load_json_file("draft_reference_maps.json", {})
+    text = candidate.get("text", "")
+    record_generated_draft(
+        drafts,
+        reference_maps,
+        chapter_id,
+        text,
+        candidate.get("reference_ids", []),
+    )
+    result = persist_draft_text(chapter_id, text, locale, refresh_memory=True, drafts=drafts)
+    if result["saved"]:
+        result["reference_map_saved"] = save_json_file("draft_reference_maps.json", reference_maps)
+    return result
+
+
+def persist_draft_text(chapter_id, draft_text, locale, *, refresh_memory=False, drafts=None):
+    """Use one persistence boundary for edited and rewritten chapter text."""
+    drafts = load_json_file("drafts.json", {}) if drafts is None else drafts
+    legacy = load_json_file("drafts_summary.json", {}).get(chapter_id)
+    return save_draft_and_maybe_refresh_memory(
+        DATA_DIR,
+        drafts,
+        chapter_id,
+        draft_text,
+        lambda value: save_json_file("drafts.json", value),
+        structured_memory_llm_call(dispatch_llm_call, locale),
+        locale=locale,
+        refresh_memory=refresh_memory,
+        legacy_summary=legacy,
+    )
 
 
 def render_tree_nav(tree, nodes, sel_key="writing_selected_id", _drafts=None):
@@ -2039,6 +2011,7 @@ def render_single_chapter_editor(tree):
             st.markdown("🧪 **本章为本人实验/方法/数据章节**")
 
         sandwich = build_context_sandwich(sel_id)
+        st.session_state["chapter_context_manifest"] = sandwich.get("context_manifest", {})
         with st.expander("👁️ 全局上下文", expanded=False):
             st.markdown(f"**【全局课题】**：{sandwich['global_topic']}")
             st.markdown(f"**【预期总字数】**：{sandwich['target_word_count']}")
@@ -2059,27 +2032,26 @@ def render_single_chapter_editor(tree):
         c_save, c_gen = st.columns(2)
         with c_save:
             if st.button("💾 手动保存并凝练记忆", key=f"save_{sel_id}"):
-                drafts[sel_id] = new_text
-                save_json_file("drafts.json", drafts)
-                reference_maps = load_json_file("draft_reference_maps.json", {})
-                if sel_id not in reference_maps:
-                    bound_literatures = get_literatures_by_ids(node.get("references", []) or [])
-                    reference_maps[sel_id] = [lit.get("id") for lit in bound_literatures if lit.get("id") is not None]
-                save_json_file("draft_reference_maps.json", reference_maps)
-                notices = [("success", "正文已保存。")]
-                try:
-                    with st.spinner("正在基于完整章节构建精简记忆..."):
-                        ds = load_json_file("drafts_summary.json", {})
-                        ds, sum_res = update_chapter_memory(
-                            ds, sel_id, new_text, dispatch_llm_call, locale="zh"
-                        )
-                    save_json_file("drafts_summary.json", ds)
-                    notices.append(("success", f"记忆池已更新（本章记忆 {len(sum_res)} 字）。"))
-                except LLMOutputError:
-                    notices.append(("warning", "正文已保存，但记忆凝练失败；之后可再次保存重试。" + llm_error_message("zh")))
-                st.session_state[f"writing_notice_{sel_id}"] = notices
-                st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
-                st.rerun()
+                with st.spinner("正在保存正文并更新章节记忆..."):
+                    result = persist_draft_text(sel_id, new_text, "zh", refresh_memory=True)
+                if not result["saved"]:
+                    st.error("正文保存失败，已保留此前版本。")
+                else:
+                    reference_maps = load_json_file("draft_reference_maps.json", {})
+                    if sel_id not in reference_maps:
+                        bound_literatures = get_literatures_by_ids(node.get("references", []) or [])
+                        reference_maps[sel_id] = [lit.get("id") for lit in bound_literatures if lit.get("id") is not None]
+                        save_json_file("draft_reference_maps.json", reference_maps)
+                    notices = [("success", "正文已保存。")]
+                    if result["memory_updated"]:
+                        notices.append(("success", "本章记忆已更新。"))
+                    elif result["memory_reused"]:
+                        notices.append(("success", "已复用与正文版本一致的章节记忆。"))
+                    elif result["memory_error"]:
+                        notices.append(("warning", "正文已保存，但记忆更新未完成；可在“章节记忆”中重试。"))
+                    st.session_state[f"writing_notice_{sel_id}"] = notices
+                    st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
+                    st.rerun()
         with c_gen:
             if st.button("🤖 AI 生成本章", type="primary", key=f"gen_{sel_id}"):
                 _kids = [c for c in (node.get("children") or []) if isinstance(c, dict)]
@@ -2088,39 +2060,56 @@ def render_single_chapter_editor(tree):
                 else:
                     with st.spinner("AI 生成中（自动纠偏）..."):
                         try:
-                            res, wc_info = generate_chapter_with_correction(sandwich, prompts)
+                            res, wc_info, consistency = generate_chapter_with_correction(sandwich, prompts)
                         except LLMOutputError:
                             st.error("章节生成失败，原有正文已保留。" + llm_error_message("zh"))
                         else:
-                            reference_maps = load_json_file("draft_reference_maps.json", {})
                             bound_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
-                            record_generated_draft(
-                                drafts,
-                                reference_maps,
-                                sel_id,
-                                res,
-                                [lit.get("id") for lit in bound_literatures if lit.get("id") is not None],
-                            )
-                            save_json_file("drafts.json", drafts)
-                            save_json_file("draft_reference_maps.json", reference_maps)
+                            candidate = {
+                                "text": res,
+                                "title": node.get("title", ""),
+                                "reference_ids": [lit.get("id") for lit in bound_literatures if lit.get("id") is not None],
+                                "word_count": wc_info,
+                                "consistency": consistency,
+                            }
                             if wc_info:
                                 generated_message = f"本章生成完毕！实际 {wc_info['actual']}字/目标{wc_info['target']}字（纠偏{wc_info['attempts']}次）。"
                             else:
                                 generated_message = f"本章生成完毕！实际 {count_chinese_chars(res)}字（未分配目标字数）。"
-                            notices = [("success", generated_message)]
-                            try:
-                                ds = load_json_file("drafts_summary.json", {})
-                                ds, sum_res = update_chapter_memory(
-                                    ds, sel_id, res, dispatch_llm_call, locale="zh"
-                                )
-                            except LLMOutputError:
-                                notices.append(("warning", "正文已保存，但记忆凝练失败；之后可再次保存重试。" + llm_error_message("zh")))
+                            if consistency.get("status") == "pass" and consistency.get("completed"):
+                                result = persist_generated_candidate(sel_id, candidate, "zh")
+                                if not result["saved"]:
+                                    st.error("生成正文保存失败，已保留此前版本。")
+                                else:
+                                    notices = [("success", generated_message)]
+                                    if result.get("memory_error"):
+                                        notices.append(("warning", "正文已保存，但记忆更新未完成；可在“章节记忆”中重试。"))
+                                    elif result.get("memory_updated"):
+                                        notices.append(("success", "本章记忆已更新。"))
+                                    st.session_state[f"writing_notice_{sel_id}"] = notices
+                                    st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
+                                    st.rerun()
                             else:
-                                save_json_file("drafts_summary.json", ds)
-                                notices.append(("success", f"记忆池已更新（本章记忆 {len(sum_res)} 字）。"))
-                            st.session_state[f"writing_notice_{sel_id}"] = notices
-                            st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
-                            st.rerun()
+                                pending = st.session_state.setdefault("pending_chapter_candidates", {})
+                                pending[sel_id] = candidate
+                                st.session_state[f"writing_notice_{sel_id}"] = [("warning", "候选正文需要先审阅，再决定是否替换已保存正文。")]
+                                st.rerun()
+
+        if sandwich.get("prompt_budget_error"):
+            st.warning(sandwich.get("prompt_budget_message", "必需写作上下文超过安全长度。"))
+        legacy_summaries = load_json_file("drafts_summary.json", {})
+        render_chapter_memory_panel(
+            st,
+            data_dir=DATA_DIR,
+            chapter_id=sel_id,
+            draft_text=current_text,
+            legacy_summary=legacy_summaries.get(sel_id),
+            llm_call=dispatch_llm_call,
+            locale="zh",
+            outline=tree,
+            drafts=drafts,
+            legacy_summaries=legacy_summaries,
+        )
 
         # ---- 图表 ----
         st.markdown("---")
@@ -2207,7 +2196,10 @@ def render_batch_workbench():
     prompts = load_json_file("prompts.json", {})
     tree = load_json_file("logic_tree.json", [])
     flat = flatten_tree_nodes(tree)
-    ordered_ids = get_ordered_node_ids(tree)
+    ordered_ids = [
+        node.get("id") for node, _ in flatten_tree_nodes(tree)
+        if not [child for child in (node.get("children") or []) if isinstance(child, dict)]
+    ]
 
     if not flat:
         st.warning("逻辑大纲为空，请先前往板块四生成。")
@@ -2304,48 +2296,48 @@ def render_batch_workbench():
             if not leaf_ids:
                 st.warning("所选章节均为父节点（章节容器）。请勾选叶子节点（没有子节点的章节）生成正文。")
             else:
-                drafts = load_json_file("drafts.json", {})
-                ds = load_json_file("drafts_summary.json", {})
-                reference_maps = load_json_file("draft_reference_maps.json", {})
                 progress_bar = st.progress(0)
                 status = st.empty()
                 results_note = []
                 failed_chapters = []
                 memory_warnings = []
+                review_chapters = []
                 for k, nid in enumerate(leaf_ids):
                     node = get_node_by_id(tree, nid)
                     status.info(f"📝 正在生成第 {k+1}/{len(leaf_ids)} 章：{node.get('title','')} ...")
                     sandwich = build_context_sandwich(nid)
                     try:
-                        res, wc_info = generate_chapter_with_correction(sandwich, prompts)
+                        res, wc_info, consistency = generate_chapter_with_correction(sandwich, prompts)
                     except LLMOutputError:
                         failed_chapters.append(f"{node.get('title','未命名')}: {llm_error_message('zh')}")
                         progress_bar.progress((k + 1) / len(leaf_ids))
                         continue
                     bound_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
-                    record_generated_draft(
-                        drafts,
-                        reference_maps,
-                        nid,
-                        res,
-                        [lit.get("id") for lit in bound_literatures if lit.get("id") is not None],
-                    )
-                    save_json_file("drafts.json", drafts)
-                    save_json_file("draft_reference_maps.json", reference_maps)
+                    candidate = {
+                        "text": res,
+                        "title": node.get("title", ""),
+                        "reference_ids": [lit.get("id") for lit in bound_literatures if lit.get("id") is not None],
+                        "word_count": wc_info,
+                        "consistency": consistency,
+                    }
+                    if consistency.get("status") != "pass" or not consistency.get("completed"):
+                        st.session_state.setdefault("pending_chapter_candidates", {})[nid] = candidate
+                        review_chapters.append(node.get("title", "未命名"))
+                        progress_bar.progress((k + 1) / len(leaf_ids))
+                        continue
+                    persisted = persist_generated_candidate(nid, candidate, "zh")
+                    if not persisted["saved"]:
+                        failed_chapters.append(f"{node.get('title','未命名')}: 正文保存失败")
+                        progress_bar.progress((k + 1) / len(leaf_ids))
+                        continue
                     if wc_info:
                         results_note.append(f"{node.get('title','')}: {wc_info['actual']}字/目标{wc_info['target']}字（纠偏{wc_info['attempts']}次）")
                     else:
                         results_note.append(f"{node.get('title','')}: {count_chinese_chars(res)}字（无目标）")
-                    try:
-                        ds, sum_res = update_chapter_memory(
-                            ds, nid, res, dispatch_llm_call, locale="zh"
-                        )
-                    except LLMOutputError:
-                        memory_warnings.append(f"{node.get('title','未命名')}: {llm_error_message('zh')}")
-                    else:
-                        save_json_file("drafts_summary.json", ds)
+                    if persisted.get("memory_error"):
+                        memory_warnings.append(node.get("title", "未命名"))
                     progress_bar.progress((k + 1) / len(leaf_ids))
-                msg = f"批量生成结束：成功 {len(results_note)} 章，失败 {len(failed_chapters)} 章。"
+                msg = f"批量生成结束：已保存 {len(results_note)} 章，待审阅 {len(review_chapters)} 章，失败 {len(failed_chapters)} 章。"
                 if results_note:
                     msg += "\n" + "\n".join(results_note)
                 if skipped:
@@ -2356,7 +2348,7 @@ def render_batch_workbench():
                 else:
                     status.success(msg)
                 if memory_warnings:
-                    st.warning("正文已保存，但以下章节的记忆凝练失败：\n" + "\n".join(memory_warnings))
+                    st.warning("正文已保存，但以下章节的记忆更新未完成：\n" + "\n".join(memory_warnings))
 
     # ---- 批量生成图表（独立选项，走图表绘制队列） ----
     if st.button("📊 批量生成图表"):
@@ -2710,13 +2702,19 @@ def module5_writing():
         return
 
     # 初始化当前选中章节（防止导航状态失效）
-    ordered_ids = get_ordered_node_ids(tree)
+    ordered_ids = [
+        node.get("id") for node, _ in flatten_tree_nodes(tree)
+        if not [child for child in (node.get("children") or []) if isinstance(child, dict)]
+    ]
     current_sel = st.session_state.get("writing_selected_id")
     if current_sel not in ordered_ids:
         st.session_state["writing_selected_id"] = ordered_ids[0]
 
     render_single_chapter_editor(tree)
     render_batch_workbench()
+    render_pending_candidate_reviews(
+        st, lambda chapter_id, candidate: persist_generated_candidate(chapter_id, candidate, "zh"), locale="zh"
+    )
     render_full_logic_review()
 
 
@@ -3206,15 +3204,17 @@ def module6_aigc():
                 c_det, c_rew = st.columns(2)
                 with c_det:
                     if st.button("📊 检测", key=f"det_{sel_id}"):
-                        drafts[sel_id] = edited_text
-                        save_json_file("drafts.json", drafts)
-                        st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
-                        with st.spinner("检测中..."):
-                            res_dict = detect_aigc(edited_text)
-                            if res_dict.get("score") is None:
-                                feedback.error(res_dict["raw"])
-                            else:
-                                feedback.info(f"**AIGC 疑似概率: {res_dict['score']}%**  \n{res_dict['raw']}")
+                        saved = persist_draft_text(sel_id, edited_text, "zh", refresh_memory=False)
+                        if not saved["saved"]:
+                            st.error("编辑后的正文保存失败，未执行检测。")
+                        else:
+                            st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
+                            with st.spinner("检测中..."):
+                                res_dict = detect_aigc(edited_text)
+                                if res_dict.get("score") is None:
+                                    feedback.error(res_dict["raw"])
+                                else:
+                                    feedback.info(f"**AIGC 疑似概率: {res_dict['score']}%**  \n{res_dict['raw']}")
                 with c_rew:
                     if st.button("✨ 降重去味", key=f"rew_{sel_id}", type="primary"):
                         # 输入防护：乱码文本拒绝去味
@@ -3234,17 +3234,16 @@ def module6_aigc():
                                     # 输出防护：异常重写结果不覆盖原文
                                     abnormal, abn_reasons = is_suspicious_rewrite(edited_text, rewritten)
                                     if abnormal:
-                                        drafts[sel_id] = edited_text
-                                        save_json_file("drafts.json", drafts)
                                         st.warning(f"⚠️ 去味结果异常（{'、'.join(abn_reasons)}），已保留原文，未写入。")
                                         st.session_state[f"rew_fb_{sel_id}"] = (False, 0, "异常已拦截")
                                     else:
-                                        drafts[sel_id] = rewritten
-                                        save_json_file("drafts.json", drafts)
-                                        st.session_state[f"rew_fb_{sel_id}"] = (ok, rounds, score)
-                                    # 版本号+1 → rerun 后 text_area 以新 key 重新从 drafts 读取，全局同步
-                                    st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
-                                    st.rerun()
+                                        saved = persist_draft_text(sel_id, rewritten, "zh", refresh_memory=False)
+                                        if saved["saved"]:
+                                            st.session_state[f"rew_fb_{sel_id}"] = (ok, rounds, score)
+                                            st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
+                                            st.rerun()
+                                        else:
+                                            st.error("去味后的正文保存失败，已保留此前版本。")
 
     # ---- 全文 ----
     with tabs[1]:
@@ -3289,9 +3288,12 @@ def module6_aigc():
                         except LLMOutputError:
                             failed_rewrites.append(f"{node.get('title','未命名')}: {llm_error_message('zh')}")
                         else:
-                            drafts[nid] = rewritten
-                            save_json_file("drafts.json", drafts)
-                            if ok:
+                            saved = persist_draft_text(nid, rewritten, "zh", refresh_memory=False, drafts=drafts)
+                            if not saved["saved"]:
+                                failed_rewrites.append(f"{node.get('title','未命名')}: 正文保存失败")
+                            else:
+                                drafts = saved["drafts"]
+                            if saved["saved"] and ok:
                                 ok_count += 1
                     bar.progress((k + 1) / len(ordered))
                 if failed_rewrites:
@@ -3497,7 +3499,17 @@ def build_context_sandwich(current_node_id, max_chars=20000):
     research_base = migrate_research_base(load_json_file("research_base.json", create_default_research_base()))
     evidence_store = load_json_file("literature_evidence.json", {})
     literatures = load_json_file("literatures.json", [])
-    return attach_chapter_grounding(context, research_base, evidence_store, literatures, locale="zh")
+    context = attach_chapter_grounding(context, research_base, evidence_store, literatures, locale="zh")
+    prompts = load_json_file("prompts.json", {})
+    try:
+        context = fit_context_sandwich_to_prompt(
+            context,
+            lambda value: build_chapter_prompt(value, prompts),
+        )
+    except ContextBudgetError:
+        context["prompt_budget_error"] = True
+        context["prompt_budget_message"] = "必需写作要求超过安全上下文预算，请精简当前提示词或要求。"
+    return context
 
 
 def main():
