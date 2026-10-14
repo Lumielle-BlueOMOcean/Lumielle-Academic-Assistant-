@@ -8,6 +8,10 @@ from structured_output_support import parse_first_json_value
 class LLMOutputError(RuntimeError):
     """Raised when an LLM response is empty or contains a known failure message."""
 
+    def __init__(self, message, *, error_code=None):
+        super().__init__(message)
+        self.error_code = error_code
+
 
 _LLM_FAILURE_MARKERS = (
     "api key missing",
@@ -64,9 +68,77 @@ def safe_llm_error_text(error, max_chars=240):
 
 def llm_error_message(locale="en", error=None):
     """Return a concise localized message without exposing provider exceptions or secrets."""
+    code = getattr(error, "error_code", None)
+    if not code and isinstance(error, dict):
+        code = error.get("error_code")
+    code = code if isinstance(code, str) else ""
     if str(locale).lower().startswith("zh"):
+        if code in {"no_active_model", "authentication_failed", "insufficient_balance", "model_not_available"}:
+            return "模型配置不可用。请检查当前模型、API 密钥、账户额度和服务地址后重试。"
+        if code == "invalid_request":
+            return "AI 服务拒绝了本次请求参数。请检查所选模型与服务接口的兼容性后重试。"
+        if code in {"rate_limited", "timeout", "connection_error", "server_error"}:
+            return "AI 服务暂时繁忙或请求受限，系统已有限重试；请稍后重试。"
+        if code == "truncated_output":
+            return "模型输出达到长度限制，本次未保存不完整正文。请稍后重试或调整本章篇幅。"
+        if code == "empty_content":
+            return "模型没有返回可用正文，本次未保存任何新内容。"
+        if code == "content_filtered":
+            return "模型服务中断了本次输出（内容过滤），未保存不完整正文。"
+        if code == "incomplete_response":
+            return "模型响应未完整结束，本次未保存不完整正文。请稍后重试。"
+        if code == "provider_error":
+            return "AI 服务未能完成本次请求，本次未保存新正文；请稍后重试。"
         return "模型调用失败，请检查当前模型/API 配置后重试。"
+    if code in {"no_active_model", "authentication_failed", "insufficient_balance", "model_not_available"}:
+        return "The model configuration is unavailable. Check the selected model, API key, account balance, and service endpoint."
+    if code == "invalid_request":
+        return "The AI service rejected the request parameters. Check compatibility between the selected model and service endpoint, then retry."
+    if code in {"rate_limited", "timeout", "connection_error", "server_error"}:
+        return "The AI service is temporarily busy or rate limited. The request was retried; please try again later."
+    if code == "truncated_output":
+        return "The model output reached its length limit. The incomplete chapter was not saved. Please retry later or adjust the chapter length."
+    if code == "empty_content":
+        return "The model returned no usable chapter text. No new content was saved."
+    if code == "content_filtered":
+        return "The model service interrupted this response for content filtering. The incomplete chapter was not saved."
+    if code == "incomplete_response":
+        return "The model response did not finish. The incomplete chapter was not saved; please try again later."
+    if code == "provider_error":
+        return "The AI service could not complete this request. No new chapter text was saved; please try again later."
     return "The model call failed. Please check the current model/API configuration and try again."
+
+
+def context_budget_error_message(locale="en", error=None):
+    """Explain a context-budget block without exposing prompt content."""
+    estimated = getattr(error, "estimated_tokens", None)
+    budget = getattr(error, "max_estimated_tokens", None)
+    request_already_sent = bool(getattr(error, "request_already_sent", False))
+    has_counts = (
+        isinstance(estimated, int) and not isinstance(estimated, bool)
+        and isinstance(budget, int) and not isinstance(budget, bool)
+    )
+    if str(locale).lower().startswith("zh"):
+        counts = f"（估算约 {estimated:,} tokens；当前安全预算 {budget:,}）" if has_counts else ""
+        if request_already_sent:
+            return (
+                f"篇幅纠偏所需的写作上下文超过当前安全长度{counts}。"
+                "本次纠偏请求尚未发送；前一轮生成请求已发送，但本次未保存新正文。请精简过长的自定义写作要求或可选上下文后重试。"
+            )
+        return (
+            f"本章所需的写作上下文超过当前安全长度{counts}。"
+            "本次正文生成请求尚未向 AI 发送。请精简过长的自定义写作要求或可选上下文后重试。"
+        )
+    counts = f" (estimated {estimated:,} tokens; safe budget {budget:,})" if has_counts else ""
+    if request_already_sent:
+        return (
+            f"The writing context required for length correction exceeds the current safe length{counts}. "
+            "This correction request was not sent; the earlier generation request had been sent, but no new chapter text was saved. Shorten unusually long custom instructions or optional context, then try again."
+        )
+    return (
+        f"The writing context for this chapter exceeds the current safe length{counts}. "
+        "No chapter-generation request was sent to the AI. Shorten unusually long custom instructions or optional context, then try again."
+    )
 
 
 def checked_llm_call(provider_call, *args, **kwargs):

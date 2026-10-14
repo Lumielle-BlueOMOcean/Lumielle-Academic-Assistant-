@@ -710,6 +710,9 @@ class GenerationReviewWiringV2Tests(unittest.TestCase):
 
         namespace = {
             "st": types.SimpleNamespace(session_state={}),
+            "ContextBudgetError": __import__("chapter_memory_support").ContextBudgetError,
+            "DEFAULT_PROMPT_TOKEN_BUDGET": __import__("chapter_memory_support").DEFAULT_PROMPT_TOKEN_BUDGET,
+            "fit_context_sandwich_to_prompt": __import__("chapter_memory_support").fit_context_sandwich_to_prompt,
             "build_chapter_prompt": lambda _sandwich, _prompts, _note=None: "Exact generated prompt",
             "dispatch_llm_call": dispatch,
             "require_valid_llm_output": lambda value: value,

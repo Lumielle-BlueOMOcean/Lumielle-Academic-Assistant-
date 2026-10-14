@@ -23,10 +23,13 @@ from structured_output_support import (
     structured_error_result,
     structured_request_options,
     structured_response_result,
+    plain_text_error_result,
+    plain_text_response_result,
 )
 from document_support import DEFAULT_CHUNK_CHARS, extract_document_text, is_document_parse_error, parse_document_in_chunks
 from chapter_memory_support import (
     ContextBudgetError,
+    DEFAULT_PROMPT_TOKEN_BUDGET,
     build_context_sandwich_v2,
     fit_context_sandwich_to_prompt,
     save_draft_and_maybe_refresh_memory,
@@ -91,6 +94,7 @@ from writing_support import (
     collect_model_answers,
     collect_global_reference_registry,
     count_chinese_chars,
+    context_budget_error_message,
     llm_error_message,
     parse_literature_analysis,
     record_generated_draft,
@@ -330,9 +334,11 @@ def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_nam
     if not api_key:
         if json_mode and return_metadata:
             return structured_error_result(RuntimeError("missing API key"), error_code="authentication_failed")
+        if return_metadata:
+            return plain_text_error_result(RuntimeError("missing API key"), error_code="authentication_failed")
         return "API 密钥缺失，请在[基础环境配置]中补全。"
     try:
-        client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0 if json_mode else 2)
+        client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0 if (json_mode or return_metadata) else 2)
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -359,6 +365,27 @@ def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_nam
                     return structured_error_result(exc, mode_state["mode"])
                 return "API 连续调用失败: 结构化请求失败"
 
+        if return_metadata:
+            transient_errors = {"rate_limited", "timeout", "connection_error", "server_error"}
+            transient_finishes = {"aborted", "insufficient_system_resource"}
+            for attempt in range(3):
+                try:
+                    response = client.chat.completions.create(**req_params)
+                    result = plain_text_response_result(response)
+                    if result.get("error_code") == "empty_content" and attempt < 2:
+                        time.sleep(1 if attempt == 0 else 2)
+                        continue
+                    if result.get("finish_reason") in transient_finishes and attempt < 2:
+                        time.sleep(1 if attempt == 0 else 2)
+                        continue
+                    return result
+                except Exception as exc:
+                    result = plain_text_error_result(exc)
+                    if result.get("error_code") in transient_errors and attempt < 2:
+                        time.sleep(1 if attempt == 0 else 2)
+                        continue
+                    return result
+
         for attempt in range(3):
             try:
                 res = client.chat.completions.create(**req_params)
@@ -383,6 +410,8 @@ def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_nam
             if return_metadata:
                 return structured_error_result(e)
             return "API 连续调用失败: 结构化请求初始化失败"
+        if return_metadata:
+            return plain_text_error_result(e)
         return f"OpenAI 客户端构造异常: {e}"
 
 def get_all_profiles():
@@ -403,14 +432,14 @@ def dispatch_llm_call(prompt, system_prompt=None, max_tokens=None, temp=0.7, pro
     """路由分发器。指定 profile_id 可调特定模型；否则使用当前激活配置。"""
     profiles = get_all_profiles()
     if not profiles:
-        raise LLMOutputError("未配置任何 LLM，请先在基础配置中添加。")
+        raise LLMOutputError("未配置任何 LLM，请先在基础配置中添加。", error_code="no_active_model")
     prof = None
     if profile_id:
         prof = next((p for p in profiles if p["id"] == profile_id), None)
     if not prof:
         prof = get_active_profile()
     if not prof:
-        raise LLMOutputError("未找到有效的 LLM 配置。")
+        raise LLMOutputError("未找到有效的 LLM 配置。", error_code="no_active_model")
     call_arguments = dict(
         prompt=prompt,
         system_prompt=system_prompt,
@@ -1886,17 +1915,40 @@ def build_chapter_prompt(sandwich, prompts, correction_note=None):
 def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, tolerance=0.5):
     """Generate and length-correct a candidate, then review that final candidate once."""
     if sandwich.get("prompt_budget_error"):
-        raise LLMOutputError(sandwich.get("prompt_budget_message") or "必需写作要求超过安全上下文预算。")
+        raise ContextBudgetError(
+            sandwich.get("prompt_budget_message") or "必需写作要求超过安全上下文预算。",
+            estimated_tokens=sandwich.get("prompt_budget_estimated_tokens"),
+            max_estimated_tokens=sandwich.get("prompt_budget_limit", DEFAULT_PROMPT_TOKEN_BUDGET),
+        )
     target = int(sandwich.get("current_word_count", 0) or 0)
     correction_note = None
     last_res = ""
     wc_info = None
     for attempt in range(max_attempts):
-        prompt = build_chapter_prompt(sandwich, prompts, correction_note)
-        st.session_state["last_generation_context_manifest"] = save_manifest_for_prompt(sandwich, prompt)
-        last_res = require_valid_llm_output(
-            dispatch_llm_call(prompt, max_tokens=4000)
-        )
+        try:
+            fitted_sandwich = fit_context_sandwich_to_prompt(
+                sandwich,
+                lambda value: build_chapter_prompt(value, prompts, correction_note),
+            )
+        except ContextBudgetError as exc:
+            exc.request_already_sent = attempt > 0
+            raise
+        prompt = build_chapter_prompt(fitted_sandwich, prompts, correction_note)
+        response = dispatch_llm_call(prompt, max_tokens=4000, return_metadata=True)
+        st.session_state["last_generation_context_manifest"] = save_manifest_for_prompt(fitted_sandwich, prompt)
+        if isinstance(response, dict):
+            error_code = response.get("error_code")
+            finish_reason = response.get("finish_reason")
+            if not error_code and finish_reason == "length":
+                error_code = "truncated_output"
+            elif not error_code and finish_reason == "content_filter":
+                error_code = "content_filtered"
+            elif not error_code and finish_reason != "stop":
+                error_code = "incomplete_response"
+            if error_code:
+                raise LLMOutputError("模型未返回可用章节正文。", error_code=error_code)
+            response = response.get("content", "")
+        last_res = require_valid_llm_output(response)
         if target <= 0:
             break
         actual = count_chinese_chars(last_res)
@@ -2075,8 +2127,10 @@ def render_single_chapter_editor(tree):
                     with st.spinner("AI 生成中（自动纠偏）..."):
                         try:
                             res, wc_info, consistency = generate_chapter_with_correction(sandwich, prompts)
-                        except LLMOutputError:
-                            st.error("章节生成失败，原有正文已保留。" + llm_error_message("zh"))
+                        except ContextBudgetError as exc:
+                            st.error("章节生成失败，原有正文已保留。" + context_budget_error_message("zh", exc))
+                        except LLMOutputError as exc:
+                            st.error("章节生成失败，原有正文已保留。" + llm_error_message("zh", exc))
                         else:
                             bound_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
                             candidate = {
@@ -2110,7 +2164,11 @@ def render_single_chapter_editor(tree):
                                 st.rerun()
 
         if sandwich.get("prompt_budget_error"):
-            st.warning(sandwich.get("prompt_budget_message", "必需写作上下文超过安全长度。"))
+            st.warning(context_budget_error_message("zh", ContextBudgetError(
+                sandwich.get("prompt_budget_message", "必需写作上下文超过安全长度。"),
+                estimated_tokens=sandwich.get("prompt_budget_estimated_tokens"),
+                max_estimated_tokens=sandwich.get("prompt_budget_limit", DEFAULT_PROMPT_TOKEN_BUDGET),
+            )))
         legacy_summaries = load_json_file("drafts_summary.json", {})
         render_chapter_memory_panel(
             st,
@@ -2322,8 +2380,12 @@ def render_batch_workbench():
                     sandwich = build_context_sandwich(nid)
                     try:
                         res, wc_info, consistency = generate_chapter_with_correction(sandwich, prompts)
-                    except LLMOutputError:
-                        failed_chapters.append(f"{node.get('title','未命名')}: {llm_error_message('zh')}")
+                    except ContextBudgetError as exc:
+                        failed_chapters.append(f"{node.get('title','未命名')}: {context_budget_error_message('zh', exc)}")
+                        progress_bar.progress((k + 1) / len(leaf_ids))
+                        continue
+                    except LLMOutputError as exc:
+                        failed_chapters.append(f"{node.get('title','未命名')}: {llm_error_message('zh', exc)}")
                         progress_bar.progress((k + 1) / len(leaf_ids))
                         continue
                     bound_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
@@ -3520,9 +3582,11 @@ def build_context_sandwich(current_node_id, max_chars=20000):
             context,
             lambda value: build_chapter_prompt(value, prompts),
         )
-    except ContextBudgetError:
+    except ContextBudgetError as exc:
         context["prompt_budget_error"] = True
         context["prompt_budget_message"] = "必需写作要求超过安全上下文预算，请精简当前提示词或要求。"
+        context["prompt_budget_estimated_tokens"] = exc.estimated_tokens
+        context["prompt_budget_limit"] = exc.max_estimated_tokens
     return context
 
 

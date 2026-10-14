@@ -168,7 +168,7 @@ class ContextManifestRerunRegressionTests(unittest.TestCase):
                     "import sys, hashlib\n"
                     f"sys.path.insert(0, {str(ROOT)!r})\n"
                     "import streamlit as st\n"
-                    "from chapter_memory_support import save_manifest_for_prompt\n"
+                    "from chapter_memory_support import save_manifest_for_prompt, fit_context_sandwich_to_prompt, ContextBudgetError, DEFAULT_PROMPT_TOKEN_BUDGET\n"
                     "from chapter_consistency import review_chapter_candidate\n"
                     "from chapter_memory_ui import render_context_manifest_summary\n"
                     "LLMOutputError = RuntimeError\n"
@@ -185,7 +185,7 @@ class ContextManifestRerunRegressionTests(unittest.TestCase):
                     + function_source + "\n"
                     "st.session_state.setdefault('chapter_context_preview_manifest', {'selected_memory_ids':['INITIAL_PREVIEW']})\n"
                     "if st.button('Generate'):\n"
-                    "    sandwich = {'current_word_count': 0, 'current_refs': [], 'context_manifest': {'selected_memory_ids':['ACTUAL_MEMORY_42'], 'selected_chapters':[{'chapter_id':'c1','title':'Background'}], 'omission_reasons':{}}}\n"
+                    "    sandwich = {'current_word_count': 0, 'current_refs': [], 'context_manifest': {'selected_memory_ids':['ACTUAL_MEMORY_42'], 'selected_chapters':[{'chapter_id':'c1','title':'Background'}], 'omission_reasons':{}}, '_base_upstream':'', '_base_downstream':'', '_memory_entries':[{'memory_id':'ACTUAL_MEMORY_42','chapter_id':'c1','chapter_title':'Background','side':'upstream','priority':1,'text':'Synthetic confirmed context','confirmed':True,'statement':'Synthetic confirmed fact','source_quote':'Synthetic quote'}]}\n"
                     "    generate_chapter_with_correction(sandwich, {})\n"
                     "    st.session_state['chapter_context_preview_manifest'] = {'selected_memory_ids':[]}\n"
                     "    st.rerun()\n"
@@ -229,6 +229,9 @@ class ContextManifestRerunRegressionTests(unittest.TestCase):
 
                 namespace = {
                     "st": types.SimpleNamespace(session_state={}),
+                    "ContextBudgetError": __import__("chapter_memory_support").ContextBudgetError,
+                    "DEFAULT_PROMPT_TOKEN_BUDGET": __import__("chapter_memory_support").DEFAULT_PROMPT_TOKEN_BUDGET,
+                    "fit_context_sandwich_to_prompt": __import__("chapter_memory_support").fit_context_sandwich_to_prompt,
                     "build_chapter_prompt": lambda _sandwich, _prompts, note=None: "Exact generated prompt" + (f"\n{note}" if note else ""),
                     "dispatch_llm_call": dispatch,
                     "require_valid_llm_output": lambda value: value,
@@ -241,7 +244,16 @@ class ContextManifestRerunRegressionTests(unittest.TestCase):
                 }
                 generate = types.FunctionType(function_code, namespace)
                 generate.__defaults__ = (3, 0.5)
-                generate({"current_word_count": 20, "current_refs": [], "context_manifest": {"selected_memory_ids": [7]}}, {}, max_attempts=2, tolerance=0.1)
+                generate({
+                    "current_word_count": 20, "current_refs": [],
+                    "context_manifest": {"selected_memory_ids": [7]},
+                    "_base_upstream": "", "_base_downstream": "",
+                    "_memory_entries": [{
+                        "memory_id": 7, "chapter_id": "prior", "chapter_title": "Prior",
+                        "side": "upstream", "priority": 1, "text": "Synthetic prior memory",
+                        "confirmed": False,
+                    }],
+                }, {}, max_attempts=2, tolerance=0.1)
                 generation_prompts = [prompt for prompt, kwargs in calls if not kwargs.get("json_mode")]
                 manifest = namespace["st"].session_state["last_generation_context_manifest"]
                 self.assertEqual(len(generation_prompts), 2)

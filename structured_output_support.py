@@ -136,6 +136,57 @@ def structured_error_result(exc: BaseException, structured_mode="native", *, err
     }
 
 
+def plain_text_error_result(exc: BaseException, *, error_code=None) -> dict:
+    """Return safe metadata for a text-call failure without preserving provider details."""
+    result = {
+        "content": "",
+        "finish_reason": None,
+        "error_code": error_code or classify_provider_exception(exc),
+    }
+    status = _http_status(exc)
+    if status is not None:
+        result["http_status"] = status
+    return result
+
+
+def plain_text_response_result(response) -> dict:
+    """Extract final text and safe response metadata; never inspect reasoning text."""
+    result = {"content": "", "finish_reason": None, "error_code": None}
+    status = _http_status(response)
+    if status is not None:
+        result["http_status"] = status
+
+    choices = getattr(response, "choices", None)
+    if not isinstance(choices, (list, tuple)) or not choices:
+        result["error_code"] = "incomplete_response"
+        return result
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    content = getattr(message, "content", None)
+    finish_reason = _safe_finish_reason(getattr(choice, "finish_reason", None))
+    result["content"] = content if isinstance(content, str) else ""
+    result["finish_reason"] = finish_reason
+
+    usage = getattr(response, "usage", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if isinstance(completion_tokens, int) and not isinstance(completion_tokens, bool):
+        result["completion_tokens"] = completion_tokens
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning_tokens = getattr(details, "reasoning_tokens", None)
+    if isinstance(reasoning_tokens, int) and not isinstance(reasoning_tokens, bool):
+        result["reasoning_tokens"] = reasoning_tokens
+
+    if finish_reason == "length":
+        result["error_code"] = "truncated_output"
+    elif finish_reason == "content_filter":
+        result["error_code"] = "content_filtered"
+    elif finish_reason in {"aborted", "insufficient_system_resource", "unknown", None}:
+        result["error_code"] = "incomplete_response"
+    elif not result["content"].strip():
+        result["error_code"] = "empty_content"
+    return result
+
+
 def is_response_format_unsupported(exc: BaseException) -> bool:
     """Allow compatibility retry only for an explicit 400/422 format rejection."""
     if _http_status(exc) not in {400, 422}:

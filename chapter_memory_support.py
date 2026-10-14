@@ -22,7 +22,7 @@ MAX_ITEM_STATEMENT_CHARS = 1200
 MAX_SOURCE_QUOTE_CHARS = 500
 _TRANSIENT_ERRORS = {"rate_limited", "timeout", "connection_error", "server_error"}
 _TRANSIENT_FINISH_REASONS = {"insufficient_system_resource", "aborted"}
-DEFAULT_PROMPT_TOKEN_BUDGET = 7000
+DEFAULT_PROMPT_TOKEN_BUDGET = 16000
 _ALLOWED_MEMORY_TYPES = {
     "definition", "terminology", "method", "data_or_number", "finding",
     "conclusion", "limitation", "hypothesis", "cross_chapter_dependency",
@@ -35,6 +35,12 @@ class MemoryBuildError(RuntimeError):
 
 class ContextBudgetError(ValueError):
     """Raised when the required prompt sections cannot fit the local budget."""
+
+    def __init__(self, message, *, estimated_tokens=None, max_estimated_tokens=DEFAULT_PROMPT_TOKEN_BUDGET, request_already_sent=False):
+        super().__init__(message)
+        self.estimated_tokens = estimated_tokens
+        self.max_estimated_tokens = max_estimated_tokens
+        self.request_already_sent = bool(request_already_sent)
 
 
 def structured_memory_llm_call(llm_call, locale="en"):
@@ -571,7 +577,11 @@ def fit_context_sandwich_to_prompt(sandwich, prompt_builder, max_estimated_token
         omitted.append(entry)
         prompt, estimate = render()
     if estimate > max_estimated_tokens:
-        raise ContextBudgetError("The required writing instructions exceed the safe prompt budget.")
+        raise ContextBudgetError(
+            "The required writing instructions exceed the safe prompt budget.",
+            estimated_tokens=estimate,
+            max_estimated_tokens=max_estimated_tokens,
+        )
     for entry in omitted:
         if entry.get("memory_id") is not None:
             manifest.setdefault("omitted_memory_ids", []).append(entry["memory_id"])
