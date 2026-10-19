@@ -83,7 +83,7 @@ class LiteratureAdaptiveSplitTests(unittest.TestCase):
         self.assertEqual(result["evidence"], [])
         self.assertLessEqual(len(calls), 2 ** (literature.MAX_SOURCE_SPLIT_DEPTH + 1) - 1)
 
-    def test_final_synthesis_length_retry_keeps_fixed_budget_then_fails_truncated(self):
+    def test_final_synthesis_length_retry_increases_budget_then_fails_truncated(self):
         calls = []
 
         def llm(prompt, **kwargs):
@@ -95,9 +95,9 @@ class LiteratureAdaptiveSplitTests(unittest.TestCase):
         result = literature.analyze_literature_document("short source", "Study", llm, max_chars=1000)
         synthesis = [kw["max_tokens"] for prompt, kw in calls if "[DOCUMENT SYNTHESIS]" in prompt]
         self.assertEqual(result["failure_code"], "truncated_output")
-        self.assertEqual(synthesis, [2600, 2600])
+        self.assertEqual(synthesis, [2600, 4000])
 
-    def test_final_synthesis_compact_retry_can_succeed_at_same_budget(self):
+    def test_final_synthesis_compact_retry_can_succeed_at_larger_budget(self):
         calls = []
 
         def llm(prompt, **kwargs):
@@ -113,7 +113,7 @@ class LiteratureAdaptiveSplitTests(unittest.TestCase):
         prompts = [prompt for prompt, _ in calls if "[DOCUMENT SYNTHESIS]" in prompt]
         budgets = [kwargs["max_tokens"] for prompt, kwargs in calls if "[DOCUMENT SYNTHESIS]" in prompt]
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(budgets, [2600, 2600])
+        self.assertEqual(budgets, [2600, 4000])
         self.assertIn("further compress", prompts[1].lower())
         self.assertIn("close the JSON object completely", prompts[1])
 

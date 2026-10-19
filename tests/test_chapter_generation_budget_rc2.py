@@ -225,11 +225,14 @@ class PlainTextResponseMetadataTests(unittest.TestCase):
         namespace = {
             "OpenAI": openai,
             "time": types.SimpleNamespace(sleep=lambda _seconds: None),
+            "call_structured_with_bounded_retry": structured_output_support.call_structured_with_bounded_retry,
+            "structured_request_options": structured_output_support.structured_request_options,
+            "structured_error_result": structured_output_support.structured_error_result,
             "plain_text_response_result": structured_output_support.plain_text_response_result,
             "plain_text_error_result": structured_output_support.plain_text_error_result,
         }
         loaded = types.FunctionType(function_code, namespace)
-        loaded.__defaults__ = (0.7, False, False)
+        loaded.__defaults__ = (0.7, False, False, True)
         return loaded, attempts, client_options
 
     def test_plain_text_default_remains_string_and_explicit_metadata_reports_finish_reason(self):

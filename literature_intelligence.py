@@ -13,7 +13,7 @@ from pathlib import Path
 from context_digest_support import balanced_excerpt
 from document_support import DEFAULT_CHUNK_CHARS, chunk_document_text
 from relevance_support import multilingual_terms
-from writing_support import LLMOutputError, require_valid_llm_output
+from writing_support import LLMOutputError, require_complete_llm_result, require_valid_llm_output
 from structured_output_support import classify_provider_exception, parse_first_json_value
 
 
@@ -23,7 +23,7 @@ MAX_EVIDENCE_CHARS = 1800
 MAX_TRANSPORT_ATTEMPTS = 3
 TRANSPORT_RETRY_BACKOFF_SECONDS = (1, 2)
 LITERATURE_CHUNK_TOKEN_BUDGETS = (2200,)
-LITERATURE_SYNTHESIS_TOKEN_BUDGETS = (2600, 2600)
+LITERATURE_SYNTHESIS_TOKEN_BUDGETS = (2600, 4000)
 LITERATURE_REDUCTION_TOKEN_BUDGET = 1800
 MAX_SYNTHESIS_INPUT_CHARS = 20000
 MAX_REDUCTION_GROUP_CHARS = 8000
@@ -150,7 +150,7 @@ def build_synthesis_prompt(title, extractions, locale="en", retry=False, *, rese
 _PROVIDER_ERROR_CODES = TRANSIENT_PROVIDER_ERRORS | frozenset({
     "authentication_failed", "insufficient_balance", "model_not_available",
     "invalid_request", "provider_error", "incomplete_response", "content_filtered",
-    "insufficient_system_resource", "aborted",
+    "insufficient_system_resource", "aborted", "truncated_output", "empty_content",
 })
 _SAFE_FINISH_REASONS = frozenset({
     "stop", "length", "content_filter", "insufficient_system_resource", "aborted",
@@ -202,7 +202,10 @@ def _safe_exception_status(exc):
 
 def _checked_call(llm_call, prompt, max_tokens):
     try:
-        value = llm_call(prompt, max_tokens=max_tokens, json_mode=True, return_metadata=True)
+        value = llm_call(
+            prompt, max_tokens=max_tokens, json_mode=True, return_metadata=True,
+            transport_retry=False,
+        )
     except Exception as exc:
         diagnostic = {
             "finish_reason": None,
@@ -247,6 +250,10 @@ def _call_with_transport_retry(llm_call, prompt, max_tokens):
 
         code = result.get("error_code")
         finish_reason = result.get("finish_reason")
+        if code in {"truncated_output", "empty_content"}:
+            # These are completed HTTP responses with unusable model output,
+            # so business-level splitting/correction—not transport retry—owns recovery.
+            return result, retry_count
         transient_code = finish_reason if finish_reason in TRANSIENT_FINISH_REASONS else code
         if transient_code:
             if _retryable_provider_error(transient_code) and transport_attempt < MAX_TRANSPORT_ATTEMPTS - 1:
@@ -1131,7 +1138,7 @@ def build_literature_review_summary_prompt(research_topic, research_context, sum
 
 def _checked_review_call(llm_call, prompt, max_tokens):
     try:
-        return require_valid_llm_output(llm_call(prompt, max_tokens=max_tokens)).strip()
+        return require_complete_llm_result(llm_call(prompt, max_tokens=max_tokens, return_metadata=True)).strip()
     except LLMOutputError:
         raise
     except Exception as exc:
@@ -1266,11 +1273,14 @@ def new_literature_record(literature_id, title, text, *, source, link="", file_p
     }
 
 
-def select_literature_evidence_for_chapter(evidence_store, bound_literature_ids, chapter_title, chapter_description="", *, limit=8):
+def select_literature_evidence_for_chapter(evidence_store, bound_literature_ids, chapter_title, chapter_description="", *, limit=8, literatures=None):
     """Select concise evidence only from references explicitly bound to this chapter."""
     if not isinstance(evidence_store, dict):
         return []
     bound = list(dict.fromkeys(str(value) for value in (bound_literature_ids or [])))
+    if literatures is not None:
+        valid_ids = {str(item.get("id")) for item in literatures if isinstance(item, dict) and item.get("id") is not None}
+        bound = [literature_id for literature_id in bound if literature_id in valid_ids]
     query_terms = multilingual_terms(f"{chapter_title or ''} {chapter_description or ''}")
     candidates = []
     for bound_index, literature_id in enumerate(bound):
@@ -1283,20 +1293,36 @@ def select_literature_evidence_for_chapter(evidence_store, bound_literature_ids,
                 candidates.append((score, bound_index, evidence_index, item))
     if query_terms:
         candidates.sort(key=lambda row: (-row[0], row[1], int(row[3].get("chunk_index", 0)), row[2]))
+        matched = [row for row in candidates if row[0] > 0]
+        matched_source_ids = {str(row[3].get("literature_id", "")) for row in matched}
+        fallback = []
+        for bound_index, literature_id in enumerate(bound):
+            if literature_id in matched_source_ids:
+                continue
+            for evidence_index, item in enumerate(evidence_store.get(literature_id, []) or []):
+                if not isinstance(item, dict):
+                    continue
+                if not str(item.get("evidence_text", "")).strip():
+                    continue
+                fallback.append((0, bound_index, evidence_index, item))
+        candidates = matched + fallback
     selected = []
-    reason = "no_query_terms_fallback" if not query_terms else "multilingual_term_overlap"
     for score, _, _, item in candidates[:max(0, int(limit))]:
         selected.append({
             **{key: item.get(key, "") for key in ("literature_id", "chunk_index", "section", "claim", "evidence_text", "source_locator")},
             "relevance_score": score,
-            "selection_reason": reason,
+            "selection_reason": (
+                "multilingual_term_overlap" if score else
+                ("bound_source_fallback" if query_terms else "no_query_terms_fallback")
+            ),
         })
     return selected
 
 
 def format_literature_evidence_for_chapter(evidence_store, bound_literature_ids, chapter_title, chapter_description="", *, locale="en", limit=8, literatures=None):
     selected = select_literature_evidence_for_chapter(
-        evidence_store, bound_literature_ids, chapter_title, chapter_description, limit=limit
+        evidence_store, bound_literature_ids, chapter_title, chapter_description, limit=limit,
+        literatures=literatures,
     )
     if not selected:
         return "本章没有可用的已绑定文献证据。" if locale == "zh" else "No evidence chunks are available for the references bound to this chapter."
@@ -1304,7 +1330,12 @@ def format_literature_evidence_for_chapter(evidence_store, bound_literature_ids,
         str(item.get("id")): str(item.get("title", item.get("id", "")))
         for item in (literatures or []) if isinstance(item, dict) and item.get("id") is not None
     }
-    citation_number = {str(item): index for index, item in enumerate(dict.fromkeys(str(value) for value in (bound_literature_ids or [])), 1)}
+    valid_ids = set(title_by_id)
+    citation_ids = [
+        literature_id for literature_id in dict.fromkeys(str(value) for value in (bound_literature_ids or []))
+        if literature_id in valid_ids
+    ]
+    citation_number = {literature_id: index for index, literature_id in enumerate(citation_ids, 1)}
     lines = []
     for item in selected:
         literature_id = str(item["literature_id"])

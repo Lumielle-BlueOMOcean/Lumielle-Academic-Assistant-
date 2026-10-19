@@ -270,13 +270,10 @@ def parse_research_source(document_text, section_id, llm_call, *, locale="en", m
     purpose = section["name_zh"] if locale == "zh" and section else section["name_en"] if section else str(section_id)
 
     def normalize(modules):
-        return [
-            fact
-            for module in modules
-            if _is_valid_research_module(module)
-            for fact in [_normalize_fact(module, section_id, allow_writing_grounding, source_id)]
-            if fact
-        ]
+        if not isinstance(modules, list) or not modules or not all(_is_valid_research_module(module) for module in modules):
+            return []
+        normalized = [_normalize_fact(module, section_id, allow_writing_grounding, source_id) for module in modules]
+        return normalized if all(fact is not None for fact in normalized) else []
 
     result = parse_document_in_chunks(
         document_text,
@@ -357,6 +354,9 @@ def _planning_fact_line(fact, budget=None):
     title = str(fact.get("title", ""))
     tags = ", ".join(str(tag) for tag in fact.get("tags", []) if str(tag).strip())
     suffix = f" (tags: {tags})" if tags else ""
+    role = str(fact.get("role", "")).strip()
+    role_suffix = f" (role: {role})" if role else ""
+    suffix += role_suffix
     prefix = f"- {title}: "
     if fact.get("type") == "table":
         columns, rows = fact.get("columns", []), fact.get("data", [])
@@ -451,12 +451,20 @@ def select_research_grounding_for_chapter(research_base, chapter_title, chapter_
     for fact in eligible:
         if fact.get("id") in excluded or fact.get("binding_mode") != "auto":
             continue
-        fact_terms = _terms(" ".join((fact.get("title", ""), fact.get("content", ""), " ".join(fact.get("tags", [])))))
+        if fact.get("type") == "table":
+            table_content = " ".join(str(value) for value in fact.get("columns", []) or []) + " " + " ".join(
+                str(value) for row in fact.get("data", []) or [] if isinstance(row, (list, tuple)) for value in row
+            )
+        else:
+            table_content = str(fact.get("content", ""))
+        fact_terms = _terms(" ".join((fact.get("title", ""), table_content, " ".join(fact.get("tags", [])), fact.get("role", ""))))
         score = len(query & fact_terms)
         if score:
             ranked.append((score, fact))
     ranked.sort(key=lambda pair: (-pair[0], str(pair[1].get("id", ""))))
-    max_auto = max(0, int(limit) - len(explicit) - len(global_facts))
+    # Global constraints do not consume the relevance-selection quota. They are
+    # still rendered first, while relevant facts retain independent slots.
+    max_auto = max(0, int(limit) - len(explicit))
     return explicit + global_facts + [fact for _, fact in ranked[:max_auto]]
 
 
@@ -547,9 +555,13 @@ def accept_smart_inbox_facts(pending, section_id, tags, role, allow_grounding, *
 
 def parse_classification_suggestion(response, valid_section_ids):
     """Parse advisory Smart Inbox classification; this never mutates or moves any facts."""
+    if isinstance(response, dict):
+        if response.get("error_code") or response.get("finish_reason") != "stop":
+            return {"section": "", "tags": [], "role": ""}
+        response = response.get("content", "")
     try:
-        value = json.loads(str(response or ""))
-    except json.JSONDecodeError:
+        value = parse_first_json_value(response)
+    except (TypeError, ValueError):
         return {"section": "", "tags": [], "role": ""}
     if not isinstance(value, dict):
         return {"section": "", "tags": [], "role": ""}

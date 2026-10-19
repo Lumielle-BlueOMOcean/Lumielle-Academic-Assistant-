@@ -3,6 +3,7 @@
 import io
 import os
 import re
+import time
 
 import PyPDF2
 import docx
@@ -10,6 +11,7 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 from writing_support import LLMOutputError, require_valid_llm_output
+from structured_output_support import classify_provider_exception
 
 
 DEFAULT_CHUNK_CHARS = 5500
@@ -139,8 +141,11 @@ def parse_document_in_chunks(
     locale="en",
     max_chars=DEFAULT_CHUNK_CHARS,
     on_parse_failure=None,
+    sleep=None,
+    max_length_splits=2,
 ):
     """Parse all chunks in order and return modules only if every chunk succeeds."""
+    sleep = sleep or time.sleep
     if not isinstance(document_text, str) or not document_text.strip():
         chunks = []
     else:
@@ -157,41 +162,85 @@ def parse_document_in_chunks(
 
     collected = []
     system_prompt = "你是严谨的科研事实结构化解析器，只输出 JSON 对象。" if locale == "zh" else "You are a rigorous research-facts parser. Output only a JSON object."
-    for index, chunk in enumerate(chunks, start=1):
+    def split_for_length(chunk):
+        if len(chunk) < 2:
+            return None
+        midpoint = len(chunk) // 2
+        sentence_candidates = [
+            match.end() for match in re.finditer(r"(?<=[.!?。！？])\s+", chunk)
+            if 0 < match.end() < len(chunk)
+        ]
+        if sentence_candidates:
+            split_at = min(sentence_candidates, key=lambda value: abs(value - midpoint))
+        else:
+            lower, upper = max(1, int(len(chunk) * 0.3)), min(len(chunk) - 1, int(len(chunk) * 0.7))
+            candidates = [lower + match.end() for match in re.finditer(r"\n[ \t]*\n|\r?\n|\s+", chunk[lower:upper])]
+            split_at = min(candidates, key=lambda value: abs(value - midpoint)) if candidates else midpoint
+        if not 0 < split_at < len(chunk):
+            return None
+        return chunk[:split_at], chunk[split_at:]
+
+    def parse_one(chunk, index, total, *, depth=0):
         parsed_modules = None
         last_response = ""
+        failure_stage = "invalid_structured_output"
         for attempt in range(2):
             prompt = _build_chunk_prompt(
                 chunk,
                 purpose,
                 index,
-                len(chunks),
+                total,
                 locale,
                 retry=attempt == 1,
             )
-            kwargs = {"system_prompt": system_prompt, "max_tokens": MAX_OUTPUT_TOKENS, "json_mode": True}
+            kwargs = {
+                "system_prompt": system_prompt,
+                "max_tokens": MAX_OUTPUT_TOKENS,
+                "json_mode": True,
+                "return_metadata": True,
+            }
             if attempt == 1:
                 kwargs["temp"] = 0.3
             try:
                 response = llm_call(prompt, **kwargs)
-            except Exception:
-                response = "API call failed repeatedly"
-            last_response = response if isinstance(response, str) else ""
-            if not isinstance(response, str) or not response.strip():
+            except Exception as exc:
+                code = classify_provider_exception(exc)
+                return None, {"failure_stage": "provider_call", "failure_code": code, "response": ""}
+            if isinstance(response, dict):
+                error_code = response.get("error_code")
+                finish_reason = response.get("finish_reason")
+                last_response = response.get("content", "") if isinstance(response.get("content"), str) else ""
+                if error_code and error_code not in {"truncated_output", "empty_content", "incomplete_response"}:
+                    return None, {"failure_stage": "provider_call", "failure_code": error_code, "response": ""}
+                if finish_reason == "length" or error_code == "truncated_output":
+                    if depth >= max_length_splits:
+                        return None, {"failure_stage": "truncated_output", "failure_code": "truncated_output", "response": ""}
+                    split = split_for_length(chunk)
+                    if not split:
+                        return None, {"failure_stage": "truncated_output", "failure_code": "truncated_output", "response": ""}
+                    left, right = split
+                    left_result, left_failure = parse_one(left, index, total, depth=depth + 1)
+                    if left_result is None:
+                        return None, left_failure
+                    right_result, right_failure = parse_one(right, index, total, depth=depth + 1)
+                    if right_result is None:
+                        return None, right_failure
+                    return left_result + right_result, None
+                if finish_reason == "content_filter":
+                    return None, {"failure_stage": "provider_call", "failure_code": "content_filtered", "response": ""}
+                if finish_reason != "stop":
+                    return None, {"failure_stage": "provider_call", "failure_code": "incomplete_response", "response": ""}
+            else:
+                # Compatibility for pure unit fakes and legacy helpers. Production
+                # dispatch_llm_call is always invoked with return_metadata=True.
+                last_response = response if isinstance(response, str) else ""
+            if not last_response.strip():
                 failure_stage = "empty_structured_output"
                 continue
             try:
-                last_response = require_valid_llm_output(response)
+                last_response = require_valid_llm_output(last_response)
             except LLMOutputError:
-                if locale == "zh":
-                    message = f"AI 服务调用失败（第 {index}/{len(chunks)} 块），未导入部分内容。请先测试当前模型连接后重试。"
-                else:
-                    message = f"The AI service call failed for part {index} of {len(chunks)}. No partial content was imported. Test the current model connection and try again."
-                return {
-                    "status": "error", "modules": [], "chunks_total": len(chunks),
-                    "failed_chunk": index, "error_type": "llm", "failure_stage": "provider_call",
-                    "failure_code": "provider_call_failed", "message": message,
-                }
+                return None, {"failure_stage": "provider_call", "failure_code": "provider_error", "response": ""}
 
             try:
                 raw_modules = parse_response(last_response)
@@ -206,35 +255,45 @@ def parse_document_in_chunks(
             if isinstance(raw_modules, list) and raw_modules:
                 parsed_modules = normalize_modules(raw_modules)
                 if isinstance(parsed_modules, list) and parsed_modules:
-                    break
+                    for module in parsed_modules:
+                        if isinstance(module, dict):
+                            module.setdefault("source_chunk", index)
+                    return parsed_modules, None
                 parsed_modules = None
+        return None, {"failure_stage": failure_stage, "failure_code": failure_stage, "response": last_response}
 
+    for index, chunk in enumerate(chunks, start=1):
+        parsed_modules, failure = parse_one(chunk, index, len(chunks))
         if parsed_modules is None:
+            failure_stage = failure["failure_stage"]
+            failure_code = failure["failure_code"]
             if on_parse_failure:
-                on_parse_failure(chunk, last_response)
+                on_parse_failure(chunk, "")
             if locale == "zh":
                 descriptions = {
                     "invalid_structured_output": "AI 返回的数据格式异常",
                     "empty_structured_output": "AI 返回了空的科研事实数据",
                     "schema_validation_failure": "AI 返回的数据不符合科研事实格式",
+                    "truncated_output": "模型输出达到长度限制",
+                    "provider_call": "AI 服务调用失败",
                 }
-                message = f"{descriptions[failure_stage]}（第 {index}/{len(chunks)} 块），未导入不完整内容。请重试；若持续出现，请联系维护者并注明失败分块。"
+                message = f"{descriptions.get(failure_stage, 'AI 解析失败')}（第 {index}/{len(chunks)} 块），未导入不完整内容。请稍后重试。"
             else:
                 descriptions = {
                     "invalid_structured_output": "The AI returned malformed structured data",
                     "empty_structured_output": "The AI returned no research facts",
                     "schema_validation_failure": "The AI data did not match the research-fact schema",
+                    "truncated_output": "The model output reached its length limit",
+                    "provider_call": "The AI service could not complete this request",
                 }
-                message = f"{descriptions[failure_stage]} for part {index} of {len(chunks)}. No partial content was imported. Retry; if this continues, tell support which part failed."
+                message = f"{descriptions.get(failure_stage, 'The document parse failed')} for part {index} of {len(chunks)}. No partial content was imported. Please retry later."
             return {
                 "status": "error", "modules": [], "chunks_total": len(chunks),
-                "failed_chunk": index, "error_type": "parse", "failure_stage": failure_stage,
-                "failure_code": failure_stage, "message": message,
+                "failed_chunk": index,
+                "error_type": "llm" if failure_stage == "provider_call" else "parse",
+                "failure_stage": failure_stage,
+                "failure_code": failure_code, "message": message,
             }
-        # Retain trusted parser provenance instead of asking the model to number chunks.
-        for module in parsed_modules:
-            if isinstance(module, dict):
-                module.setdefault("source_chunk", index)
         collected.extend(parsed_modules)
 
     return {"status": "ok", "modules": collected, "chunks_total": len(chunks)}

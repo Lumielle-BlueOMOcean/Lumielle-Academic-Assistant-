@@ -230,13 +230,13 @@ def _render_inbox(st, base, llm_call, save_base, extract_upload_text, locale):
                 fact_preview = [{"title": item["title"], "content": item["content"], "tags": item["tags"]} for item in parsed["facts"]]
                 section_names = {key: _name(section, locale) for key, section in base["sections"].items() if key != "legacy_unclassified"}
                 prompt = (
-                    "请根据已解析事实，建议最适合的科研资料分区、关键词标签和用途。分类仅供用户审核，不得移动资料。"
+                    "请根据已解析事实，建议最适合的科研资料分区、关键词标签和用途。分类仅供用户审核，不得移动资料。只输出 JSON 对象，字段为 section（有效分区 ID）、tags（字符串数组）、role（简短用途）；无把握时 section 为空字符串。示例：{\"section\":\"methods\",\"tags\":[\"sampling\"],\"role\":\"用于界定抽样范围\"}。"
                     if locale == "zh" else
-                    "Given these parsed facts, suggest the best research section, concise tags, and role. This is advisory only; do not move or rewrite the facts."
+                    "Given these parsed facts, suggest the best research section, concise tags, and role. This is advisory only; do not move or rewrite the facts. Return only a JSON object with section (a valid section ID), tags (string array), and role (short purpose); use an empty section when uncertain. Example: {\"section\":\"methods\",\"tags\":[\"sampling\"],\"role\":\"Defines the sampling scope\"}."
                 )
                 prompt += "\nValid section IDs: " + ", ".join(section_names) + "\nFacts: " + json.dumps(fact_preview, ensure_ascii=False)
                 try:
-                    response = llm_call(prompt, max_tokens=500)
+                    response = llm_call(prompt, max_tokens=500, json_mode=True, return_metadata=True)
                     suggestion = parse_classification_suggestion(response, section_names)
                 except LLMOutputError:
                     suggestion = {"section": "", "tags": [], "role": ""}

@@ -51,6 +51,27 @@ def require_valid_llm_output(text):
     return text
 
 
+def require_complete_llm_result(result):
+    """Validate metadata-aware text output before it enters a business workflow.
+
+    Legacy string callers remain supported. Metadata callers must finish with
+    ``stop`` and a non-empty final content field; reasoning content is ignored.
+    """
+    if isinstance(result, dict):
+        code = result.get("error_code")
+        finish_reason = result.get("finish_reason")
+        if code:
+            raise LLMOutputError("The model response was not usable.", error_code=code)
+        if finish_reason == "length":
+            raise LLMOutputError("The model output was truncated.", error_code="truncated_output")
+        if finish_reason == "content_filter":
+            raise LLMOutputError("The model response was filtered.", error_code="content_filtered")
+        if finish_reason != "stop":
+            raise LLMOutputError("The model response did not complete.", error_code="incomplete_response")
+        result = result.get("content", "")
+    return require_valid_llm_output(result)
+
+
 def safe_llm_error_text(error, max_chars=240):
     """Return a one-line, bounded error detail with common credential forms redacted."""
     if error is None:
@@ -152,7 +173,7 @@ def collect_model_answers(model_ids, call_model):
     failures = []
     for model_id in model_ids:
         try:
-            answers[model_id] = require_valid_llm_output(call_model(model_id))
+            answers[model_id] = require_complete_llm_result(call_model(model_id))
         except LLMOutputError:
             failures.append(model_id)
     return answers, failures
@@ -199,6 +220,25 @@ def aigc_detection_error_result(locale="en"):
     }
 
 
+def parse_aigc_detection_response(response, locale="en"):
+    """Accept only a complete JSON verdict with an explicitly valid probability."""
+    if not isinstance(response, dict) or response.get("error_code") or response.get("finish_reason") != "stop":
+        return aigc_detection_error_result(locale)
+    parsed = parse_first_json_value(response.get("content", ""))
+    if not isinstance(parsed, dict):
+        return aigc_detection_error_result(locale)
+    probability = parsed.get("ai_probability")
+    if isinstance(probability, bool) or not isinstance(probability, (int, float)) or not 0 <= probability <= 100:
+        return aigc_detection_error_result(locale)
+    label = str(parsed.get("judgment", "Unknown" if locale != "zh" else "未知"))
+    reason = str(parsed.get("reasons", ""))[:300]
+    if str(locale).lower().startswith("zh"):
+        raw = f"LLM 判定：{label}（AI概率 {probability:.0f}%）。理由：{reason}"
+    else:
+        raw = f"LLM verdict: {label} (AI probability {probability:.0f}%). Reason: {reason}"
+    return {"score": round(float(probability), 2), "label": label, "raw": raw}
+
+
 def build_deep_review_report(block_results, locale="en"):
     """Compose reports only from successful blocks and report success/failure counts."""
     successful = [
@@ -240,6 +280,30 @@ def reference_ids_for_node(node, draft_reference_maps):
     return list(ids) if isinstance(ids, (list, tuple)) else []
 
 
+def chapters_citing_literature(tree, drafts, draft_reference_maps, literature_id):
+    """Find saved chapters whose local numeric citation map resolves to an ID."""
+    target = str(literature_id)
+    cited = []
+
+    def visit(nodes):
+        for node in nodes if isinstance(nodes, list) else []:
+            if not isinstance(node, dict):
+                continue
+            children = node.get("children", [])
+            if not children:
+                node_id = node.get("id")
+                body = (drafts or {}).get(node_id, (drafts or {}).get(str(node_id), ""))
+                local_ids = reference_ids_for_node(node, draft_reference_maps)
+                if isinstance(body, str) and body:
+                    numeric_refs = {int(value) for value in re.findall(r"\[(\d+)\]", body)}
+                    if any(1 <= number <= len(local_ids) and str(local_ids[number - 1]) == target for number in numeric_refs):
+                        cited.append(str(node.get("title") or node_id))
+            visit(children)
+
+    visit(tree)
+    return list(dict.fromkeys(cited))
+
+
 def collect_global_reference_registry(tree, drafts, draft_reference_maps, literatures):
     """Build one deduplicated export order from draft snapshots in tree order."""
     literature_by_id = {
@@ -257,7 +321,7 @@ def collect_global_reference_registry(tree, drafts, draft_reference_maps, litera
             node_id = node.get("id")
             draft_key = node_id if node_id in (drafts or {}) else str(node_id)
             body = (drafts or {}).get(draft_key, "")
-            if isinstance(body, str) and body.strip():
+            if isinstance(body, str) and body.strip() and not node.get("children"):
                 for reference_id in reference_ids_for_node(node, draft_reference_maps):
                     if reference_id in literature_by_id and reference_id not in seen:
                         seen.add(reference_id)

@@ -153,7 +153,7 @@ class StructuredMetadataRc3Tests(unittest.TestCase):
             "finish_reason": "length",
             "structured_mode": "native",
             "http_status": 200,
-            "error_code": None,
+            "error_code": "truncated_output",
         })
 
     def test_provider_exception_classifier_distinguishes_safe_categories(self):
@@ -193,9 +193,8 @@ class StructuredMetadataRc3Tests(unittest.TestCase):
                 code = compile(module, app_name, "exec")
                 namespace = {
                     "OpenAI": None,
-                    "create_completion_with_json_fallback": structured.create_completion_with_json_fallback,
+                    "call_structured_with_bounded_retry": structured.call_structured_with_bounded_retry,
                     "structured_request_options": structured.structured_request_options,
-                    "structured_response_result": structured.structured_response_result,
                     "structured_error_result": structured.structured_error_result,
                 }
                 calls = []
@@ -248,9 +247,8 @@ class StructuredMetadataRc3Tests(unittest.TestCase):
                 )
                 namespace = {
                     "OpenAI": None,
-                    "create_completion_with_json_fallback": structured.create_completion_with_json_fallback,
+                    "call_structured_with_bounded_retry": structured.call_structured_with_bounded_retry,
                     "structured_request_options": structured.structured_request_options,
-                    "structured_response_result": structured.structured_response_result,
                     "structured_error_result": structured.structured_error_result,
                 }
                 attempts = []
@@ -385,7 +383,7 @@ class LiteratureRobustnessRc3Tests(unittest.TestCase):
         self.assertEqual(len(chunk_budgets), 1)
         self.assertGreater(chunk_budgets[0], 1400)
 
-    def test_synthesis_length_retry_uses_the_same_fixed_budget(self):
+    def test_synthesis_length_retry_uses_larger_bounded_budget(self):
         calls = []
 
         def llm(prompt, **kwargs):
@@ -400,7 +398,7 @@ class LiteratureRobustnessRc3Tests(unittest.TestCase):
         result = analyze_literature_document("EXACT SOURCE QUOTE", "Study", llm, max_chars=500)
         budgets = [kwargs["max_tokens"] for prompt, kwargs in calls if "[DOCUMENT SYNTHESIS]" in prompt]
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(budgets, [2600, 2600])
+        self.assertEqual(budgets, [2600, 4000])
 
     def test_repeated_length_response_fails_as_truncated_output_with_safe_diagnostic(self):
         calls = []

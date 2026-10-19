@@ -92,6 +92,7 @@ def _response_content(llm_call, prompt, *, max_tokens=MEMORY_CHUNK_TOKEN_BUDGET,
                 max_tokens=max_tokens,
                 json_mode=True,
                 return_metadata=True,
+                transport_retry=False,
             )
         except Exception as exc:
             code = getattr(exc, "error_code", None)
@@ -102,6 +103,10 @@ def _response_content(llm_call, prompt, *, max_tokens=MEMORY_CHUNK_TOKEN_BUDGET,
         if not isinstance(result, dict):
             raise MemoryBuildError("The structured memory response was unavailable.")
         error_code = result.get("error_code")
+        if error_code == "truncated_output" or result.get("finish_reason") == "length":
+            return None, "length"
+        if error_code == "empty_content":
+            return None, "empty"
         if error_code:
             if error_code in _TRANSIENT_ERRORS and attempt + 1 < MAX_STRUCTURED_ATTEMPTS:
                 sleep(1 if attempt == 0 else 2)
@@ -195,6 +200,17 @@ def _split_source_segment(source, source_offset, part_number, total_parts, local
     if depth >= MAX_LENGTH_SPLITS or len(source) < 2:
         raise MemoryBuildError("The structured memory response remained truncated.")
     middle = len(source) // 2
+    sentence_candidates = [
+        match.end() for match in re.finditer(r"(?<=[.!?。！？])\s+", source)
+        if 0 < match.end() < len(source)
+    ]
+    if sentence_candidates:
+        middle = min(sentence_candidates, key=lambda value: abs(value - middle))
+    else:
+        lower, upper = max(1, int(len(source) * 0.25)), min(len(source) - 1, int(len(source) * 0.75))
+        candidates = [lower + match.end() for match in re.finditer(r"\n[ \t]*\n|\r?\n|\s+", source[lower:upper])]
+        if candidates:
+            middle = min(candidates, key=lambda value: abs(value - middle))
     return (
         _extract_source_segment(source[:middle], source_offset, part_number, total_parts, locale, llm_call, depth + 1)
         + _extract_source_segment(source[middle:], source_offset + middle, part_number, total_parts, locale, llm_call, depth + 1)
@@ -340,9 +356,40 @@ def refresh_chapter_memory_snapshot(data_dir, chapter_id, draft_text, llm_call, 
     state = read_chapter_memory(data_dir, chapter_id, draft_text)
     if state["status"] == "current":
         return {"updated": False, "reused": True, "memory": state}
+    previous_items = state.get("items", []) if state.get("status") == "stale" else []
     memory = build_chapter_memory_v2(draft_text, llm_call, locale=locale, max_chars=max_chars)
+    confirmed = set()
+    for item in previous_items:
+        if not isinstance(item, dict) or not item.get("confirmed_for_writing"):
+            continue
+        if item.get("verification_status") != "draft_provisional":
+            continue
+        identity = (item.get("memory_type"), item.get("statement"), item.get("source_quote"))
+        if all(isinstance(value, str) for value in identity) and identity[2].strip():
+            confirmed.add(identity)
+    for item in memory.get("items", []):
+        identity = (item.get("memory_type"), item.get("statement"), item.get("source_quote"))
+        start, end, quote = item.get("source_start"), item.get("source_end"), item.get("source_quote")
+        if (
+            identity in confirmed
+            and isinstance(start, int) and not isinstance(start, bool)
+            and isinstance(end, int) and not isinstance(end, bool)
+            and isinstance(quote, str) and draft_text[start:end] == quote
+        ):
+            item["confirmed_for_writing"] = True
     save_chapter_memory(data_dir, chapter_id, draft_text, memory)
     return {"updated": True, "reused": False, "memory": memory}
+
+
+def chapter_review_summary(data_dir, chapter_id, draft_text, max_chars=500, locale="en"):
+    """Use only a current Memory V2 summary; otherwise label a short body excerpt."""
+    if not isinstance(draft_text, str) or not draft_text.strip():
+        return ""
+    state = read_chapter_memory(data_dir, str(chapter_id), draft_text)
+    if state.get("status") == "current":
+        return balanced_excerpt(state.get("narrative_summary", ""), max_chars)
+    prefix = "[正文摘录；章节记忆缺失或已过期] " if locale == "zh" else "[Draft excerpt; chapter memory missing or stale] "
+    return prefix + balanced_excerpt(draft_text, max(0, int(max_chars) - len(prefix)))
 
 
 def _leaf_nodes(outline):

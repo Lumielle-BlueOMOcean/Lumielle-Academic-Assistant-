@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from structured_output_support import (
-    create_completion_with_json_fallback,
+    call_structured_with_bounded_retry,
     structured_error_result,
     structured_request_options,
     structured_response_result,
@@ -844,9 +844,7 @@ class OutlineSupportTests(unittest.TestCase):
             {"id": "same-id", "title": " Parent ", "word_count": "999", "references": ["fake"],
              "is_own_experiment": "false", "children": [
                  {"id": "same-id", "title": " Child A ", "word_count": "12"},
-                 {"id": "same-id", "title": "Child B", "word_count": -4, "children": "invalid"},
-                 None,
-                 {"title": "   ", "word_count": 90},
+                 {"id": "same-id", "title": "Child B", "word_count": -4, "children": []},
              ]},
             {"title": "Leaf", "word_count": "7", "children": None},
         ])
@@ -862,6 +860,15 @@ class OutlineSupportTests(unittest.TestCase):
         self.assertEqual(normalized[0]["image_suggestion"], "")
         self.assertEqual(normalized[0]["children"][1]["word_count"], 0)
         self.assertEqual(normalized[1]["word_count"], 7)
+
+    def test_normalization_rejects_malformed_nodes_instead_of_silently_dropping_them(self):
+        for malformed in (
+            [None, {"title": "Valid"}],
+            [{"title": "Valid", "children": [{"title": "   "}]}],
+            [{"title": "Valid", "children": "not-an-array"}],
+        ):
+            with self.subTest(malformed=malformed), self.assertRaises(self.support.OutlineParseError):
+                self.support.normalize_reverse_outline_tree(malformed)
 
     def test_docx_extraction_includes_table_paragraphs_in_document_order(self):
         from docx import Document
@@ -1480,7 +1487,7 @@ class AppStructuredRequestTests(unittest.TestCase):
     @staticmethod
     def _response(content='{"status":"ok"}'):
         return types.SimpleNamespace(
-            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=content))]
+            choices=[types.SimpleNamespace(finish_reason="stop", message=types.SimpleNamespace(content=content))]
         )
 
     def _load_call(self, app_name, client):
@@ -1488,10 +1495,9 @@ class AppStructuredRequestTests(unittest.TestCase):
         return load_app_function(self, app_name, "call_llm_api", {
             "OpenAI": self.openai_factory,
             "time": time,
-            "create_completion_with_json_fallback": create_completion_with_json_fallback,
+            "call_structured_with_bounded_retry": call_structured_with_bounded_retry,
             "structured_request_options": structured_request_options,
             "structured_error_result": structured_error_result,
-            "structured_response_result": structured_response_result,
         })
 
     def _client(self, create):

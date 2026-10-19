@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from urllib.parse import urlsplit
 
 
@@ -98,24 +99,46 @@ def structured_response_result(response, structured_mode="native") -> dict:
     safe_mode = structured_mode if isinstance(structured_mode, str) and structured_mode in {"native", "compatibility", "legacy"} else "unknown"
     choices = getattr(response, "choices", None)
     if not isinstance(choices, (list, tuple)) or not choices:
-        return {
+        result = {
             "content": "",
             "finish_reason": None,
             "structured_mode": safe_mode,
-            "http_status": _http_status(response) or 200,
             "error_code": "incomplete_response",
         }
+        status = _http_status(response)
+        if status is not None:
+            result["http_status"] = status
+        return result
     choice = choices[0]
     message = getattr(choice, "message", None)
     content = getattr(message, "content", None)
     finish_reason = getattr(choice, "finish_reason", None)
-    return {
+    result = {
         "content": content if isinstance(content, str) else "",
         "finish_reason": _safe_finish_reason(finish_reason),
         "structured_mode": safe_mode,
-        "http_status": _http_status(response) or 200,
         "error_code": None,
     }
+    status = _http_status(response)
+    if status is not None:
+        result["http_status"] = status
+    usage = getattr(response, "usage", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if isinstance(completion_tokens, int) and not isinstance(completion_tokens, bool):
+        result["completion_tokens"] = completion_tokens
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning_tokens = getattr(details, "reasoning_tokens", None)
+    if isinstance(reasoning_tokens, int) and not isinstance(reasoning_tokens, bool):
+        result["reasoning_tokens"] = reasoning_tokens
+    if result["finish_reason"] == "length":
+        result["error_code"] = "truncated_output"
+    elif result["finish_reason"] == "content_filter":
+        result["error_code"] = "content_filtered"
+    elif result["finish_reason"] in {"aborted", "insufficient_system_resource", "unknown", None}:
+        result["error_code"] = "incomplete_response"
+    elif not result["content"].strip():
+        result["error_code"] = "empty_content"
+    return result
 
 
 def structured_error_result(exc: BaseException, structured_mode="native", *, error_code=None) -> dict:
@@ -125,15 +148,62 @@ def structured_error_result(exc: BaseException, structured_mode="native", *, err
         "authentication_failed", "insufficient_balance", "model_not_available",
         "rate_limited", "timeout", "connection_error", "server_error",
         "invalid_request", "provider_error", "incomplete_response",
+        "truncated_output", "content_filtered", "empty_content",
     }
     safe_error = error_code if isinstance(error_code, str) and error_code in safe_codes else classify_provider_exception(exc)
-    return {
+    result = {
         "content": "",
         "finish_reason": None,
         "structured_mode": safe_mode,
-        "http_status": _http_status(exc),
         "error_code": safe_error,
     }
+    status = _http_status(exc)
+    if status is not None:
+        result["http_status"] = status
+    return result
+
+
+def call_structured_with_bounded_retry(create_completion, request_args, *, max_attempts=3, sleep=None):
+    """Retry only transient structured-call failures; preserve safe metadata."""
+    sleep = sleep or time.sleep
+    try:
+        attempts = max(1, min(3, int(max_attempts)))
+    except (TypeError, ValueError, OverflowError):
+        attempts = 3
+    transient_codes = {"rate_limited", "timeout", "connection_error", "server_error"}
+    transient_finishes = {"aborted", "insufficient_system_resource"}
+    compatibility_args = None
+
+    for attempt in range(attempts):
+        mode_state = {"mode": "native"}
+        try:
+            if compatibility_args is None:
+                response, mode = create_completion_with_json_fallback(
+                    create_completion,
+                    request_args,
+                    mode_callback=lambda value: mode_state.update(mode=value),
+                )
+                if mode == "compatibility":
+                    compatibility_args = dict(request_args)
+                    compatibility_args.pop("response_format", None)
+            else:
+                response = create_completion(**compatibility_args)
+                mode = "compatibility"
+                mode_state["mode"] = mode
+            result = structured_response_result(response, mode)
+        except Exception as exc:
+            if mode_state["mode"] == "compatibility" and compatibility_args is None:
+                compatibility_args = dict(request_args)
+                compatibility_args.pop("response_format", None)
+            result = structured_error_result(exc, mode_state["mode"])
+
+        transient = result.get("error_code") in transient_codes or result.get("finish_reason") in transient_finishes
+        if transient and attempt + 1 < attempts:
+            sleep(1 if attempt == 0 else 2)
+            continue
+        return result
+
+    return structured_error_result(RuntimeError("structured call exhausted"))
 
 
 def plain_text_error_result(exc: BaseException, *, error_code=None) -> dict:

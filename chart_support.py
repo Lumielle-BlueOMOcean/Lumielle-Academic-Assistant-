@@ -7,7 +7,7 @@ import os
 import re
 import struct
 
-from writing_support import LLMOutputError, require_valid_llm_output
+from writing_support import LLMOutputError, require_complete_llm_result
 
 
 ALLOWED_CHART_TYPES = frozenset({"bar", "line", "scatter", "pie"})
@@ -558,15 +558,17 @@ def generate_chart_image(instruction, output_path, llm_call, *, locale="en", max
         else:
             system_prompt = "Return only valid JSON chart data. Never generate or execute code."
         try:
-            response = require_valid_llm_output(llm_call(
+            response = require_complete_llm_result(llm_call(
                 prompt,
                 system_prompt=system_prompt,
                 max_tokens=6000,
                 temp=0.3 if previous_error else 0.7,
                 json_mode=True,
+                return_metadata=True,
             ))
         except LLMOutputError as exc:
-            return {"status": "error", "message": chart_result_message("error", locale), "debug": str(exc)}
+            code = getattr(exc, "error_code", None)
+            return {"status": "error", "message": chart_result_message("error", locale), "failure_code": code}
         except Exception as exc:
             return {"status": "error", "message": chart_result_message("error", locale), "debug": type(exc).__name__}
 

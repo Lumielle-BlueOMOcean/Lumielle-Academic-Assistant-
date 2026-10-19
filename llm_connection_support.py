@@ -65,6 +65,9 @@ def _safe_message(code: str) -> str:
         "connection_error": "Could not reach the provider. Check the network and Base URL.",
         "provider_error": "The provider could not complete this request. Check the Base URL and provider service status.",
         "invalid_structured_output": "The model did not return the required JSON connection response. Check model compatibility and try again.",
+        "truncated_output": "The model response reached its length limit before the connection check completed.",
+        "content_filtered": "The provider filtered the connection check response.",
+        "incomplete_response": "The provider response did not complete.",
         "unknown_error": "The connection test could not be completed.",
     }.get(code, "The connection test could not be completed.")
 
@@ -181,6 +184,11 @@ def test_model_connection(
         response, structured_mode = create_completion_with_json_fallback(
             client.chat.completions.create, request_args
         )
+        choices = getattr(response, "choices", None)
+        finish_reason = getattr(choices[0], "finish_reason", None) if isinstance(choices, (list, tuple)) and choices else None
+        if finish_reason != "stop":
+            code = "truncated_output" if finish_reason == "length" else "content_filtered" if finish_reason == "content_filter" else "incomplete_response"
+            return _failure(code, normalized_model)
         content = _completion_content(response)
         parsed = parse_first_json_value(content)
         if not isinstance(parsed, dict) or str(parsed.get("status", "")).strip().casefold() != "ok":

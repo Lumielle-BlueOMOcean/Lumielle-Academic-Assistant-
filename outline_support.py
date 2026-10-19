@@ -6,7 +6,8 @@ import tempfile
 import uuid
 
 from document_support import DEFAULT_CHUNK_CHARS, chunk_document_text
-from writing_support import LLMOutputError, require_valid_llm_output
+from structured_output_support import classify_provider_exception
+from writing_support import LLMOutputError, require_complete_llm_result
 
 
 MAX_CONSOLIDATION_PROMPT_CHARS = 24000
@@ -15,8 +16,102 @@ MAX_MERGE_OUTPUT_TOKENS = 6000
 MAX_TREE_DEPTH = 3
 
 
+def _request_complete_json(llm_call, prompt, locale, max_tokens):
+    """Request a complete JSON-mode response and reject any non-stop completion."""
+    try:
+        result = llm_call(
+            prompt,
+            system_prompt="You are a rigorous outline-structure extractor. Output JSON only." if locale != "zh" else "你是严谨的大纲结构提取器，只输出 JSON。",
+            max_tokens=max_tokens,
+            temp=0.2,
+            json_mode=True,
+            return_metadata=True,
+        )
+    except Exception as exc:
+        # Legacy callback adapters sometimes raise a bare LLMOutputError. Keep
+        # its unclassified state so the existing single correction attempt can
+        # run; production provider results carry an explicit safe error code.
+        code = getattr(exc, "error_code", None)
+        if code is None and not isinstance(exc, LLMOutputError):
+            code = classify_provider_exception(exc)
+        raise LLMOutputError("The outline provider request failed.", error_code=code) from None
+    return require_complete_llm_result(result)
+
+
 class OutlineParseError(ValueError):
     """Raised when a model response is not a usable outline JSON array."""
+
+
+def validate_forward_outline_tree(tree, literature_count):
+    """Validate model IDs, hierarchy, word counts, and catalog-only reference indexes."""
+    if not isinstance(tree, list) or not tree:
+        return "empty_outline"
+    seen_ids = set()
+
+    def visit(nodes, depth):
+        if not isinstance(nodes, list):
+            return "invalid_children"
+        for node in nodes:
+            if not isinstance(node, dict):
+                return "invalid_node"
+            node_id = node.get("id")
+            title = node.get("title")
+            if not isinstance(node_id, str) or not node_id.strip() or node_id in seen_ids:
+                return "invalid_or_duplicate_id"
+            if not isinstance(title, str) or not title.strip():
+                return "missing_title"
+            if depth > MAX_TREE_DEPTH:
+                return "outline_too_deep"
+            seen_ids.add(node_id)
+            count = node.get("word_count", 0)
+            if isinstance(count, bool):
+                return "invalid_word_count"
+            try:
+                if int(str(count).replace(",", "").replace("字", "").strip()) < 0:
+                    return "invalid_word_count"
+            except (TypeError, ValueError, OverflowError):
+                return "invalid_word_count"
+            refs = node.get("references", [])
+            if not isinstance(refs, list):
+                return "invalid_references"
+            for reference in refs:
+                if isinstance(reference, bool):
+                    return "invalid_references"
+                try:
+                    index = int(reference)
+                except (TypeError, ValueError, OverflowError):
+                    return "invalid_references"
+                if str(reference).strip() != str(index) or not 1 <= index <= literature_count:
+                    return "invalid_references"
+            children = node.get("children", [])
+            if not isinstance(children, list):
+                return "invalid_children"
+            child_error = visit(children, depth + 1) if children else None
+            if child_error:
+                return child_error
+        return None
+
+    return visit(tree, 1)
+
+
+def forward_outline_preserves_draft_ids(tree, drafts):
+    """Require every saved draft owner to remain an editable leaf on replacement."""
+    leaf_ids = set()
+    def visit(nodes):
+        for node in nodes if isinstance(nodes, list) else []:
+            if not isinstance(node, dict):
+                continue
+            children = node.get("children", [])
+            if isinstance(children, list) and children:
+                visit(children)
+            elif node.get("id") is not None:
+                leaf_ids.add(str(node["id"]))
+    visit(tree)
+    return all(
+        str(node_id) in leaf_ids
+        for node_id, body in (drafts or {}).items()
+        if isinstance(body, str) and body.strip()
+    )
 
 
 def extract_docx_manuscript_text(document):
@@ -85,13 +180,21 @@ def _contains_titled_node(nodes):
 
 
 def _validate_tree_depth(nodes, depth=1):
+    if not isinstance(nodes, list):
+        raise OutlineParseError("Outline children must be an array.")
     for node in nodes:
-        if not isinstance(node, dict) or not _title_of(node):
-            continue
+        if not isinstance(node, dict):
+            raise OutlineParseError("Every outline node must be an object.")
+        if not _title_of(node):
+            raise OutlineParseError("Every outline node must have a non-empty title.")
         if depth > MAX_TREE_DEPTH:
             raise OutlineParseError("The outline exceeds the supported hierarchy depth.")
-        children = node.get("children")
-        if isinstance(children, list):
+        children = node.get("children", [])
+        if children is None:
+            children = []
+        if not isinstance(children, list):
+            raise OutlineParseError("Outline children must be an array.")
+        if children:
             _validate_tree_depth(children, depth + 1)
 
 
@@ -132,11 +235,7 @@ def normalize_reverse_outline_tree(raw_tree):
     def normalize_nodes(nodes, depth):
         normalized = []
         for raw_node in nodes:
-            if not isinstance(raw_node, dict):
-                continue
             title = _title_of(raw_node)
-            if not title:
-                continue
             if depth > MAX_TREE_DEPTH:
                 raise OutlineParseError("The outline exceeds the supported hierarchy depth.")
             raw_children = raw_node.get("children")
@@ -254,16 +353,13 @@ def _call_for_fragments(prompt_factory, llm_call, locale, max_tokens):
     error_type = "parse"
     for attempt in range(2):
         try:
-            response = require_valid_llm_output(llm_call(
-                prompt_factory(attempt == 1),
-                system_prompt="You are a rigorous outline-structure extractor. Output JSON only." if locale != "zh" else "你是严谨的大纲结构提取器，只输出 JSON。",
-                max_tokens=max_tokens,
-                temp=0.3 if attempt else 0.2,
-            ))
+            response = _request_complete_json(llm_call, prompt_factory(attempt == 1), locale, max_tokens)
             return extract_outline_array(response), None
         except LLMOutputError as exc:
             last_error = exc
             error_type = "llm"
+            if getattr(exc, "error_code", None) not in {None, "empty_content", "invalid_structured_output"}:
+                break
         except (OutlineParseError, TypeError, ValueError) as exc:
             last_error = exc
             error_type = "parse"
@@ -275,17 +371,14 @@ def _call_for_final_tree(prompt_factory, llm_call, locale, max_tokens):
     error_type = "parse"
     for attempt in range(2):
         try:
-            response = require_valid_llm_output(llm_call(
-                prompt_factory(attempt == 1),
-                system_prompt="You are a rigorous academic outline consolidator. Output JSON only." if locale != "zh" else "你是严谨的学术大纲整合器，只输出 JSON。",
-                max_tokens=max_tokens,
-                temp=0.3 if attempt else 0.2,
-            ))
+            response = _request_complete_json(llm_call, prompt_factory(attempt == 1), locale, max_tokens)
             tree = normalize_reverse_outline_tree(extract_outline_array(response))
             return tree, None
         except LLMOutputError as exc:
             last_error = exc
             error_type = "llm"
+            if getattr(exc, "error_code", None) not in {None, "empty_content", "invalid_structured_output"}:
+                break
         except (OutlineParseError, TypeError, ValueError) as exc:
             last_error = exc
             error_type = "parse"
@@ -319,19 +412,22 @@ def _pack_ordered_fragments(fragments, locale, round_number, max_prompt_chars):
     return groups
 
 
-def _error_result(locale, error_type, chunks_total, stage):
+def _error_result(locale, error_type, chunks_total, stage, error_code=None):
     message = (
         "文稿未能完整完成逆向解析，因此已保留原有逻辑大纲。"
         if locale == "zh"
         else "The manuscript could not be reverse-engineered completely, so the existing logic outline was kept."
     )
-    return {
+    result = {
         "status": "error",
         "error_type": error_type,
         "stage": stage,
         "chunks_total": chunks_total,
         "message": message,
     }
+    if isinstance(error_code, str):
+        result["error_code"] = error_code
+    return result
 
 
 def reverse_engineer_manuscript(
@@ -356,7 +452,7 @@ def reverse_engineer_manuscript(
             MAX_MERGE_OUTPUT_TOKENS,
         )
         if error:
-            return _error_result(locale, error["error_type"], 1, "final_outline")
+            return _error_result(locale, error["error_type"], 1, "final_outline", getattr(error.get("error"), "error_code", None))
         return {"status": "ok", "tree": parsed_tree, "chunks_total": 1, "stage1_calls": 0, "merge_rounds": 0}
 
     fragments = []
@@ -370,7 +466,7 @@ def reverse_engineer_manuscript(
             MAX_SOURCE_OUTPUT_TOKENS,
         )
         if error:
-            return _error_result(locale, error["error_type"], len(chunks), f"source_part_{part_number}")
+            return _error_result(locale, error["error_type"], len(chunks), f"source_part_{part_number}", getattr(error.get("error"), "error_code", None))
         fragments.append({"start": part_number, "end": part_number, "nodes": parsed})
 
     round_number = 0
@@ -401,7 +497,7 @@ def reverse_engineer_manuscript(
                     MAX_MERGE_OUTPUT_TOKENS,
                 )
                 if error:
-                    return _error_result(locale, error["error_type"], len(chunks), "consolidation")
+                    return _error_result(locale, error["error_type"], len(chunks), "consolidation", getattr(error.get("error"), "error_code", None))
                 return {
                     "status": "ok", "tree": merged, "chunks_total": len(chunks),
                     "stage1_calls": len(chunks), "merge_rounds": round_number,
@@ -413,7 +509,7 @@ def reverse_engineer_manuscript(
                 MAX_MERGE_OUTPUT_TOKENS,
             )
             if error:
-                return _error_result(locale, error["error_type"], len(chunks), "consolidation")
+                return _error_result(locale, error["error_type"], len(chunks), "consolidation", getattr(error.get("error"), "error_code", None))
             next_fragments.append({"start": source_start, "end": source_end, "nodes": merged})
         fragments = next_fragments
 

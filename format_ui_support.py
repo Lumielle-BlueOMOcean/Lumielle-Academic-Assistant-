@@ -13,7 +13,7 @@ from format_support import (
     parse_format_spec,
     save_user_preset,
 )
-from writing_support import LLMOutputError, require_valid_llm_output
+from writing_support import LLMOutputError, require_complete_llm_result
 
 
 _LABELS = {
@@ -64,6 +64,28 @@ def _generation_prompt(instructions, locale):
         'Generate a FormatSpec JSON from the user\'s requirements. page_number.start is an integer from 1 to 32767; headings.mode is "controlled" or "legacy"; each heading supports keep_with_next and page_break_before; table.style is "grid" or "three_line"; figure.width_percent is an integer from 10 to 100; figure.caption_mode is "numbered" or "legacy". Return only JSON using the supplied schema; do not add code, paths, or unsupported fields.'
     )
     return f"{task}\nSchema example:\n{json.dumps(schema, ensure_ascii=False)}\nUser requirements:\n{instructions}"
+
+
+def generate_format_spec_from_instructions(instructions, llm_call, locale):
+    """Request and validate a FormatSpec, with one correction for schema output only."""
+    correction = (
+        "上次 JSON 未通过 FormatSpec 校验。请根据同一要求修正，只返回完整、符合示例 schema 的 JSON。\n"
+        if locale == "zh" else
+        "The previous JSON did not pass FormatSpec validation. Correct it against the same requirements and return one complete JSON object only.\n"
+    )
+    last_error = None
+    for attempt in range(2):
+        prompt = _generation_prompt(instructions, locale)
+        if attempt:
+            prompt += "\n" + correction
+        response = require_complete_llm_result(llm_call(
+            prompt, max_tokens=1800, json_mode=True, return_metadata=True,
+        ))
+        try:
+            return parse_format_spec(response)
+        except FormatSpecError as exc:
+            last_error = exc
+    raise last_error or FormatSpecError("FormatSpec validation failed.")
 
 
 def render_format_spec_controls(st, *, locale, preset_directory, custom_store_path, llm_call, saved_format_prompt=""):
@@ -125,8 +147,7 @@ def render_format_spec_controls(st, *, locale, preset_directory, custom_store_pa
         instructions = st.text_area(labels["natural_input"], value=saved_format_prompt, height=120, key=f"format_natural_prompt_{locale}")
         if st.button(labels["generate"], key=f"format_natural_generate_{locale}"):
             try:
-                response = require_valid_llm_output(llm_call(_generation_prompt(instructions, locale), max_tokens=1800, json_mode=True))
-                pending = parse_format_spec(response)
+                pending = generate_format_spec_from_instructions(instructions, llm_call, locale)
                 st.session_state[f"format_pending_{locale}"] = pending
                 st.success(labels["generated"])
             except (LLMOutputError, FormatSpecError, TypeError, ValueError) as exc:

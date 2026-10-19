@@ -18,11 +18,10 @@ import streamlit as st
 from version import __version__
 import llm_connection_support
 from structured_output_support import (
-    create_completion_with_json_fallback,
+    call_structured_with_bounded_retry,
     parse_first_json_value,
     structured_error_result,
     structured_request_options,
-    structured_response_result,
     plain_text_error_result,
     plain_text_response_result,
 )
@@ -31,6 +30,7 @@ from chapter_memory_support import (
     ContextBudgetError,
     DEFAULT_PROMPT_TOKEN_BUDGET,
     build_context_sandwich_v2,
+    chapter_review_summary,
     fit_context_sandwich_to_prompt,
     save_draft_and_maybe_refresh_memory,
     save_manifest_for_prompt,
@@ -81,8 +81,10 @@ from literature_ui_support import (
 from format_ui_support import render_format_spec_controls
 from outline_support import (
     extract_docx_manuscript_text,
+    forward_outline_preserves_draft_ids,
     persist_reverse_outline_result,
     reverse_engineer_manuscript,
+    validate_forward_outline_tree,
 )
 from chart_support import chart_result_message, generate_chart_image
 from writing_support import (
@@ -93,15 +95,19 @@ from writing_support import (
     checked_llm_call,
     collect_model_answers,
     collect_global_reference_registry,
+    chapters_citing_literature,
     count_chinese_chars,
     context_budget_error_message,
     llm_error_message,
     parse_literature_analysis,
+    parse_aigc_detection_response,
     record_generated_draft,
     reference_ids_for_node,
     remap_local_citations,
     require_valid_llm_output,
+    require_complete_llm_result,
 )
+from json_storage_support import atomic_write_json
 import json
 import os
 import time
@@ -181,8 +187,8 @@ def load_json_file(filename, default_val):
         except Exception:
             UNREADABLE_JSON_FILES.add(filename)
             return default_val
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(default_val, f, ensure_ascii=False, indent=2)
+    if not atomic_write_json(path, default_val):
+        raise OSError(f"无法安全初始化 {filename}")
     return default_val
 
 def save_json_file(filename, data):
@@ -192,9 +198,7 @@ def save_json_file(filename, data):
         return False
     path = os.path.join(DATA_DIR, filename)
     try:
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return True
+        return atomic_write_json(path, data)
     except Exception as e:
         st.error(f"写入异常 ({filename}): {e}")
         return False
@@ -272,24 +276,10 @@ def llm_detect_aigc(text: str, profile_id=None) -> dict:
     else:
         prompt = detect_prompt + "\n\n待检测文本：\n" + text
     try:
-        res = dispatch_llm_call(prompt, system_prompt="你是严格的AIGC文本检测专家，只输出JSON。", max_tokens=400, temp=0.2, profile_id=profile_id)
+        res = dispatch_llm_call(prompt, system_prompt="你是严格的AIGC文本检测专家，只输出JSON。", max_tokens=400, temp=0.2, profile_id=profile_id, json_mode=True, return_metadata=True)
     except LLMOutputError:
         return aigc_detection_error_result("zh")
-    try:
-        parsed = re.search(r'(\{.*\})', res, re.DOTALL)
-        if parsed:
-            data = json.loads(parsed.group(1))
-            prob = float(data.get("ai_probability", 50))
-            judgment = str(data.get("judgment", "未知"))
-            reasons = str(data.get("reasons", ""))
-            return {
-                "score": round(min(max(prob, 0), 100), 2),
-                "label": judgment,
-                "raw": f"LLM 判定：{judgment}（AI概率 {prob:.0f}%）。理由：{reasons}"
-            }
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return aigc_detection_error_result("zh")
-    return aigc_detection_error_result("zh")
+    return parse_aigc_detection_response(res, "zh")
 
 
 def get_detect_engine():
@@ -329,7 +319,7 @@ def detect_aigc(text: str) -> dict:
 # ============================================================
 # 3. LLM 核心调用层（多配置支持）
 # ============================================================
-def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_name, temp=0.7, json_mode=False, return_metadata=False):
+def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_name, temp=0.7, json_mode=False, return_metadata=False, transport_retry=True):
     """底层 API 调用；结构化请求只在明确不支持 JSON 参数时兼容降级。"""
     if not api_key:
         if json_mode and return_metadata:
@@ -349,39 +339,34 @@ def call_llm_api(prompt, system_prompt, max_tokens, api_key, base_url, model_nam
             req_params["max_tokens"] = max_tokens
         if json_mode:
             req_params.update(structured_request_options(base_url))
-            mode_state = {"mode": "native"}
-            try:
-                res, structured_mode = create_completion_with_json_fallback(
-                    client.chat.completions.create, req_params,
-                    mode_callback=lambda mode: mode_state.update(mode=mode),
-                )
-                result = structured_response_result(res, structured_mode)
-                if return_metadata:
-                    return result
-                content = result["content"]
-                return content if isinstance(content, str) and content.strip() else ""
-            except Exception as exc:
-                if return_metadata:
-                    return structured_error_result(exc, mode_state["mode"])
-                return "API 连续调用失败: 结构化请求失败"
+            result = call_structured_with_bounded_retry(
+                client.chat.completions.create,
+                req_params,
+                max_attempts=3 if transport_retry else 1,
+            )
+            if return_metadata:
+                return result
+            content = result.get("content", "")
+            return content if not result.get("error_code") and isinstance(content, str) and content.strip() else ""
 
         if return_metadata:
             transient_errors = {"rate_limited", "timeout", "connection_error", "server_error"}
             transient_finishes = {"aborted", "insufficient_system_resource"}
-            for attempt in range(3):
+            attempts = 3 if transport_retry else 1
+            for attempt in range(attempts):
                 try:
                     response = client.chat.completions.create(**req_params)
                     result = plain_text_response_result(response)
-                    if result.get("error_code") == "empty_content" and attempt < 2:
+                    if result.get("error_code") == "empty_content" and attempt + 1 < attempts:
                         time.sleep(1 if attempt == 0 else 2)
                         continue
-                    if result.get("finish_reason") in transient_finishes and attempt < 2:
+                    if result.get("finish_reason") in transient_finishes and attempt + 1 < attempts:
                         time.sleep(1 if attempt == 0 else 2)
                         continue
                     return result
                 except Exception as exc:
                     result = plain_text_error_result(exc)
-                    if result.get("error_code") in transient_errors and attempt < 2:
+                    if result.get("error_code") in transient_errors and attempt + 1 < attempts:
                         time.sleep(1 if attempt == 0 else 2)
                         continue
                     return result
@@ -428,7 +413,7 @@ def get_active_profile():
             return p
     return profiles[0] if profiles else None
 
-def dispatch_llm_call(prompt, system_prompt=None, max_tokens=None, temp=0.7, profile_id=None, json_mode=False, return_metadata=False):
+def dispatch_llm_call(prompt, system_prompt=None, max_tokens=None, temp=0.7, profile_id=None, json_mode=False, return_metadata=False, transport_retry=True):
     """路由分发器。指定 profile_id 可调特定模型；否则使用当前激活配置。"""
     profiles = get_all_profiles()
     if not profiles:
@@ -449,6 +434,7 @@ def dispatch_llm_call(prompt, system_prompt=None, max_tokens=None, temp=0.7, pro
         model_name=prof.get("model", ""),
         temp=temp,
         json_mode=json_mode,
+        transport_retry=transport_retry,
     )
     if return_metadata:
         return call_llm_api(**call_arguments, return_metadata=True)
@@ -981,7 +967,8 @@ def multi_model_discussion_tab():
                         question,
                         system_prompt="你是资深学术专家。请独立、严谨、结构化地回答以下问题，不要提及自己是 AI。",
                         max_tokens=2000,
-                        profile_id=pid
+                        profile_id=pid,
+                        return_metadata=True,
                     )
                 finally:
                     progress["count"] += 1
@@ -1019,12 +1006,16 @@ def multi_model_discussion_tab():
                     final = dispatch_llm_call(
                         summary_prompt,
                         system_prompt="你是严谨的学术仲裁者，擅长整合多方观点形成共识结论。",
-                        max_tokens=2500
+                        max_tokens=2500,
+                        return_metadata=True,
                     )
             except LLMOutputError:
                 st.error(llm_error_message("zh"))
             else:
-                st.session_state["discussion_final"] = final
+                try:
+                    st.session_state["discussion_final"] = require_complete_llm_result(final)
+                except LLMOutputError as exc:
+                    st.error(llm_error_message("zh", exc))
 
         if "discussion_final" in st.session_state:
             st.markdown("### 🏛️ 最终共识")
@@ -1068,7 +1059,7 @@ def ast_reverse_tab():
             "文稿未能完整完成逆向解析，因此已保留原有逻辑大纲。",
         )
         if result.get("error_type") == "llm":
-            error_message += " " + llm_error_message("zh")
+            error_message += " " + llm_error_message("zh", {"error_code": result.get("error_code")})
         st.error(error_message)
     except Exception:
         st.error("文稿无法处理，原有逻辑大纲已保留。")
@@ -1182,7 +1173,7 @@ def _extract_json_array(res):
 
 
 def _log_parse_failure(doc_text, res):
-    """把解析失败的原始返回记录到日志，便于定位"""
+    """只记录长度元数据，不持久化文档原文或模型返回内容。"""
     try:
         log_path = os.path.join(DATA_DIR, "parse_fail_log.json")
         log = load_json_file("parse_fail_log.json", {"entries": []})
@@ -1191,7 +1182,6 @@ def _log_parse_failure(doc_text, res):
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "doc_len": len(doc_text or ""),
             "llm_res_len": len(res or ""),
-            "llm_res_head": (res or "")[:800]
         })
         # 只保留最近 20 条
         log["entries"] = entries[-20:]
@@ -1485,6 +1475,15 @@ def module3_literature():
                         st.rerun()
                 with c_del:
                     if st.button("🗑️", key=f"litdel_{lit['id']}"):
+                        citing_chapters = chapters_citing_literature(
+                            load_json_file("logic_tree.json", []),
+                            load_json_file("drafts.json", {}),
+                            load_json_file("draft_reference_maps.json", {}),
+                            lit.get("id", ""),
+                        )
+                        if citing_chapters:
+                            st.error("该文献已被已保存章节引用。请先更正相关引用后再删除：" + "、".join(citing_chapters))
+                            continue
                         # 同时删除原文件副本
                         fp = lit.get("file_path", "")
                         if fp and os.path.exists(fp):
@@ -1740,17 +1739,38 @@ def module4_logic():
         outline = None
         last_res = ""
         llm_failed = False
+        format_retry_used = False
         for attempt in range(3):
             with st.spinner(f"AI 正在深度规划逻辑大纲...（第{attempt+1}次尝试）"):
                 try:
-                    res = dispatch_llm_call(prompt, system_prompt="你是一位拥有十年经验的期刊主编，只输出合法 JSON。", max_tokens=16000, json_mode=True)
-                except LLMOutputError:
-                    st.error(llm_error_message("zh"))
+                    response = dispatch_llm_call(prompt, system_prompt="你是一位拥有十年经验的期刊主编，只输出合法 JSON。", max_tokens=16000, json_mode=True, return_metadata=True)
+                except LLMOutputError as exc:
+                    st.error(llm_error_message("zh", exc))
                     llm_failed = True
                     break
+                if isinstance(response, dict):
+                    if response.get("error_code") or response.get("finish_reason") != "stop":
+                        failure = LLMOutputError("大纲响应未完整结束。", error_code=response.get("error_code") or ("truncated_output" if response.get("finish_reason") == "length" else "incomplete_response"))
+                        st.error("大纲响应未完整结束，已保留原有大纲。" + llm_error_message("zh", failure))
+                        llm_failed = True
+                        break
+                    res = response.get("content", "")
+                else:
+                    res = response
                 last_res = res
                 tree = extract_first_nonempty_json_array(res)
                 if tree is None:
+                    if format_retry_used:
+                        break
+                    format_retry_used = True
+                    prompt += "\n上一次响应不是完整的非空大纲 JSON 数组。请只修正 JSON 结构，并保留要求的章节内容。"
+                    continue
+                contract_error = validate_forward_outline_tree(tree, len(literatures))
+                if contract_error:
+                    if format_retry_used:
+                        break
+                    format_retry_used = True
+                    prompt += "\n上一次响应未通过大纲结构校验（" + contract_error + "）。请修正唯一 ID、children、字数和文献索引，并仅输出 JSON。"
                     continue
                 # 顶层过滤 + 引用解析 + 字段规范化
                 tree = [t for t in tree if isinstance(t, dict)]
@@ -1817,10 +1837,14 @@ def module4_logic():
                     outline = tree
                     break
                 # 字数不达标：记录并重试
+                prompt += f"\n上次有效大纲的叶子节点合计为 {total} 字，目标为 {target_wc} 字。请调整叶子节点字数分配，使其至少达到 {int(max(target_wc * 0.7, 1000))}，保留已校验的结构，并返回完整 JSON 数组。"
         if outline is not None:
-            save_json_file("logic_tree.json", outline)
-            st.success(f"逻辑大纲生成成功！共 {len(outline)} 个顶层章节，叶子节点规划总字数约 {sum_leaf_wc(outline)} 字。")
-            st.rerun()
+            existing_drafts = load_json_file("drafts.json", {})
+            if not forward_outline_preserves_draft_ids(outline, existing_drafts):
+                st.error("新大纲会使已有正文脱离可编辑的叶子章节；原有大纲和正文已保留。")
+            elif save_json_file("logic_tree.json", outline):
+                st.success(f"逻辑大纲生成成功！共 {len(outline)} 个顶层章节，叶子节点规划总字数约 {sum_leaf_wc(outline)} 字。")
+                st.rerun()
         elif not llm_failed:
             res = last_res
             if res:
@@ -1829,8 +1853,7 @@ def module4_logic():
                     st.error("未能解析出 JSON 大纲：当前模型返回的是 YAML 文本草稿而非 JSON（推理型模型特性）。建议在板块一切换为模型列表中支持 Chat Completions 的常规对话模型后重试。")
                 elif "未能从模型输出中解析" not in res:
                     st.error("生成的逻辑大纲字数远低于预期目标，多次尝试后仍未达标。可稍后重试，或检查板块一的目标字数设置。")
-                with st.expander("查看 LLM 原始返回（调试用）", expanded=False):
-                    st.code(res[:3000])
+                st.caption("模型输出未通过完整 JSON 和树结构校验，原有大纲保持不变。")
 
     st.markdown("---")
 
@@ -1968,11 +1991,11 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
     )
     consistency = review_chapter_candidate(
         last_res,
-        sandwich,
-        len(sandwich.get("current_refs", []) or []),
+        fitted_sandwich,
+        len(fitted_sandwich.get("current_refs", []) or []),
         consistency_call,
         locale="zh",
-        confirmed_items=sandwich.get("confirmed_memory_items", []),
+        confirmed_items=fitted_sandwich.get("confirmed_memory_items", []),
     )
     return last_res, wc_info, consistency
 
@@ -1981,6 +2004,7 @@ def persist_generated_candidate(chapter_id, candidate, locale):
     """Save a reviewed candidate first, then refresh its derived memory snapshot."""
     drafts = load_json_file("drafts.json", {})
     reference_maps = load_json_file("draft_reference_maps.json", {})
+    previous_reference_maps = dict(reference_maps) if isinstance(reference_maps, dict) else {}
     text = candidate.get("text", "")
     record_generated_draft(
         drafts,
@@ -1989,9 +2013,15 @@ def persist_generated_candidate(chapter_id, candidate, locale):
         text,
         candidate.get("reference_ids", []),
     )
+    if not save_json_file("draft_reference_maps.json", reference_maps):
+        return {"saved": False, "memory_error": None, "reference_map_saved": False}
     result = persist_draft_text(chapter_id, text, locale, refresh_memory=True, drafts=drafts)
-    if result["saved"]:
-        result["reference_map_saved"] = save_json_file("draft_reference_maps.json", reference_maps)
+    if not result["saved"]:
+        result["reference_map_rollback"] = save_json_file("draft_reference_maps.json", previous_reference_maps)
+    else:
+        result["reference_map_saved"] = True
+        version_key = f"content_ver_{chapter_id}"
+        st.session_state[version_key] = int(st.session_state.get(version_key, 0) or 0) + 1
     return result
 
 
@@ -2155,7 +2185,6 @@ def render_single_chapter_editor(tree):
                                     elif result.get("memory_updated"):
                                         notices.append(("success", "本章记忆已更新。"))
                                     st.session_state[f"writing_notice_{sel_id}"] = notices
-                                    st.session_state[f"content_ver_{sel_id}"] = content_ver + 1
                                     st.rerun()
                             else:
                                 pending = st.session_state.setdefault("pending_chapter_candidates", {})
@@ -2610,12 +2639,12 @@ def _light_llm_scan(tree, drafts, prompts):
     """浅度审查-轻量 LLM 扫描：喂大纲+章节摘要，限制输出短清单。
     只抓明显问题：明显重复、明显跑题、术语混用。"""
     target_wc = int(prompts.get("target_word_count", 5000) or 5000)
-    ds = load_json_file("drafts_summary.json", {})
     outline_lines = []
     for node, depth in flatten_tree_nodes(tree):
         indent = "  " * depth
         nid = node.get("id")
-        summ = (ds.get(nid) or "")[:80]
+        body = drafts.get(nid, drafts.get(str(nid), ""))
+        summ = chapter_review_summary(DATA_DIR, nid, body, max_chars=160, locale="zh") if body else ""
         outline_lines.append(f"{indent}- {node.get('title','')}（{node.get('word_count',0) or 0}字）{('｜摘要:'+summ) if summ else ''}")
     outline_text = "\n".join(outline_lines)
     prompt = (
@@ -2631,8 +2660,8 @@ def _light_llm_scan(tree, drafts, prompts):
         "- 总输出控制在 300 字以内，宁缺毋滥。\n\n"
         "【章节大纲】\n" + outline_text
     )
-    res = dispatch_llm_call(prompt, system_prompt="你是一个快速扫描型学术审稿助理，只输出简短问题清单。", max_tokens=1000, temp=0.3)
-    return purge_thinking_text(res)
+    res = dispatch_llm_call(prompt, system_prompt="你是一个快速扫描型学术审稿助理，只输出简短问题清单。", max_tokens=1000, temp=0.3, return_metadata=True)
+    return purge_thinking_text(require_complete_llm_result(res))
 
 
 def render_full_logic_review():
@@ -2741,7 +2770,7 @@ def render_full_logic_review():
                             f"【章节块：{gtitle}】\n" + "\n".join(parts)
                         )
                         try:
-                            res = dispatch_llm_call(block_prompt, system_prompt="你是极端严谨的学术论文逻辑审查专家。", max_tokens=1500, temp=0.3)
+                            res = require_complete_llm_result(dispatch_llm_call(block_prompt, system_prompt="你是极端严谨的学术论文逻辑审查专家。", max_tokens=1500, temp=0.3, return_metadata=True))
                         except LLMOutputError:
                             block_results.append({"status": "error", "title": gtitle})
                         else:
@@ -2834,11 +2863,12 @@ def adversarial_rewrite(text, rewrite_prompt, max_attempts=3):
         temp_val = 0.85 + (attempt * 0.1)
         # 根据原文长度动态调整输出预算：正文约原文1.2倍token + 思考余量
         out_tokens = max(8000, int(len(text) * 1.8) + 4000)
-        rewritten = require_valid_llm_output(dispatch_llm_call(
+        rewritten = require_complete_llm_result(dispatch_llm_call(
             prompt,
             system_prompt="你是极其克制的顶级学术校对员，只输出重写后的正文，绝不输出任何思考过程。",
             max_tokens=out_tokens,
-            temp=temp_val
+            temp=temp_val,
+            return_metadata=True,
         ))
         # 清理后再次验证，避免空结果进入检测或保存流程。
         rewritten = require_valid_llm_output(purge_thinking_text(rewritten))
@@ -3301,7 +3331,9 @@ def module6_aigc():
                                 # 去味前自动备份当前章节（防破坏可恢复）
                                 bak_d = load_json_file("drafts_rewrite_backup.json", {})
                                 bak_d[sel_id] = drafts.get(sel_id, "")
-                                save_json_file("drafts_rewrite_backup.json", bak_d)
+                                if not save_json_file("drafts_rewrite_backup.json", bak_d):
+                                    st.error("无法保存去味前正文备份，本次操作未开始。")
+                                    st.stop()
                                 try:
                                     rewritten, ok, rounds, score = adversarial_rewrite(edited_text, rewrite_prompt)
                                 except LLMOutputError:
@@ -3350,6 +3382,13 @@ def module6_aigc():
             else:
                 ordered = get_ordered_node_ids(tree)
                 drafts = load_json_file("drafts.json", {})
+                backup = load_json_file("drafts_rewrite_backup.json", {})
+                for draft_id in ordered:
+                    if drafts.get(draft_id):
+                        backup[draft_id] = drafts[draft_id]
+                if not save_json_file("drafts_rewrite_backup.json", backup):
+                    st.error("无法保存去味前备份，本次批量去味未开始。")
+                    st.stop()
                 bar = st.progress(0)
                 status = st.empty()
                 ok_count = 0
@@ -3364,11 +3403,18 @@ def module6_aigc():
                         except LLMOutputError:
                             failed_rewrites.append(f"{node.get('title','未命名')}: {llm_error_message('zh')}")
                         else:
+                            abnormal, reasons = is_suspicious_rewrite(text, rewritten)
+                            if abnormal:
+                                failed_rewrites.append(f"{node.get('title','未命名')}: 去味结果异常（{'、'.join(reasons)}），原文已保留")
+                                bar.progress((k + 1) / len(ordered))
+                                continue
                             saved = persist_draft_text(nid, rewritten, "zh", refresh_memory=False, drafts=drafts)
                             if not saved["saved"]:
                                 failed_rewrites.append(f"{node.get('title','未命名')}: 正文保存失败")
                             else:
                                 drafts = saved["drafts"]
+                                version_key = f"content_ver_{nid}"
+                                st.session_state[version_key] = int(st.session_state.get(version_key, 0) or 0) + 1
                             if saved["saved"] and ok:
                                 ok_count += 1
                     bar.progress((k + 1) / len(ordered))
@@ -3406,7 +3452,7 @@ def module6_aigc():
                     for idx, chunk in enumerate(chunks):
                         chunk_prompt = f"{rewrite_prompt}\n待处理文本：\n{chunk}"
                         try:
-                            res = dispatch_llm_call(chunk_prompt, max_tokens=2500, temp=0.9)
+                            res = require_complete_llm_result(dispatch_llm_call(chunk_prompt, max_tokens=2500, temp=0.9, return_metadata=True))
                         except LLMOutputError:
                             chunk_failed = True
                             break

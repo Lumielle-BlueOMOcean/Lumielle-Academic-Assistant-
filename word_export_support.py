@@ -148,7 +148,6 @@ def _clean_body_lines(text):
         line = re.sub(r"^#{1,6}\s*", "", line)
         line = re.sub(r"^>+\s*", "", line)
         line = re.sub(r"^[-*+•]\s+", "", line)
-        line = re.sub(r"^\d+[.、)]\s*", "", line)
         line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
         line = re.sub(r"\*(.+?)\*", r"\1", line)
         line = re.sub(r"`(.+?)`", r"\1", line)
@@ -270,6 +269,7 @@ def render_manuscript_docx(
         page_width_in = max(1.0, first_section.page_width.inches - first_section.left_margin.inches - first_section.right_margin.inches)
     else:
         page_width_in = max(1.0, 8.2677 - (spec["page"]["margins_cm"]["left"] + spec["page"]["margins_cm"]["right"]) / 2.54)
+    available_literature_ids = {str(key) for key in literature_by_id}
     for node, depth in _flatten_tree(tree):
         node_id = node.get("id")
         title = str(node.get("title", "") or "")
@@ -280,43 +280,37 @@ def render_manuscript_docx(
                     _set_legacy_heading_font(heading, spec, min(depth + 1, 3))
                 else:
                     _set_heading(heading, spec, min(depth + 1, 3))
-        text = str(drafts.get(node_id, "") or "")
+        text = str(drafts.get(node_id, "") or "") if not node.get("children") else ""
         if text:
             local_reference_ids = reference_ids_for_node(node, draft_reference_maps)
+            citation_numbers = {int(value) for value in re.findall(r"\[(\d+)\]", text)}
+            if any(number < 1 or number > len(local_reference_ids) for number in citation_numbers):
+                raise ValueError("A saved chapter contains citations without a valid reference snapshot. Correct the chapter references before exporting.")
+            if any(str(reference_id) not in available_literature_ids for reference_id in local_reference_ids):
+                if citation_numbers:
+                    raise ValueError("A saved chapter cites a literature record that no longer exists. Restore or correct the reference before exporting.")
+            local_reference_ids = [reference_id for reference_id in local_reference_ids if str(reference_id) in available_literature_ids]
             text = remap_local_citations(text, local_reference_ids, number_by_id)
             lines = _clean_body_lines(text)
-            paragraphs = []
             index = 0
             while index < len(lines):
                 line = lines[index]
                 if not line or line == "[[PAGE_BREAK]]":
-                    if paragraphs:
-                        paragraph = doc.add_paragraph("\n".join(paragraphs))
-                        if not template_only:
-                            _format_paragraph(paragraph, spec)
-                        paragraphs = []
                     if line == "[[PAGE_BREAK]]":
                         doc.add_page_break()
                     index += 1
                     continue
                 if line.startswith("TABLE|"):
-                    if paragraphs:
-                        paragraph = doc.add_paragraph("\n".join(paragraphs))
-                        if not template_only:
-                            _format_paragraph(paragraph, spec)
-                        paragraphs = []
                     table_lines = []
                     while index < len(lines) and lines[index].startswith("TABLE|"):
                         table_lines.append(lines[index])
                         index += 1
                     table_number = _add_table(doc, table_lines, spec, table_number, locale)
                     continue
-                paragraphs.append(line)
-                index += 1
-            if paragraphs:
-                paragraph = doc.add_paragraph("\n".join(paragraphs))
+                paragraph = doc.add_paragraph(line)
                 if not template_only:
                     _format_paragraph(paragraph, spec)
+                index += 1
 
         for chart in drafts_charts.get(node_id, []) or []:
             path = chart.get("path", "") if isinstance(chart, dict) else ""

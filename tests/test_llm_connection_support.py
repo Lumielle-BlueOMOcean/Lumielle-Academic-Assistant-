@@ -19,7 +19,7 @@ class FakeHTTPError(Exception):
 
 def successful_client(response=None):
     completion = response or SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content='{"status":"ok"}'))]
+        choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"status":"ok"}'))]
     )
     create = Mock(return_value=completion)
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
@@ -153,7 +153,7 @@ class LLMConnectionSupportTests(unittest.TestCase):
 
     def test_malformed_structured_response_fails_the_connection_test(self):
         client, _ = successful_client(SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="not JSON"))]
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="not JSON"))]
         ))
         with patch.object(self.support, "OpenAI", return_value=client):
             result = self.support.test_model_connection(
