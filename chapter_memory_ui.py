@@ -91,6 +91,7 @@ _REVIEW_TEXT = {
         "saved": "Candidate saved.",
         "memory_failed": "The draft was saved, but its memory was not updated. You can rebuild it from Chapter memory.",
         "save_failed": "The candidate could not be saved; the previous draft remains unchanged.",
+        "save_consistency_failed": "The candidate was not saved, and its citation snapshot could not be restored. Check this chapter's references before export; the editor was not refreshed.",
         "kept": "The previous draft was kept.",
         "candidate": "Candidate text",
     },
@@ -105,6 +106,7 @@ _REVIEW_TEXT = {
         "saved": "候选正文已保存。",
         "memory_failed": "正文已保存，但记忆未能更新；可在“章节记忆”中重试。",
         "save_failed": "候选正文保存失败，原有正文保持不变。",
+        "save_consistency_failed": "候选正文未保存，且引用快照无法恢复。请先核对本章引用再导出；编辑器未刷新。",
         "kept": "已保留此前正文。",
         "candidate": "候选正文",
     },
@@ -267,7 +269,7 @@ def render_pending_candidate_reviews(st, on_save, locale="en"):
                     except Exception:
                         result = {"saved": False, "memory_updated": False}
                     if not result.get("saved"):
-                        st.error(text["save_failed"])
+                        st.error(text["save_consistency_failed"] if result.get("consistency_warning") else text["save_failed"])
                     else:
                         pending.pop(chapter_id, None)
                         st.success(text["saved"])

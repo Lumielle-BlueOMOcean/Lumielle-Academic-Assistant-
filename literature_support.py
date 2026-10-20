@@ -90,3 +90,59 @@ def clear_literature_library(literatures, raw_dir, save_records, delete_source_f
         "deleted": file_result["deleted"],
         "failed": file_result["failed"],
     }
+
+
+def delete_literature_record(literatures, evidence_store, literature_id, raw_dir,
+                             save_records, save_evidence, cited=False):
+    """Persist a single-record removal before deleting its imported source file."""
+    if cited:
+        return {"status": "cited", "records_saved": False, "evidence_saved": False,
+                "rollback_failed": False, "source_deleted": False, "cleanup_failed": False}
+
+    records = literatures if isinstance(literatures, list) else []
+    evidence = evidence_store if isinstance(evidence_store, dict) else {}
+    key = str(literature_id or "")
+    target = next((item for item in records if isinstance(item, dict) and str(item.get("id", "")) == key), None)
+    if target is None:
+        return {"status": "missing", "records_saved": False, "evidence_saved": False,
+                "rollback_failed": False, "source_deleted": False, "cleanup_failed": False}
+
+    old_records = list(records)
+    old_evidence = dict(evidence)
+    new_records = [item for item in records if not (isinstance(item, dict) and str(item.get("id", "")) == key)]
+    new_evidence = dict(evidence)
+    new_evidence.pop(key, None)
+    try:
+        records_saved = bool(save_records(new_records))
+    except Exception:
+        records_saved = False
+    if not records_saved:
+        return {"status": "save_failed", "records_saved": False, "evidence_saved": False,
+                "rollback_failed": False, "source_deleted": False, "cleanup_failed": False}
+
+    try:
+        evidence_saved = bool(save_evidence(new_evidence))
+    except Exception:
+        evidence_saved = False
+    if not evidence_saved:
+        rollback_records_ok = rollback_evidence_ok = True
+        try:
+            rollback_records_ok = bool(save_records(old_records))
+        except Exception:
+            rollback_records_ok = False
+        try:
+            rollback_evidence_ok = bool(save_evidence(old_evidence))
+        except Exception:
+            rollback_evidence_ok = False
+        rollback_failed = not (rollback_records_ok and rollback_evidence_ok)
+        return {"status": "rollback_failed" if rollback_failed else "save_failed",
+                "records_saved": True, "evidence_saved": False,
+                "rollback_failed": rollback_failed, "source_deleted": False, "cleanup_failed": False}
+
+    source_path = target.get("file_path")
+    file_result = _delete_source_files(raw_dir, [source_path]) if source_path else {"deleted": 0, "failed": 0}
+    cleanup_failed = file_result["failed"] > 0
+    return {"status": "cleanup_warning" if cleanup_failed else "deleted",
+            "records_saved": True, "evidence_saved": True,
+            "rollback_failed": False, "source_deleted": file_result["deleted"] > 0,
+            "cleanup_failed": cleanup_failed}

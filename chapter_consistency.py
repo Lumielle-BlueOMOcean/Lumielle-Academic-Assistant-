@@ -42,6 +42,25 @@ _METRICS = (
     ("revenue", re.compile(r"\bannual\s+revenue\b|\brevenue\b|\bturnover\b|年收入|销售额", re.IGNORECASE)),
     ("profit", re.compile(r"\bprofit\b|利润", re.IGNORECASE)),
 )
+_MAX_REVIEW_PROMPT_CHARS = 48_000
+
+
+def _review_context_text(value):
+    if isinstance(value, (list, tuple)):
+        return "\n".join(str(item) for item in value if item is not None)
+    if isinstance(value, dict):
+        return "\n".join(f"{key}: {item}" for key, item in value.items())
+    return str(value or "")
+
+
+def _truncate_review_context(value, limit, locale):
+    value = _review_context_text(value)
+    if len(value) <= limit:
+        return value
+    marker = "\n[已截断：审阅上下文预算]" if locale == "zh" else "\n[TRUNCATED: review context budget]"
+    if limit <= len(marker):
+        return marker[:limit]
+    return value[: limit - len(marker)] + marker
 
 
 def _without_links(text):
@@ -162,29 +181,64 @@ def check_deterministic_consistency(candidate, valid_reference_count=0, confirme
 
 def _semantic_prompt(candidate, context, locale, correction=False):
     context = context if isinstance(context, dict) else {}
+    normalized = {
+        "title": _review_context_text(context.get("current_title", "")),
+        "description": _review_context_text(context.get("current_desc", "")),
+        "constraints": _review_context_text(context.get("research_constraints", "")),
+        "facts": _review_context_text(context.get("research_facts", "")),
+        "evidence": _review_context_text(context.get("literature_evidence", "")),
+        "upstream": _review_context_text(context.get("upstream", "")),
+        "downstream": _review_context_text(context.get("downstream", "")),
+    }
+    candidate = str(candidate or "")
     if locale == "zh":
         correction_text = "上次输出不是有效审阅 JSON。请仅按下列结构修正。\n" if correction else ""
-        return (
+        instruction = (
             "你是论文章节一致性审阅助手。只检查候选正文与给定的已写章节信息是否存在明显冲突，不判断学术结论的客观真伪。"
             "重点看重要论断、术语、数值主体/时间/口径、假设被写成事实，以及是否越过未写章节边界。没有明确风险时返回 pass。"
             "只输出 JSON：{\"status\":\"pass\",\"issues\":[]}；status 只能为 pass、warning、needs_review。issues 每项包含简短 reason 与 source。"
             "这是风险提示，不是学术真实性认证；不得补充事实。\n"
-            + correction_text
-            + "[已写上游]\n" + str(context.get("upstream", ""))
-            + "\n[已写下游与章节边界]\n" + str(context.get("downstream", ""))
-            + "\n[候选正文]\n" + str(candidate or "")
         )
-    correction_text = "The previous output was not valid review JSON. Correct it to the required shape only.\n" if correction else ""
-    return (
-        "Review a candidate paper chapter only for clear conflicts with the supplied written-chapter context. Do not judge objective academic truth. "
-        "Look for contradictions in important claims, terminology drift, changed subjects/timeframes/measurement bases for numbers, assumptions presented as facts, and content that crosses an unwritten chapter boundary. Return pass when no clear risk is present. "
-        "Output JSON only: {\"status\":\"pass\",\"issues\":[]}. status is pass, warning, or needs_review. Each issue has a short reason and a source chapter or memory reference. "
-        "This is a risk signal, not truth certification. Do not add facts.\n"
-        + correction_text
-        + "[WRITTEN UPSTREAM]\n" + str(context.get("upstream", ""))
-        + "\n[WRITTEN DOWNSTREAM AND BOUNDARY]\n" + str(context.get("downstream", ""))
-        + "\n[CANDIDATE CHAPTER]\n" + str(candidate or "")
-    )
+        labels = {
+            "chapter": "[当前章节]\n", "constraints": "[必须遵守的研究约束]\n",
+            "facts": "[本章科研事实]\n", "evidence": "[本章绑定文献证据与来源]\n",
+            "upstream": "[已写上游]\n", "downstream": "[已写下游与章节边界]\n",
+            "candidate": "[候选正文]\n",
+        }
+    else:
+        correction_text = "The previous output was not valid review JSON. Correct it to the required shape only.\n" if correction else ""
+        instruction = (
+            "Review a candidate paper chapter only for clear conflicts with the supplied written-chapter context. Do not judge objective academic truth. "
+            "Look for contradictions in important claims, terminology drift, changed subjects/timeframes/measurement bases for numbers, assumptions presented as facts, and content that crosses an unwritten chapter boundary. Return pass when no clear risk is present. "
+            "Output JSON only: {\"status\":\"pass\",\"issues\":[]}. status is pass, warning, or needs_review. Each issue has a short reason and a source chapter or memory reference. "
+            "This is a risk signal, not truth certification. Do not add facts.\n"
+        )
+        labels = {
+            "chapter": "[CURRENT CHAPTER]\n", "constraints": "[REQUIRED RESEARCH CONSTRAINTS]\n",
+            "facts": "[SELECTED RESEARCH FACTS]\n", "evidence": "[BOUND LITERATURE EVIDENCE AND SOURCES]\n",
+            "upstream": "[WRITTEN UPSTREAM]\n", "downstream": "[WRITTEN DOWNSTREAM AND BOUNDARY]\n",
+            "candidate": "[CANDIDATE CHAPTER]\n",
+        }
+    chapter = normalized["title"] + ("\n" + normalized["description"] if normalized["description"] else "")
+    required = [("chapter", chapter), ("constraints", normalized["constraints"]), ("candidate", candidate)]
+    optional = {key: normalized[key] for key in ("facts", "evidence", "upstream", "downstream")}
+    fixed = instruction + correction_text + "".join(labels[key] + value + "\n" for key, value in required)
+    if len(fixed) > _MAX_REVIEW_PROMPT_CHARS:
+        return None
+    prompt = fixed + "".join(labels[key] + value + "\n" for key, value in optional.items() if value)
+    overflow = len(prompt) - _MAX_REVIEW_PROMPT_CHARS
+    if overflow > 0:
+        # Reduce low-priority surrounding prose first; keep constraints and candidate intact.
+        for key in ("downstream", "upstream", "evidence", "facts"):
+            value = optional[key]
+            if not value or overflow <= 0:
+                continue
+            allowance = max(0, len(value) - overflow)
+            optional[key] = _truncate_review_context(value, allowance, locale) if allowance else ""
+            overflow -= len(value) - len(optional[key])
+        if overflow > 0:
+            return None
+    return fixed + "".join(labels[key] + value + "\n" for key, value in optional.items() if value)
 
 
 def _normalize_review(value):
@@ -212,9 +266,12 @@ def _normalize_review(value):
 def review_semantic_consistency(candidate, context, llm_call, locale="en"):
     """Make one structured review request and at most one format-correction request."""
     for attempt in range(2):
+        prompt = _semantic_prompt(candidate, context, locale, correction=attempt == 1)
+        if prompt is None:
+            return {"status": "needs_review", "completed": False, "failure_code": "review_context_too_large", "issues": []}
         try:
             result = llm_call(
-                _semantic_prompt(candidate, context, locale, correction=attempt == 1),
+                prompt,
                 max_tokens=1400,
                 json_mode=True,
                 return_metadata=True,

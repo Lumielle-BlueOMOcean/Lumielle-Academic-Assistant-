@@ -39,7 +39,7 @@ from chapter_memory_support import (
 from chapter_memory_store import clear_chapter_memory_store, initialize_memory_store
 from chapter_memory_ui import render_chapter_memory_panel, render_pending_candidate_reviews
 from chapter_consistency import review_chapter_candidate
-from literature_support import clear_literature_library
+from literature_support import clear_literature_library, delete_literature_record
 from literature_intelligence import (
     analyze_literature_document,
     legacy_profile_for_display,
@@ -110,6 +110,7 @@ from writing_support import (
 )
 from json_storage_support import atomic_write_json
 import json
+import copy
 import os
 import time
 import uuid
@@ -1398,6 +1399,11 @@ def open_file_with_default_app(file_path):
 
 def module3_literature():
     st.header("📚 Literature Processing")
+    delete_notice = st.session_state.pop("_literature_delete_notice_en", None)
+    if isinstance(delete_notice, dict):
+        level = delete_notice.get("level")
+        message = delete_notice.get("message", "")
+        (st.success if level == "success" else st.warning if level == "warning" else st.error)(message)
     literatures = load_json_file("literatures.json", [])
     evidence_store = load_json_file("literature_evidence.json", {})
     research_topic = str(load_json_file("prompts.json", {}).get("global_topic", ""))
@@ -1496,17 +1502,20 @@ def module3_literature():
                         if citing_chapters:
                             st.error("This literature is cited by saved chapters and cannot be deleted until those citations are corrected: " + ", ".join(citing_chapters))
                             continue
-                        # 同时删除原文件副本
-                        fp = lit.get("file_path", "")
-                        if fp and os.path.exists(fp):
-                            try:
-                                os.remove(fp)
-                            except Exception:
-                                pass
-                        literatures.pop(idx)
-                        evidence_store.pop(str(lit.get("id", "")), None)
-                        save_json_file("literatures.json", literatures)
-                        save_json_file("literature_evidence.json", evidence_store)
+                        result = delete_literature_record(
+                            literatures, evidence_store, lit.get("id", ""), RAW_DIR,
+                            lambda records: save_json_file("literatures.json", records),
+                            lambda records: save_json_file("literature_evidence.json", records),
+                        )
+                        notices = {
+                            "deleted": ("success", "Literature record and evidence deleted."),
+                            "cleanup_warning": ("warning", "The record was deleted, but its original file could not be removed."),
+                            "save_failed": ("error", "The literature records could not be saved. The original file was kept."),
+                            "rollback_failed": ("error", "The metadata save and its rollback both failed. The original file was kept; review the literature data files before continuing."),
+                            "missing": ("error", "This literature record no longer exists; no source file was removed."),
+                        }
+                        level, message = notices.get(result["status"], ("error", "Literature deletion did not complete."))
+                        st.session_state["_literature_delete_notice_en"] = {"level": level, "message": message}
                         st.rerun()
 
     st.markdown("---")
@@ -2016,7 +2025,7 @@ def persist_generated_candidate(chapter_id, candidate, locale):
     """Save a reviewed candidate first, then refresh its derived memory snapshot."""
     drafts = load_json_file("drafts.json", {})
     reference_maps = load_json_file("draft_reference_maps.json", {})
-    previous_reference_maps = dict(reference_maps) if isinstance(reference_maps, dict) else {}
+    previous_reference_maps = copy.deepcopy(reference_maps) if isinstance(reference_maps, dict) else {}
     text = candidate.get("text", "")
     record_generated_draft(
         drafts,
@@ -2025,13 +2034,45 @@ def persist_generated_candidate(chapter_id, candidate, locale):
         text,
         candidate.get("reference_ids", []),
     )
-    if not save_json_file("draft_reference_maps.json", reference_maps):
-        return {"saved": False, "memory_error": None, "reference_map_saved": False}
-    result = persist_draft_text(chapter_id, text, locale, refresh_memory=True, drafts=drafts)
+    def restore_reference_maps():
+        try:
+            return bool(save_json_file("draft_reference_maps.json", previous_reference_maps))
+        except Exception:
+            return False
+
+    try:
+        reference_map_saved = bool(save_json_file("draft_reference_maps.json", reference_maps))
+    except Exception:
+        reference_map_saved = False
+    if not reference_map_saved:
+        rollback_ok = restore_reference_maps()
+        result = {
+            "saved": False, "memory_error": None, "reference_map_saved": False,
+            "draft_saved": False, "reference_map_rollback": rollback_ok,
+            "consistency_warning": not rollback_ok, "failure_stage": "reference_map_save",
+        }
+        if not rollback_ok:
+            st.session_state[f"draft_reference_warning_{chapter_id}"] = (
+                "The citation snapshot could not be restored after a failed save. Do not export or interpret this chapter's numeric citations until its references are checked."
+            )
+        return result
+    try:
+        result = persist_draft_text(chapter_id, text, locale, refresh_memory=True, drafts=drafts)
+    except Exception:
+        result = {"saved": False, "memory_updated": False, "memory_reused": False, "memory_error": None}
+    result["reference_map_saved"] = True
+    result["draft_saved"] = bool(result.get("saved"))
     if not result["saved"]:
-        result["reference_map_rollback"] = save_json_file("draft_reference_maps.json", previous_reference_maps)
+        rollback_ok = restore_reference_maps()
+        result["reference_map_rollback"] = rollback_ok
+        result["consistency_warning"] = not rollback_ok
+        result["failure_stage"] = "draft_save"
+        if not rollback_ok:
+            st.session_state[f"draft_reference_warning_{chapter_id}"] = (
+                "The draft save failed and its citation snapshot could not be restored. Do not export or interpret this chapter's numeric citations until its references are checked."
+            )
     else:
-        result["reference_map_saved"] = True
+        st.session_state.pop(f"draft_reference_warning_{chapter_id}", None)
         version_key = f"content_ver_{chapter_id}"
         st.session_state[version_key] = int(st.session_state.get(version_key, 0) or 0) + 1
     return result
@@ -2133,6 +2174,9 @@ def render_single_chapter_editor(tree):
         drafts = load_json_file("drafts.json", {})
         content_ver = st.session_state.get(f"content_ver_{sel_id}", 0)
         current_text = drafts.get(sel_id, "")
+        reference_warning = st.session_state.get(f"draft_reference_warning_{sel_id}")
+        if reference_warning:
+            st.error(reference_warning)
         new_text = st.text_area("Draft editor (Markdown supported)", value=current_text, height=400, key=f"draft_{sel_id}_v{content_ver}")
         for level, message in st.session_state.pop(f"writing_notice_{sel_id}", []):
             getattr(st, level)(message)
@@ -2189,7 +2233,10 @@ def render_single_chapter_editor(tree):
                             if consistency.get("status") == "pass" and consistency.get("completed"):
                                 result = persist_generated_candidate(sel_id, candidate, "en")
                                 if not result["saved"]:
-                                    st.error("The generated chapter could not be saved; the previous draft was kept.")
+                                    if result.get("consistency_warning"):
+                                        st.error("The generated chapter was not saved. Its citation snapshot rollback also failed; check the chapter's references before export. The editor was not refreshed.")
+                                    else:
+                                        st.error("The generated chapter could not be saved; the previous draft was kept.")
                                 else:
                                     notices = [("success", generated_message)]
                                     if result.get("memory_error"):
@@ -2444,7 +2491,8 @@ def render_batch_workbench():
                         continue
                     persisted = persist_generated_candidate(nid, candidate, "en")
                     if not persisted["saved"]:
-                        failed_chapters.append(f"{node.get('title','Untitled')}: draft save failed")
+                        save_message = "citation snapshot could not be restored; references need review" if persisted.get("consistency_warning") else "draft save failed"
+                        failed_chapters.append(f"{node.get('title','Untitled')}: {save_message}")
                         progress_bar.progress((k + 1) / len(leaf_ids))
                         continue
                     if wc_info:
@@ -2549,8 +2597,11 @@ def render_batch_workbench():
             with st.spinner("Formatting Agent is assembling the final draft..."):
                 try:
                     bio = build_final_document(None if tpl_sel.startswith("(No template") else tpl_sel, quick_spec)
-                except (FormatSpecError, ValueError):
-                    st.error("The selected FormatSpec could not be rendered. Choose a valid preset and try again.")
+                except (FormatSpecError, ValueError) as exc:
+                    if "Citation snapshot consistency" in str(exc):
+                        st.error("Word export is blocked because a chapter's draft and citation snapshot may be inconsistent. Review the cited chapters before exporting.")
+                    else:
+                        st.error("The selected FormatSpec could not be rendered. Choose a valid preset and try again.")
                 else:
                     st.success("Final draft assembled!")
                     st.download_button(
@@ -3190,6 +3241,13 @@ def render_md_table(doc, table_lines, params):
 
 def build_final_document(template_name, format_spec, template_only=False):
     """Load the current manuscript state and delegate all DOCX layout to the shared renderer."""
+    inconsistent_chapters = [
+        str(key).removeprefix("draft_reference_warning_")
+        for key in st.session_state
+        if str(key).startswith("draft_reference_warning_")
+    ]
+    if inconsistent_chapters:
+        raise ValueError("Citation snapshot consistency needs review for: " + ", ".join(inconsistent_chapters))
     tree = load_json_file("logic_tree.json", [])
     drafts = load_json_file("drafts.json", {})
     draft_reference_maps = load_json_file("draft_reference_maps.json", {})
