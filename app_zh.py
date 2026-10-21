@@ -38,7 +38,7 @@ from chapter_memory_support import (
 )
 from chapter_memory_store import clear_chapter_memory_store, initialize_memory_store
 from chapter_memory_ui import render_chapter_memory_panel, render_pending_candidate_reviews
-from chapter_consistency import review_chapter_candidate
+from chapter_consistency import classify_pending_review_reason, review_chapter_candidate, review_pending_candidate
 from literature_support import clear_literature_library, delete_literature_record
 from literature_intelligence import (
     analyze_literature_document,
@@ -89,6 +89,7 @@ from outline_support import (
 from chart_support import chart_result_message, generate_chart_image
 from writing_support import (
     LLMOutputError,
+    is_transient_provider_failure,
     aigc_detection_error_result,
     build_deep_review_report,
     build_chapter_prompt as assemble_chapter_prompt,
@@ -99,6 +100,7 @@ from writing_support import (
     count_chinese_chars,
     context_budget_error_message,
     llm_error_message,
+    llm_error_diagnostic,
     parse_literature_analysis,
     parse_aigc_detection_response,
     record_generated_draft,
@@ -1435,6 +1437,14 @@ def module3_literature():
                     st.markdown(f"**与当前课题的相关性**: {stars} ｜ **文献类型**: `{display_category}`")
                     if lit.get("analysis_status") == "unavailable":
                         st.caption("该文献未能完成 AI 评级。")
+                    if lit.get("analysis_status") != "ok":
+                        render_legacy_reanalysis(
+                            st, lit, literatures, evidence_store, RAW_DIR, extract_document_text,
+                            dispatch_llm_call,
+                            lambda records: save_json_file("literatures.json", records),
+                            lambda records: save_json_file("literature_evidence.json", records),
+                            "zh", research_topic=research_topic, research_context=research_context,
+                        )
                     with st.expander("👁️ 查看 LLM 文献总结与原文", expanded=False):
                         st.markdown(f"**核心发现**: {lit.get('analysis',{}).get('key_findings','-')}")
                         st.markdown(f"**与当前课题的相关性说明**: {lit.get('analysis',{}).get('relevance_reason','-')}")
@@ -1466,13 +1476,14 @@ def module3_literature():
                             
                         else:
                             st.caption("（未保存原文件，仅存解析文本）")
-                        render_legacy_reanalysis(
-                            st, lit, literatures, evidence_store, RAW_DIR, extract_document_text,
-                            dispatch_llm_call,
-                            lambda records: save_json_file("literatures.json", records),
-                            lambda records: save_json_file("literature_evidence.json", records),
-                            "zh", research_topic=research_topic, research_context=research_context,
-                        )
+                        if lit.get("analysis_status") == "ok":
+                            render_legacy_reanalysis(
+                                st, lit, literatures, evidence_store, RAW_DIR, extract_document_text,
+                                dispatch_llm_call,
+                                lambda records: save_json_file("literatures.json", records),
+                                lambda records: save_json_file("literature_evidence.json", records),
+                                "zh", research_topic=research_topic, research_context=research_context,
+                            )
                 with c_star:
                     label, help_text = literature_importance_control(lit, "zh")
                     if st.button(label, key=f"litstar_{lit['id']}", help=help_text):
@@ -1975,11 +1986,19 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
                 error_code = "truncated_output"
             elif not error_code and finish_reason == "content_filter":
                 error_code = "content_filtered"
+            elif not error_code and finish_reason in {"aborted", "insufficient_system_resource"}:
+                error_code = "provider_temporarily_unavailable"
             elif not error_code and finish_reason != "stop":
                 error_code = "incomplete_response"
             if error_code:
-                raise LLMOutputError("模型未返回可用章节正文。", error_code=error_code)
+                raise LLMOutputError(
+                    "模型未返回可用章节正文。", error_code=error_code,
+                    http_status=response.get("http_status"), finish_reason=finish_reason,
+                    completion_tokens=response.get("completion_tokens"), reasoning_tokens=response.get("reasoning_tokens"),
+                )
             response = response.get("content", "")
+        if not isinstance(response, str) or not response.strip():
+            raise LLMOutputError("模型未返回可用章节正文。", error_code="empty_content")
         last_res = require_valid_llm_output(response)
         if target <= 0:
             break
@@ -2006,7 +2025,23 @@ def generate_chapter_with_correction(sandwich, prompts, max_attempts=3, toleranc
         locale="zh",
         confirmed_items=fitted_sandwich.get("confirmed_memory_items", []),
     )
+    consistency["_review_context"] = {
+        key: fitted_sandwich.get(key, "") for key in (
+            "current_title", "current_desc", "research_constraints", "research_facts",
+            "literature_evidence", "upstream", "downstream",
+        )
+    }
+    consistency["_confirmed_memory_items"] = fitted_sandwich.get("confirmed_memory_items", [])
     return last_res, wc_info, consistency
+
+
+def rereview_pending_candidate(chapter_id, candidate, locale="zh"):
+    system_prompt = "你审阅章节中的明显一致性风险，只返回规定的 JSON。" if locale == "zh" else "You review a chapter for clear consistency risks. Return only the requested JSON."
+    return review_pending_candidate(
+        candidate,
+        lambda prompt, **kwargs: dispatch_llm_call(prompt, system_prompt=system_prompt, **kwargs),
+        locale=locale,
+    )
 
 
 def persist_generated_candidate(chapter_id, candidate, locale):
@@ -2070,7 +2105,7 @@ def persist_draft_text(chapter_id, draft_text, locale, *, refresh_memory=False, 
     """Use one persistence boundary for edited and rewritten chapter text."""
     drafts = load_json_file("drafts.json", {}) if drafts is None else drafts
     legacy = load_json_file("drafts_summary.json", {}).get(chapter_id)
-    return save_draft_and_maybe_refresh_memory(
+    result = save_draft_and_maybe_refresh_memory(
         DATA_DIR,
         drafts,
         chapter_id,
@@ -2081,6 +2116,12 @@ def persist_draft_text(chapter_id, draft_text, locale, *, refresh_memory=False, 
         refresh_memory=refresh_memory,
         legacy_summary=legacy,
     )
+    failure_key = f"chapter_memory_failure_{chapter_id}"
+    if result.get("memory_failure"):
+        st.session_state[failure_key] = result["memory_failure"]
+    elif result.get("memory_updated") or result.get("memory_reused"):
+        st.session_state.pop(failure_key, None)
+    return result
 
 
 def render_tree_nav(tree, nodes, sel_key="writing_selected_id", _drafts=None):
@@ -2205,6 +2246,9 @@ def render_single_chapter_editor(tree):
                             st.error("章节生成失败，原有正文已保留。" + context_budget_error_message("zh", exc))
                         except LLMOutputError as exc:
                             st.error("章节生成失败，原有正文已保留。" + llm_error_message("zh", exc))
+                            diagnostic = llm_error_diagnostic(exc, "zh")
+                            if diagnostic:
+                                st.caption(diagnostic)
                         else:
                             bound_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
                             candidate = {
@@ -2213,6 +2257,8 @@ def render_single_chapter_editor(tree):
                                 "reference_ids": [lit.get("id") for lit in bound_literatures if lit.get("id") is not None],
                                 "word_count": wc_info,
                                 "consistency": consistency,
+                                "review_context": consistency.pop("_review_context", {}),
+                                "confirmed_memory_items": consistency.pop("_confirmed_memory_items", []),
                             }
                             if wc_info:
                                 generated_message = f"本章生成完毕！实际 {wc_info['actual']}字/目标{wc_info['target']}字（纠偏{wc_info['attempts']}次）。"
@@ -2450,6 +2496,8 @@ def render_batch_workbench():
                 failed_chapters = []
                 memory_warnings = []
                 review_chapters = []
+                review_reason_counts = {}
+                not_attempted_chapters = []
                 for k, nid in enumerate(leaf_ids):
                     node = get_node_by_id(tree, nid)
                     status.info(f"📝 正在生成第 {k+1}/{len(leaf_ids)} 章：{node.get('title','')} ...")
@@ -2461,8 +2509,12 @@ def render_batch_workbench():
                         progress_bar.progress((k + 1) / len(leaf_ids))
                         continue
                     except LLMOutputError as exc:
-                        failed_chapters.append(f"{node.get('title','未命名')}: {llm_error_message('zh', exc)}")
+                        diagnostic = llm_error_diagnostic(exc, "zh")
+                        failed_chapters.append(f"{node.get('title','未命名')}: {llm_error_message('zh', exc)}" + (f"（{diagnostic}）" if diagnostic else ""))
                         progress_bar.progress((k + 1) / len(leaf_ids))
+                        if is_transient_provider_failure(exc):
+                            not_attempted_chapters = [get_node_by_id(tree, rest_id).get("title", "未命名") for rest_id in leaf_ids[k + 1:]]
+                            break
                         continue
                     bound_literatures = get_literatures_by_ids(sandwich.get("current_refs", []) or [])
                     candidate = {
@@ -2471,11 +2523,18 @@ def render_batch_workbench():
                         "reference_ids": [lit.get("id") for lit in bound_literatures if lit.get("id") is not None],
                         "word_count": wc_info,
                         "consistency": consistency,
+                        "review_context": consistency.pop("_review_context", {}),
+                        "confirmed_memory_items": consistency.pop("_confirmed_memory_items", []),
                     }
                     if consistency.get("status") != "pass" or not consistency.get("completed"):
                         st.session_state.setdefault("pending_chapter_candidates", {})[nid] = candidate
                         review_chapters.append(node.get("title", "未命名"))
+                        reason_code = classify_pending_review_reason(consistency)
+                        review_reason_counts[reason_code] = review_reason_counts.get(reason_code, 0) + 1
                         progress_bar.progress((k + 1) / len(leaf_ids))
+                        if not consistency.get("completed") and is_transient_provider_failure({"error_code": consistency.get("failure_code")}):
+                            not_attempted_chapters = [get_node_by_id(tree, rest_id).get("title", "未命名") for rest_id in leaf_ids[k + 1:]]
+                            break
                         continue
                     persisted = persist_generated_candidate(nid, candidate, "zh")
                     if not persisted["saved"]:
@@ -2488,20 +2547,34 @@ def render_batch_workbench():
                     else:
                         results_note.append(f"{node.get('title','')}: {count_chinese_chars(res)}字（无目标）")
                     if persisted.get("memory_error"):
-                        memory_warnings.append(node.get("title", "未命名"))
+                        memory_warnings.append((node.get("title", "未命名"), persisted.get("memory_failure", {})))
                     progress_bar.progress((k + 1) / len(leaf_ids))
-                msg = f"批量生成结束：已保存 {len(results_note)} 章，待审阅 {len(review_chapters)} 章，失败 {len(failed_chapters)} 章。"
+                    if is_transient_provider_failure(persisted.get("memory_failure", {})):
+                        not_attempted_chapters = [get_node_by_id(tree, rest_id).get("title", "未命名") for rest_id in leaf_ids[k + 1:]]
+                        break
+                msg = f"批量生成结束：已保存 {len(results_note)} 章，待审 {len(review_chapters)} 章，失败 {len(failed_chapters)} 章（已尝试），未尝试 {len(not_attempted_chapters)} 章。"
+                if review_reason_counts:
+                    reason_names = {
+                        "deterministic_reference_error": "确定性引用错误", "deterministic_fact_conflict": "已确认事实冲突",
+                        "review_warning": "审阅警告", "review_invalid_json": "审阅 JSON 无效",
+                        "review_empty_output": "审阅无内容", "review_truncated": "审阅截断",
+                        "review_timeout": "审阅超时", "review_rate_limited": "审阅限流",
+                        "review_provider_unavailable": "审阅服务暂时不可用",
+                        "review_context_budget": "审阅上下文超预算", "review_incomplete": "审阅未完成",
+                    }
+                    msg += "\n待审原因：" + "；".join(f"{reason_names.get(code, code)} {count} 章" for code, count in review_reason_counts.items())
                 if results_note:
                     msg += "\n" + "\n".join(results_note)
                 if skipped:
                     msg += f"\n\n（已跳过 {len(skipped)} 个父节点容器：{'、'.join(skipped[:5])}）"
                 if failed_chapters:
-                    status.warning(msg)
                     st.error("生成失败的章节：\n" + "\n".join(failed_chapters))
-                else:
-                    status.success(msg)
+                status.warning(msg) if failed_chapters or not_attempted_chapters else status.success(msg)
+                if not_attempted_chapters:
+                    st.warning("服务暂时异常，以下章节尚未尝试：" + "、".join(not_attempted_chapters))
                 if memory_warnings:
-                    st.warning("正文已保存，但以下章节的记忆更新未完成：\n" + "\n".join(memory_warnings))
+                    details = [f"{title}：{failure.get('category', 'other')} 阶段 {failure.get('stage', 'extraction')}（{failure.get('code', 'memory_update_failed')}）" for title, failure in memory_warnings]
+                    st.warning("正文已保存，以下章节记忆待重建：\n" + "\n".join(details))
 
     # ---- 批量生成图表（独立选项，走图表绘制队列） ----
     if st.button("📊 批量生成图表"):
@@ -2869,7 +2942,8 @@ def module5_writing():
     render_single_chapter_editor(tree)
     render_batch_workbench()
     render_pending_candidate_reviews(
-        st, lambda chapter_id, candidate: persist_generated_candidate(chapter_id, candidate, "zh"), locale="zh"
+        st, lambda chapter_id, candidate: persist_generated_candidate(chapter_id, candidate, "zh"), locale="zh",
+        on_re_review=lambda chapter_id, candidate: rereview_pending_candidate(chapter_id, candidate, "zh"),
     )
     render_full_logic_review()
 

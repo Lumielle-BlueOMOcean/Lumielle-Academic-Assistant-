@@ -29,6 +29,9 @@ _LABELS = {
         "success": "Complete document analyzed across {chunks} ordered chunk(s); {evidence} evidence item(s) saved.",
         "added": "Imported {count} reference(s).", "library": "Literature Library",
         "evidence": "Stored evidence chunks", "reanalyze": "Re-analyze complete source for profile and evidence",
+        "retry_analysis": "Retry AI analysis for this saved literature",
+        "upload_missing": "Original file is unavailable. Upload a source file for this literature record",
+        "reanalyze_missing": "Analyze this uploaded source for the existing literature record",
         "reanalyze_failed": "Re-analysis failed. Existing profile and evidence were preserved.",
         "reanalyze_success": "Full document profile and evidence updated.", "open_error": "Original source is unavailable.",
     },
@@ -42,6 +45,9 @@ _LABELS = {
         "success": "完整文献已按顺序处理 {chunks} 个分块，保存 {evidence} 条证据。",
         "added": "已导入 {count} 篇文献。", "library": "文献库",
         "evidence": "已保存的证据片段", "reanalyze": "基于完整原文重新分析档案与证据",
+        "retry_analysis": "重新分析这篇已入库文献",
+        "upload_missing": "原始文件不可用。请为这条文献记录单独上传原文",
+        "reanalyze_missing": "将上传原文分析到这条已有文献记录",
         "reanalyze_failed": "重新分析失败，原有档案与证据保持不变。",
         "reanalyze_success": "已根据完整原文更新文献档案与证据。", "open_error": "原始文献不可用。",
     },
@@ -635,18 +641,65 @@ def render_legacy_reanalysis(st, literature, literatures, evidence_store, raw_di
     labels = _LABELS[locale]
     evidence = evidence_store.get(str(literature.get("id", "")), []) if isinstance(evidence_store, dict) else []
     if evidence:
-        st.caption(f"{labels['evidence']}: {len(evidence)}")
-        st.json(evidence[:8])
+        with st.expander(f"{labels['evidence']}: {len(evidence)}", expanded=False):
+            st.json(evidence[:8])
     file_path = str(literature.get("file_path", "") or "")
-    if not file_path or not os.path.isfile(file_path):
-        return
-    if st.button(labels["reanalyze"], key=f"literature_reanalyze_{literature.get('id')}"):
+    source_exists = bool(file_path and os.path.isfile(file_path))
+    uploaded = None
+    if not source_exists:
+        uploaded = st.file_uploader(
+            labels["upload_missing"], type=["pdf", "docx", "txt"],
+            key=f"literature_reanalysis_upload_{literature.get('id')}",
+        )
+    failed_record = literature.get("analysis_status") != "ok"
+    button_label = labels["retry_analysis"] if failed_record else labels["reanalyze"]
+    if not source_exists:
+        button_label = labels["reanalyze_missing"]
+    if st.button(
+        button_label,
+        key=f"literature_reanalyze_{literature.get('id')}",
+        disabled=not source_exists and uploaded is None,
+    ):
+        raw = None
+        source_name = os.path.basename(file_path) if source_exists else str(getattr(uploaded, "name", "source.txt"))
+
+        def preserve_uploaded_source():
+            """Attach a replacement original to this record without changing its analysis."""
+            if source_exists or not isinstance(raw, bytes) or not raw:
+                return ""
+            suffix = Path(source_name).suffix or ".txt"
+            unique_name = f"{Path(source_name).stem or 'source'}_retry_{uuid.uuid4().hex[:8]}{suffix}"
+            saved_path = save_literature_source(raw_dir, literature.get("id", ""), unique_name, raw)
+            source_records = [
+                dict(record, file_path=saved_path)
+                if str(record.get("id", "")) == str(literature.get("id", "")) else record
+                for record in literatures
+            ]
+            try:
+                saved = save_records(source_records)
+            except Exception:
+                saved = False
+            if saved is False:
+                try:
+                    os.remove(saved_path)
+                except OSError:
+                    pass
+                raise OSError("replacement source record could not be saved")
+            literature["file_path"] = saved_path
+            return saved_path
+
         try:
-            raw = Path(file_path).read_bytes()
-            text = extract_document_text(raw, file_path)
+            raw = Path(file_path).read_bytes() if source_exists else bytes(uploaded.getvalue())
+            text = extract_document_text(raw, source_name)
         except OSError:
             text = "Parse failed: source file could not be read."
         if is_document_parse_error(text):
+            if not source_exists:
+                try:
+                    preserve_uploaded_source()
+                except Exception:
+                    st.warning(labels["reanalyze_failed"])
+                    return
             st.warning(labels["reanalyze_failed"])
             return
         result = analyze_literature_document(
@@ -655,14 +708,63 @@ def render_legacy_reanalysis(st, literature, literatures, evidence_store, raw_di
         )
         updated, new_store, success = apply_analysis_to_literature_record(literature, evidence_store, result)
         if not success:
+            source_saved = source_exists
+            if not source_exists:
+                try:
+                    source_saved = bool(preserve_uploaded_source())
+                except Exception:
+                    source_saved = False
             st.warning(failure_message(result, locale, reanalysis=True))
             _render_technical_diagnostic(st, {
                 "filename": str(literature.get("title", "literature")),
-                "success": False, "source_saved": True, "result": result,
+                "success": False, "source_saved": source_saved, "result": result,
             }, locale)
             return
+        staged_source = ""
+        if not source_exists:
+            try:
+                staged_source = save_literature_source(raw_dir, literature.get("id", ""), source_name, raw)
+                updated["file_path"] = staged_source
+            except Exception:
+                st.warning(labels["reanalyze_failed"])
+                return
+        updated_records = [dict(record, **updated) if str(record.get("id", "")) == str(literature.get("id", "")) else record for record in literatures]
+        try:
+            records_saved = save_records(updated_records)
+        except Exception:
+            records_saved = False
+        if records_saved is False:
+            try:
+                save_records(literatures)
+            except Exception:
+                pass
+            if staged_source:
+                try:
+                    os.remove(staged_source)
+                except OSError:
+                    pass
+            st.warning(labels["reanalyze_failed"])
+            return
+        try:
+            evidence_saved = save_evidence(new_store)
+        except Exception:
+            evidence_saved = False
+        if evidence_saved is False:
+            try:
+                save_records(literatures)
+            except Exception:
+                pass
+            try:
+                save_evidence(evidence_store)
+            except Exception:
+                pass
+            if staged_source:
+                try:
+                    os.remove(staged_source)
+                except OSError:
+                    pass
+            st.warning(labels["reanalyze_failed"])
+            return
         literature.update(updated)
-        save_records(literatures)
-        save_evidence(new_store)
         st.success(labels["reanalyze_success"])
         st.rerun()

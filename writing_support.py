@@ -8,9 +8,57 @@ from structured_output_support import parse_first_json_value
 class LLMOutputError(RuntimeError):
     """Raised when an LLM response is empty or contains a known failure message."""
 
-    def __init__(self, message, *, error_code=None):
+    def __init__(self, message, *, error_code=None, http_status=None, finish_reason=None, completion_tokens=None, reasoning_tokens=None):
         super().__init__(message)
         self.error_code = error_code
+        self.http_status = http_status if isinstance(http_status, int) and not isinstance(http_status, bool) else None
+        self.finish_reason = finish_reason if isinstance(finish_reason, str) else None
+        self.completion_tokens = completion_tokens if isinstance(completion_tokens, int) and not isinstance(completion_tokens, bool) else None
+        self.reasoning_tokens = reasoning_tokens if isinstance(reasoning_tokens, int) and not isinstance(reasoning_tokens, bool) else None
+
+
+def is_transient_provider_failure(error):
+    """Whether a provider interruption should stop the rest of a chapter batch."""
+    if isinstance(error, dict):
+        code = error.get("error_code") or error.get("code")
+        status = error.get("http_status")
+    else:
+        code = getattr(error, "error_code", None)
+        status = getattr(error, "http_status", None)
+    return code in {
+        "rate_limited", "timeout", "connection_error", "server_error",
+        "provider_temporarily_unavailable", "insufficient_system_resource", "aborted",
+    } or status == 429 or (isinstance(status, int) and 500 <= status <= 599)
+
+
+def llm_error_diagnostic(error, locale="en"):
+    """Format only whitelisted response metadata; never include provider text."""
+    parts = []
+    error_code = getattr(error, "error_code", None)
+    if error_code in {
+        "rate_limited", "timeout", "connection_error", "server_error",
+        "authentication_failed", "insufficient_balance", "model_not_available",
+        "invalid_request", "provider_error", "truncated_output", "empty_content",
+        "content_filtered", "incomplete_response", "provider_temporarily_unavailable",
+        "insufficient_system_resource", "aborted",
+    }:
+        parts.append(f"error_code={error_code}")
+    status = getattr(error, "http_status", None)
+    finish_reason = getattr(error, "finish_reason", None)
+    completion_tokens = getattr(error, "completion_tokens", None)
+    reasoning_tokens = getattr(error, "reasoning_tokens", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        parts.append(f"HTTP {status}")
+    if isinstance(finish_reason, str) and finish_reason in {"stop", "length", "content_filter", "aborted", "insufficient_system_resource"}:
+        parts.append(f"finish_reason={finish_reason}")
+    if isinstance(completion_tokens, int) and not isinstance(completion_tokens, bool):
+        parts.append(f"completion_tokens={completion_tokens}")
+    if isinstance(reasoning_tokens, int) and not isinstance(reasoning_tokens, bool):
+        parts.append(f"reasoning_tokens={reasoning_tokens}")
+    if not parts:
+        return ""
+    prefix = "安全响应诊断：" if str(locale).startswith("zh") else "Safe response diagnostics: "
+    return prefix + ", ".join(parts)
 
 
 _LLM_FAILURE_MARKERS = (
@@ -98,7 +146,9 @@ def llm_error_message(locale="en", error=None):
             return "模型配置不可用。请检查当前模型、API 密钥、账户额度和服务地址后重试。"
         if code == "invalid_request":
             return "AI 服务拒绝了本次请求参数。请检查所选模型与服务接口的兼容性后重试。"
-        if code in {"rate_limited", "timeout", "connection_error", "server_error"}:
+        if code in {"rate_limited", "timeout", "connection_error", "server_error", "provider_temporarily_unavailable", "insufficient_system_resource", "aborted"}:
+            if code in {"provider_temporarily_unavailable", "insufficient_system_resource", "aborted"}:
+                return "AI 服务暂时中断，本次未保存正文；请稍后重试。"
             return "AI 服务暂时繁忙或请求受限，系统已有限重试；请稍后重试。"
         if code == "truncated_output":
             return "模型输出达到长度限制，本次未保存不完整正文。请稍后重试或调整本章篇幅。"
@@ -115,7 +165,9 @@ def llm_error_message(locale="en", error=None):
         return "The model configuration is unavailable. Check the selected model, API key, account balance, and service endpoint."
     if code == "invalid_request":
         return "The AI service rejected the request parameters. Check compatibility between the selected model and service endpoint, then retry."
-    if code in {"rate_limited", "timeout", "connection_error", "server_error"}:
+    if code in {"rate_limited", "timeout", "connection_error", "server_error", "provider_temporarily_unavailable", "insufficient_system_resource", "aborted"}:
+        if code in {"provider_temporarily_unavailable", "insufficient_system_resource", "aborted"}:
+            return "The AI service interrupted the request. No chapter text was saved; please retry later."
         return "The AI service is temporarily busy or rate limited. The request was retried; please try again later."
     if code == "truncated_output":
         return "The model output reached its length limit. The incomplete chapter was not saved. Please retry later or adjust the chapter length."

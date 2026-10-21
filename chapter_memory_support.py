@@ -32,6 +32,28 @@ _ALLOWED_MEMORY_TYPES = {
 class MemoryBuildError(RuntimeError):
     """Raised when a complete, source-checked memory cannot be built."""
 
+    def __init__(self, message, *, error_code="memory_update_failed", stage="extraction", chunk_index=None, chunks_total=None):
+        super().__init__(message)
+        self.error_code = error_code if isinstance(error_code, str) else "memory_update_failed"
+        self.stage = stage if isinstance(stage, str) else "extraction"
+        self.chunk_index = chunk_index if isinstance(chunk_index, int) and not isinstance(chunk_index, bool) else None
+        self.chunks_total = chunks_total if isinstance(chunks_total, int) and not isinstance(chunks_total, bool) else None
+
+    def safe_details(self):
+        category = (
+            "provider_temporarily_unavailable" if self.error_code in {"rate_limited", "timeout", "connection_error", "server_error", "provider_temporarily_unavailable"}
+            else "truncated_output" if self.error_code == "truncated_output"
+            else "source_anchor_validation_failed" if self.error_code == "source_anchor_validation_failed"
+            else "persistence_failed" if self.error_code == "persistence_failure"
+            else "json_schema_invalid" if self.error_code in {"invalid_json", "invalid_schema", "invalid_structured_output"}
+            else "provider_configuration_error" if self.error_code in {"authentication_failed", "insufficient_balance", "model_not_available", "invalid_request"}
+            else "other"
+        )
+        details = {"code": self.error_code[:80], "category": category, "stage": self.stage[:80]}
+        if self.chunk_index is not None and self.chunks_total is not None:
+            details.update({"chunk_index": self.chunk_index, "chunks_total": self.chunks_total})
+        return details
+
 
 class ContextBudgetError(ValueError):
     """Raised when the required prompt sections cannot fit the local budget."""
@@ -82,7 +104,7 @@ def _chunk_prompt(chunk, part_number, total_parts, locale, correction=False):
     )
 
 
-def _response_content(llm_call, prompt, *, max_tokens=MEMORY_CHUNK_TOKEN_BUDGET, sleep=None):
+def _response_content(llm_call, prompt, *, max_tokens=MEMORY_CHUNK_TOKEN_BUDGET, sleep=None, chunk_index=None, chunks_total=None):
     """Make a bounded metadata-aware call without exposing provider response details."""
     sleep = sleep or time.sleep
     for attempt in range(MAX_STRUCTURED_ATTEMPTS):
@@ -97,11 +119,12 @@ def _response_content(llm_call, prompt, *, max_tokens=MEMORY_CHUNK_TOKEN_BUDGET,
         except Exception as exc:
             code = getattr(exc, "error_code", None)
             if code not in _TRANSIENT_ERRORS or attempt + 1 >= MAX_STRUCTURED_ATTEMPTS:
-                raise MemoryBuildError("The configured model could not complete memory extraction.") from None
+                safe_code = code if code in {"rate_limited", "timeout", "connection_error", "server_error", "authentication_failed", "insufficient_balance", "model_not_available", "invalid_request"} else "provider_error"
+                raise MemoryBuildError("The configured model could not complete memory extraction.", error_code=safe_code, stage="chunk_extraction", chunk_index=chunk_index, chunks_total=chunks_total) from None
             sleep(1 if attempt == 0 else 2)
             continue
         if not isinstance(result, dict):
-            raise MemoryBuildError("The structured memory response was unavailable.")
+            raise MemoryBuildError("The structured memory response was unavailable.", error_code="invalid_structured_output", stage="chunk_extraction", chunk_index=chunk_index, chunks_total=chunks_total)
         error_code = result.get("error_code")
         if error_code == "truncated_output" or result.get("finish_reason") == "length":
             return None, "length"
@@ -111,17 +134,19 @@ def _response_content(llm_call, prompt, *, max_tokens=MEMORY_CHUNK_TOKEN_BUDGET,
             if error_code in _TRANSIENT_ERRORS and attempt + 1 < MAX_STRUCTURED_ATTEMPTS:
                 sleep(1 if attempt == 0 else 2)
                 continue
-            raise MemoryBuildError("The configured model could not complete memory extraction.")
+            safe_code = error_code if error_code in {"rate_limited", "timeout", "connection_error", "server_error", "authentication_failed", "insufficient_balance", "model_not_available", "invalid_request"} else "provider_error"
+            raise MemoryBuildError("The configured model could not complete memory extraction.", error_code=safe_code, stage="chunk_extraction", chunk_index=chunk_index, chunks_total=chunks_total)
         finish_reason = result.get("finish_reason")
         if finish_reason in _TRANSIENT_FINISH_REASONS:
             if attempt + 1 < MAX_STRUCTURED_ATTEMPTS:
                 sleep(1 if attempt == 0 else 2)
                 continue
-            raise MemoryBuildError("The model response was interrupted repeatedly.")
+            raise MemoryBuildError("The model response was interrupted repeatedly.", error_code="provider_temporarily_unavailable", stage="chunk_extraction", chunk_index=chunk_index, chunks_total=chunks_total)
         if finish_reason == "length":
             return None, "length"
         if finish_reason != "stop":
-            raise MemoryBuildError("The memory response was incomplete or filtered.")
+            code = "content_filtered" if finish_reason == "content_filter" else "incomplete_response"
+            raise MemoryBuildError("The memory response was incomplete or filtered.", error_code=code, stage="chunk_extraction", chunk_index=chunk_index, chunks_total=chunks_total)
         content = result.get("content")
         if not isinstance(content, str) or not content.strip():
             return None, "empty"
@@ -129,24 +154,25 @@ def _response_content(llm_call, prompt, *, max_tokens=MEMORY_CHUNK_TOKEN_BUDGET,
         if not isinstance(value, dict):
             return None, "invalid"
         return value, "ok"
-    raise MemoryBuildError("The configured model could not complete memory extraction.")
+    raise MemoryBuildError("The configured model could not complete memory extraction.", error_code="provider_error", stage="chunk_extraction", chunk_index=chunk_index, chunks_total=chunks_total)
 
 
-def _normalize_chunk(value, source_chunk, global_offset):
+def _normalize_chunk(value, source_chunk, global_offset, *, chunk_index=None, chunks_total=None):
+    error_fields = {"error_code": "invalid_schema", "stage": "schema_validation", "chunk_index": chunk_index, "chunks_total": chunks_total}
     if not isinstance(value, dict) or set(value) - {"chunk_status", "summary", "items"}:
-        raise MemoryBuildError("The structured memory shape was invalid.")
+        raise MemoryBuildError("The structured memory shape was invalid.", **error_fields)
     status = value.get("chunk_status")
     summary = value.get("summary")
     raw_items = value.get("items")
     if not isinstance(status, str) or status not in {"content", "no_relevant_content"}:
-        raise MemoryBuildError("The structured memory status was invalid.")
+        raise MemoryBuildError("The structured memory status was invalid.", **error_fields)
     if not isinstance(summary, str) or not isinstance(raw_items, list):
-        raise MemoryBuildError("The structured memory fields were invalid.")
+        raise MemoryBuildError("The structured memory fields were invalid.", **error_fields)
     if len(summary) > MAX_CHUNK_SUMMARY_CHARS:
-        raise MemoryBuildError("The structured memory summary was too long.")
+        raise MemoryBuildError("The structured memory summary was too long.", **error_fields)
     if status == "no_relevant_content":
         if summary.strip() or raw_items:
-            raise MemoryBuildError("An empty memory chunk contained unexpected content.")
+            raise MemoryBuildError("An empty memory chunk contained unexpected content.", **error_fields)
         return {
             "status": status,
             "summary": "",
@@ -156,24 +182,26 @@ def _normalize_chunk(value, source_chunk, global_offset):
         }
 
     items = []
+    anchor_failed = False
     for raw in raw_items:
         if not isinstance(raw, dict) or set(raw) - {"memory_type", "statement", "source_quote"}:
-            raise MemoryBuildError("A structured memory item had an invalid shape.")
+            raise MemoryBuildError("A structured memory item had an invalid shape.", **error_fields)
         memory_type = raw.get("memory_type")
         statement = raw.get("statement")
         quote = raw.get("source_quote")
         if not isinstance(memory_type, str) or memory_type not in _ALLOWED_MEMORY_TYPES:
-            raise MemoryBuildError("A structured memory item used an unsupported type.")
+            raise MemoryBuildError("A structured memory item used an unsupported type.", **error_fields)
         if not isinstance(statement, str) or not statement.strip():
-            raise MemoryBuildError("A structured memory item had no statement.")
+            raise MemoryBuildError("A structured memory item had no statement.", **error_fields)
         if len(statement) > MAX_ITEM_STATEMENT_CHARS:
-            raise MemoryBuildError("A structured memory statement was too long.")
+            raise MemoryBuildError("A structured memory statement was too long.", **error_fields)
         if not isinstance(quote, str) or not quote.strip():
             continue
         if len(quote) > MAX_SOURCE_QUOTE_CHARS:
-            raise MemoryBuildError("A structured memory source quote was too long.")
+            raise MemoryBuildError("A structured memory source quote was too long.", **error_fields)
         local_start = source_chunk.find(quote)
         if local_start < 0:
+            anchor_failed = True
             continue
         items.append({
             "memory_type": memory_type,
@@ -186,7 +214,9 @@ def _normalize_chunk(value, source_chunk, global_offset):
         })
     summary = summary.strip()
     if not summary and not items:
-        raise MemoryBuildError("The chunk contained no verifiable academic memory.")
+        if anchor_failed:
+            raise MemoryBuildError("Memory quotes did not match the source chunk.", error_code="source_anchor_validation_failed", stage="source_validation", chunk_index=chunk_index, chunks_total=chunks_total)
+        raise MemoryBuildError("The chunk contained no verifiable academic memory.", error_code="no_academic_content", stage="schema_validation", chunk_index=chunk_index, chunks_total=chunks_total)
     return {
         "status": status,
         "summary": summary,
@@ -198,7 +228,7 @@ def _normalize_chunk(value, source_chunk, global_offset):
 
 def _split_source_segment(source, source_offset, part_number, total_parts, locale, llm_call, depth):
     if depth >= MAX_LENGTH_SPLITS or len(source) < 2:
-        raise MemoryBuildError("The structured memory response remained truncated.")
+        raise MemoryBuildError("The structured memory response remained truncated.", error_code="truncated_output", stage="chunk_extraction", chunk_index=part_number, chunks_total=total_parts)
     middle = len(source) // 2
     sentence_candidates = [
         match.end() for match in re.finditer(r"(?<=[.!?。！？])\s+", source)
@@ -218,7 +248,7 @@ def _split_source_segment(source, source_offset, part_number, total_parts, local
 
 
 def _extract_source_segment(source, source_offset, part_number, total_parts, locale, llm_call, depth=0):
-    value, state = _response_content(llm_call, _chunk_prompt(source, part_number, total_parts, locale))
+    value, state = _response_content(llm_call, _chunk_prompt(source, part_number, total_parts, locale), chunk_index=part_number, chunks_total=total_parts)
     if state == "length":
         return _split_source_segment(source, source_offset, part_number, total_parts, locale, llm_call, depth)
 
@@ -226,22 +256,25 @@ def _extract_source_segment(source, source_offset, part_number, total_parts, loc
     needs_correction = state in {"invalid", "empty"}
     if not needs_correction:
         try:
-            normalized = _normalize_chunk(value, source, source_offset)
+            normalized = _normalize_chunk(value, source, source_offset, chunk_index=part_number, chunks_total=total_parts)
         except MemoryBuildError:
             needs_correction = True
     if needs_correction:
         value, state = _response_content(
             llm_call,
             _chunk_prompt(source, part_number, total_parts, locale, correction=True),
+            chunk_index=part_number,
+            chunks_total=total_parts,
         )
         if state == "length":
             return _split_source_segment(source, source_offset, part_number, total_parts, locale, llm_call, depth)
         if state != "ok":
-            raise MemoryBuildError("The corrected memory response was invalid.")
+            code = "empty_content" if state == "empty" else "invalid_json"
+            raise MemoryBuildError("The corrected memory response was invalid.", error_code=code, stage="chunk_extraction", chunk_index=part_number, chunks_total=total_parts)
         try:
-            normalized = _normalize_chunk(value, source, source_offset)
-        except MemoryBuildError:
-            raise MemoryBuildError("The corrected memory response was invalid.") from None
+            normalized = _normalize_chunk(value, source, source_offset, chunk_index=part_number, chunks_total=total_parts)
+        except MemoryBuildError as exc:
+            raise MemoryBuildError("The corrected memory response was invalid.", error_code=exc.error_code, stage=exc.stage, chunk_index=part_number, chunks_total=total_parts) from None
     normalized["chunk_index"] = part_number
     return [normalized]
 
@@ -254,7 +287,7 @@ def _chunk_spans(text, max_chars):
         spans.append((chunk, offset))
         offset += len(chunk)
     if "".join(chunk for chunk, _ in spans) != text:
-        raise MemoryBuildError("The chapter could not be divided without losing source text.")
+        raise MemoryBuildError("The chapter could not be divided without losing source text.", error_code="source_partition_failed", stage="chunking")
     return spans
 
 
@@ -293,7 +326,7 @@ def build_chapter_memory_v2(chapter_text, llm_call, locale="en", max_chars=MEMOR
             items.append(item)
     items.sort(key=lambda item: (item["source_start"], item["source_end"], item["memory_type"]))
     if not summaries and not items:
-        raise MemoryBuildError("No useful academic continuity information was found in the chapter.")
+        raise MemoryBuildError("No useful academic continuity information was found in the chapter.", error_code="no_academic_content", stage="synthesis")
     if not summaries:
         summaries = [item["statement"] for item in items[:30]]
     summary = "\n".join(summaries)
@@ -342,8 +375,15 @@ def save_draft_and_maybe_refresh_memory(
         return result
     try:
         refresh_chapter_memory_snapshot(data_dir, chapter_id, draft_text, llm_call, locale=locale, max_chars=max_chars)
+    except MemoryBuildError as exc:
+        result["memory_error"] = "memory_update_failed"
+        result["memory_pending"] = True
+        result["memory_failure"] = exc.safe_details()
+        return result
     except Exception:
         result["memory_error"] = "memory_update_failed"
+        result["memory_pending"] = True
+        result["memory_failure"] = {"code": "memory_update_failed", "stage": "other"}
         return result
     result["memory_updated"] = True
     return result
@@ -377,7 +417,10 @@ def refresh_chapter_memory_snapshot(data_dir, chapter_id, draft_text, llm_call, 
             and isinstance(quote, str) and draft_text[start:end] == quote
         ):
             item["confirmed_for_writing"] = True
-    save_chapter_memory(data_dir, chapter_id, draft_text, memory)
+    try:
+        save_chapter_memory(data_dir, chapter_id, draft_text, memory)
+    except Exception:
+        raise MemoryBuildError("The complete memory snapshot could not be persisted.", error_code="persistence_failure", stage="persistence") from None
     return {"updated": True, "reused": False, "memory": memory}
 
 

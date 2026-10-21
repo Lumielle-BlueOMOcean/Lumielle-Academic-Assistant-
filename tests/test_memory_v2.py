@@ -602,6 +602,9 @@ class DraftLifecycleV2Tests(unittest.TestCase):
             state = read_chapter_memory(data_dir, "c1", new)
         self.assertTrue(result["saved"])
         self.assertEqual(result["memory_error"], "memory_update_failed")
+        self.assertTrue(result["memory_pending"])
+        self.assertEqual(result["memory_failure"]["category"], "provider_configuration_error")
+        self.assertEqual(result["memory_failure"]["stage"], "chunk_extraction")
         self.assertEqual(state["status"], "stale")
         self.assertEqual(state["narrative_summary"], "Previous complete snapshot.")
         self.assertEqual(len(calls), 2)
@@ -641,6 +644,7 @@ class DraftLifecycleV2Tests(unittest.TestCase):
                 module_code = compile(ast.Module(body=[node], type_ignores=[]), app_name, "exec")
                 function_code = next(item for item in module_code.co_consts if isinstance(item, types.CodeType))
                 namespace = {
+                    "st": types.SimpleNamespace(session_state={}),
                     "load_json_file": load_json,
                     "save_json_file": save_json,
                     "DATA_DIR": data_dir,
@@ -690,6 +694,23 @@ class ChapterConsistencyV2Tests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "needs_review")
         self.assertFalse(result["completed"])
+
+    def test_semantic_review_preserves_only_safe_provider_metadata(self):
+        result = review_semantic_consistency(
+            "Candidate", {},
+            lambda prompt, **kwargs: {
+                "content": "PRIVATE_PROVIDER_BODY", "finish_reason": None,
+                "error_code": "rate_limited", "http_status": 429,
+                "completion_tokens": 12, "reasoning_tokens": 7,
+                "api_key": "PRIVATE_KEY_SENTINEL",
+            },
+        )
+        self.assertEqual(result["failure_code"], "rate_limited")
+        self.assertEqual(result["http_status"], 429)
+        self.assertEqual(result["completion_tokens"], 12)
+        self.assertEqual(result["reasoning_tokens"], 7)
+        self.assertNotIn("PRIVATE_PROVIDER_BODY", str(result))
+        self.assertNotIn("PRIVATE_KEY_SENTINEL", str(result))
 
 
 class GenerationReviewWiringV2Tests(unittest.TestCase):

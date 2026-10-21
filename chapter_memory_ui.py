@@ -2,6 +2,7 @@
 
 from chapter_memory_store import read_chapter_memory, set_memory_item_confirmation
 from chapter_memory_support import MemoryBuildError, _leaf_nodes, refresh_chapter_memory_snapshot, structured_memory_llm_call
+from chapter_consistency import classify_pending_review_reason
 
 
 _TEXT = {
@@ -27,6 +28,8 @@ _TEXT = {
         "batch_done": "Memory rebuild finished: {ok} updated, {failed} failed, {skipped} already current.",
         "progress": "Rebuilding chapter {current}/{total}: {title}",
         "failed": "Memory update did not finish. The saved draft and previous memory were preserved; try again later.",
+        "pending": "Memory is waiting to be rebuilt for this saved chapter.",
+        "failure_detail": "Safe diagnostic: {category} ({code}) at {stage}{chunk}.",
         "empty": "The saved chapter has no text to analyze.",
         "updated": "Chapter memory updated.",
         "reused": "This saved chapter already has current memory.",
@@ -63,6 +66,8 @@ _TEXT = {
         "batch_done": "记忆重建完成：更新 {ok} 章，失败 {failed} 章，已有记忆 {skipped} 章。",
         "progress": "正在重建第 {current}/{total} 章：{title}",
         "failed": "记忆更新未完成。已保留已保存正文和此前记忆，请稍后重试。",
+        "pending": "本章正文已保存，记忆待重建。可使用下方按钮单独重新提取。",
+        "failure_detail": "安全诊断：{stage} 阶段，类别 {category}，状态 {code}{chunk}。",
         "empty": "当前没有可分析的已保存正文。",
         "updated": "本章记忆已更新。",
         "reused": "已保存正文已有对应版本的记忆。",
@@ -84,6 +89,27 @@ _REVIEW_TEXT = {
         "title": "Review generated chapter candidates",
         "pass_warning": "This candidate needs your review before it can replace the saved chapter.",
         "review_unavailable": "The consistency review did not complete. Inspect the candidate before saving.",
+        "reason_labels": {
+            "deterministic_reference_error": "Deterministic citation error",
+            "deterministic_fact_conflict": "Confirmed-fact conflict",
+            "review_warning": "Review completed with a warning; manual review is required",
+            "review_invalid_json": "Review returned invalid JSON",
+            "review_empty_output": "Review returned empty output",
+            "review_truncated": "Review output was truncated",
+            "review_timeout": "Review timed out",
+            "review_rate_limited": "Review was rate limited",
+            "review_connection_error": "Review connection failed",
+            "review_server_error": "Review service error",
+            "review_provider_unavailable": "Review provider was temporarily unavailable",
+            "review_context_budget": "Review context exceeded the safe budget",
+            "review_content_filtered": "Review was interrupted by content filtering",
+            "review_provider_error": "Review provider failed",
+            "review_incomplete": "Review did not complete",
+            "review_completed": "Review completed; manual confirmation is required",
+        },
+        "rereview": "Re-review this candidate only",
+        "rereview_done": "Review completed. This candidate is still awaiting your explicit save decision.",
+        "rereview_incomplete": "Review did not complete; the candidate and previous draft are unchanged.",
         "issues": "Possible issue",
         "source": "Related context",
         "save": "Save this candidate",
@@ -99,6 +125,27 @@ _REVIEW_TEXT = {
         "title": "审阅生成候选正文",
         "pass_warning": "候选正文需要你审阅后才能替换已保存章节。",
         "review_unavailable": "一致性检查未完成，请检查候选正文后再决定是否保存。",
+        "reason_labels": {
+            "deterministic_reference_error": "确定性引用错误",
+            "deterministic_fact_conflict": "与已确认事实存在冲突",
+            "review_warning": "审阅已完成但有警告，需要人工核对",
+            "review_invalid_json": "审阅返回的 JSON 格式无效",
+            "review_empty_output": "审阅未返回内容",
+            "review_truncated": "审阅输出被截断",
+            "review_timeout": "审阅请求超时",
+            "review_rate_limited": "审阅请求受到频率限制",
+            "review_connection_error": "审阅连接失败",
+            "review_server_error": "审阅服务异常",
+            "review_provider_unavailable": "审阅服务暂时不可用",
+            "review_context_budget": "审阅上下文超过安全长度",
+            "review_content_filtered": "审阅被内容过滤中断",
+            "review_provider_error": "审阅服务调用失败",
+            "review_incomplete": "审阅未完成",
+            "review_completed": "审阅已完成，仍需你确认候选正文",
+        },
+        "rereview": "仅重新审阅本章候选",
+        "rereview_done": "审阅已完成。候选正文仍等待你明确决定是否保存。",
+        "rereview_incomplete": "审阅仍未完成；候选正文和此前正文均未改变。",
         "issues": "可能需要核对",
         "source": "相关内容来源",
         "save": "保存这份候选正文",
@@ -164,6 +211,18 @@ def render_chapter_memory_panel(
     state = read_chapter_memory(data_dir, str(chapter_id), draft_text, legacy_summary=legacy_summary)
     st.markdown(f"### 🧠 {text['title']}")
     st.caption(text["status"].get(state["status"], text["status"]["invalid"]))
+    memory_failure = st.session_state.get(f"chapter_memory_failure_{chapter_id}")
+    if isinstance(memory_failure, dict):
+        st.warning(text["pending"])
+        chunk_index = memory_failure.get("chunk_index")
+        chunks_total = memory_failure.get("chunks_total")
+        chunk = f" ({chunk_index}/{chunks_total})" if isinstance(chunk_index, int) and isinstance(chunks_total, int) else ""
+        st.caption(text["failure_detail"].format(
+            code=str(memory_failure.get("code", "memory_update_failed"))[:80],
+            category=str(memory_failure.get("category", "other"))[:80],
+            stage=str(memory_failure.get("stage", "extraction"))[:80],
+            chunk=chunk,
+        ))
     if state["status"] == "legacy_unverified" and state.get("legacy_summary"):
         st.caption(f"{text['legacy']}: {state['legacy_summary']}")
     if state["status"] == "current":
@@ -193,11 +252,19 @@ def render_chapter_memory_panel(
                     data_dir, str(chapter_id), draft_text,
                     structured_memory_llm_call(llm_call, locale), locale=locale,
                 )
-        except MemoryBuildError:
+        except MemoryBuildError as exc:
+            st.session_state[f"chapter_memory_failure_{chapter_id}"] = exc.safe_details()
             st.warning(text["failed"])
+            st.caption(text["failure_detail"].format(
+                code=exc.error_code, stage=exc.stage,
+                category=exc.safe_details().get("category", "other"),
+                chunk=f" ({exc.chunk_index}/{exc.chunks_total})" if exc.chunk_index and exc.chunks_total else "",
+            ))
         except Exception:
+            st.session_state[f"chapter_memory_failure_{chapter_id}"] = {"code": "memory_update_failed", "stage": "other"}
             st.warning(text["failed"])
         else:
+            st.session_state.pop(f"chapter_memory_failure_{chapter_id}", None)
             st.success(text["reused"] if result["reused"] else text["updated"])
 
     render_context_manifest_summary(st, locale=locale)
@@ -234,13 +301,14 @@ def render_chapter_memory_panel(
                     except Exception:
                         failed += 1
                     else:
+                        st.session_state.pop(f"chapter_memory_failure_{nid}", None)
                         ok += 1
                     progress.progress(index / total if total else 1.0)
                 summary = text["batch_done"].format(ok=ok, failed=failed, skipped=skipped)
                 status.warning(summary) if failed else status.success(summary)
 
 
-def render_pending_candidate_reviews(st, on_save, locale="en"):
+def render_pending_candidate_reviews(st, on_save, locale="en", on_re_review=None):
     """Present non-passing generated candidates for an explicit keep-or-save choice."""
     language = "zh" if locale == "zh" else "en"
     text = _REVIEW_TEXT[language]
@@ -252,10 +320,28 @@ def render_pending_candidate_reviews(st, on_save, locale="en"):
         title = candidate.get("title", str(chapter_id))
         with st.expander(title, expanded=True):
             review = candidate.get("consistency", {})
+            if not review.get("completed") and on_re_review is not None:
+                if st.button(text["rereview"], key=f"pending_candidate_rereview_{chapter_id}"):
+                    try:
+                        updated_review = on_re_review(chapter_id, candidate)
+                    except Exception:
+                        updated_review = {"status": "needs_review", "completed": False, "hard_conflicts": [], "issues": [], "failure_code": "provider_error"}
+                    candidate["consistency"] = updated_review
+                    review = updated_review
+                    if updated_review.get("completed"):
+                        st.success(text["rereview_done"])
+                    else:
+                        st.warning(text["rereview_incomplete"])
+            reason_code = classify_pending_review_reason(review)
+            reason_label = text["reason_labels"].get(reason_code, text["reason_labels"]["review_incomplete"])
             if review.get("completed"):
                 st.warning(text["pass_warning"])
             else:
                 st.warning(text["review_unavailable"])
+            http_status = review.get("http_status")
+            if isinstance(http_status, int) and not isinstance(http_status, bool) and 100 <= http_status <= 599:
+                reason_label += f" (HTTP {http_status})"
+            st.caption(reason_label)
             for issue in review.get("hard_conflicts", []) + review.get("issues", []):
                 st.markdown(f"**{text['issues']}:** {issue.get('reason', issue.get('code', ''))}")
                 if issue.get("source"):

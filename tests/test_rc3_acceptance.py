@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from chapter_consistency import review_semantic_consistency
+from chapter_consistency import classify_pending_review_reason, review_semantic_consistency
 import chapter_memory_store
 from literature_support import delete_literature_record
 
@@ -285,6 +285,7 @@ class BilingualWritingPageAcceptanceTests(unittest.TestCase):
             "        requests.append({'kind': 'review', 'prompt': prompt})\n"
             "        mode = st.session_state.get('_rc3_review_mode', 'pass')\n"
             "        if mode == 'invalid': return {'content': 'not json', 'finish_reason': 'stop', 'error_code': None}\n"
+            "        if mode == 'rate_limited': return {'content': '', 'finish_reason': None, 'error_code': 'rate_limited', 'http_status': 429}\n"
             "        status = 'needs_review' if mode == 'needs_review' else 'pass'\n"
             "        return {'content': json.dumps({'status': status, 'issues': []}), 'finish_reason': 'stop', 'error_code': None}\n"
             "    if is_memory:\n"
@@ -299,11 +300,12 @@ class BilingualWritingPageAcceptanceTests(unittest.TestCase):
             "    index = int(st.session_state.get('_rc3_generation_index', 0))\n"
             "    st.session_state['_rc3_generation_index'] = index + 1\n"
             "    mode = modes[index] if index < len(modes) else st.session_state.get('_rc3_generation_mode', 'normal')\n"
-            "    title = 'Chapter Two' if ('[CURRENT CHAPTER]\\nChapter Two' in prompt or '【当前章节】\\n《Chapter Two》' in prompt) else 'Chapter One'\n"
+            "    title = 'Chapter Three' if ('[CURRENT CHAPTER]\\nChapter Three' in prompt or '【当前章节】\\n《Chapter Three》' in prompt) else ('Chapter Two' if ('[CURRENT CHAPTER]\\nChapter Two' in prompt or '【当前章节】\\n《Chapter Two》' in prompt) else 'Chapter One')\n"
             "    requests.append({'kind': 'generation', 'prompt': prompt, 'title': title})\n"
             "    if mode == 'length': return {'content': 'TRUNCATED_BODY_SENTINEL', 'finish_reason': 'length', 'error_code': 'truncated_output'}\n"
             "    if mode == 'empty': return {'content': '', 'finish_reason': 'stop', 'error_code': 'empty_content'}\n"
             "    if mode == 'provider': return {'content': '', 'finish_reason': None, 'error_code': 'authentication_failed'}\n"
+            "    if mode == 'rate_limited': return {'content': '', 'finish_reason': None, 'error_code': 'rate_limited', 'http_status': 429}\n"
             "    body = f'NEW_{title.upper().replace(\" \", \"_\")}_BODY_SENTINEL. Synthetic generated chapter has a verified method.'\n"
             "    return {'content': body, 'finish_reason': 'stop', 'error_code': None}\n"
             "app.dispatch_llm_call = _fake_dispatch\n"
@@ -518,6 +520,208 @@ class BilingualWritingPageAcceptanceTests(unittest.TestCase):
                 page.run()
                 editor = next(item for item in page.text_area if item.key.startswith("draft_chapter-1_v"))
                 self.assertIn("NEW_CHAPTER_ONE_BODY_SENTINEL", editor.value)
+
+    def test_scenario_6_bilingual_re_review_reuses_candidate_without_regenerating(self):
+        for locale in ("en", "zh"):
+            with self.subTest(locale=locale):
+                temporary, root, page = self._make_page(locale)
+                self.addCleanup(temporary.cleanup)
+                page.session_state["_rc3_review_mode"] = "invalid"
+                page.run()
+                self._click(page, "gen_chapter-1")
+                before = list(page.session_state["_rc3_llm_requests"])
+                generation_count = sum(row["kind"] == "generation" for row in before)
+                self.assertEqual(generation_count, 1)
+                page.session_state["_rc3_review_mode"] = "pass"
+                page.run()
+                self._click(page, "pending_candidate_rereview_chapter-1")
+                self.assertFalse(page.exception)
+                after = page.session_state["_rc3_llm_requests"]
+                self.assertEqual(sum(row["kind"] == "generation" for row in after), 1)
+                self.assertGreater(sum(row["kind"] == "review" for row in after), sum(row["kind"] == "review" for row in before))
+                self.assertEqual(self._json(root, "drafts.json")["chapter-1"], "OLD_C1_BODY")
+                self.assertIn("chapter-1", page.session_state["pending_chapter_candidates"])
+                self.assertTrue(page.session_state["pending_chapter_candidates"]["chapter-1"]["consistency"]["completed"])
+
+    def test_bilingual_re_review_failure_updates_reason_and_http_status_without_saving(self):
+        for locale in ("en", "zh"):
+            with self.subTest(locale=locale):
+                temporary, root, page = self._make_page(locale)
+                self.addCleanup(temporary.cleanup)
+                page.session_state["_rc3_review_mode"] = "invalid"
+                page.run()
+                self._click(page, "gen_chapter-1")
+                page.session_state["_rc3_review_mode"] = "rate_limited"
+                page.run()
+                self._click(page, "pending_candidate_rereview_chapter-1")
+                candidate = page.session_state["pending_chapter_candidates"]["chapter-1"]
+                self.assertEqual(candidate["consistency"]["failure_code"], "rate_limited")
+                self.assertEqual(candidate["consistency"]["http_status"], 429)
+                self.assertEqual(self._json(root, "drafts.json")["chapter-1"], "OLD_C1_BODY")
+                output = "\n".join(item.value for item in (*page.warning, *page.caption))
+                self.assertIn("HTTP 429", output)
+
+    def test_scenario_7_bilingual_batch_stops_after_retried_transient_provider_failure(self):
+        for locale in ("en", "zh"):
+            with self.subTest(locale=locale):
+                temporary, root, page = self._make_page(locale)
+                self.addCleanup(temporary.cleanup)
+                tree = self._json(root, "logic_tree.json")
+                tree[0]["children"].append({"id": "chapter-3", "title": "Chapter Three", "desc": "synthetic third chapter", "word_count": 0, "references": []})
+                (root / "data" / "logic_tree.json").write_text(json.dumps(tree), encoding="utf-8")
+                drafts = self._json(root, "drafts.json")
+                drafts["chapter-3"] = "OLD_C3_BODY"
+                (root / "data" / "drafts.json").write_text(json.dumps(drafts), encoding="utf-8")
+                references = self._json(root, "draft_reference_maps.json")
+                references["chapter-3"] = []
+                (root / "data" / "draft_reference_maps.json").write_text(json.dumps(references), encoding="utf-8")
+                page.session_state["bchk_text_chapter-1"] = True
+                page.session_state["bchk_text_chapter-2"] = True
+                page.session_state["bchk_text_chapter-3"] = True
+                page.session_state["_rc3_generation_modes"] = ["normal", "rate_limited", "normal"]
+                page.run()
+                label = "📝 Batch Generate Drafts (chapter by chapter)" if locale == "en" else "📝 批量生成正文（逐章循环）"
+                next(button for button in page.button if button.label == label).click().run()
+                self.assertFalse(page.exception)
+                requests = page.session_state["_rc3_llm_requests"]
+                self.assertEqual(sum(row["kind"] == "generation" for row in requests), 2)
+                self.assertIn("NEW_CHAPTER_ONE_BODY_SENTINEL", self._json(root, "drafts.json")["chapter-1"])
+                self.assertEqual(self._json(root, "drafts.json")["chapter-2"], "OLD_C2_BODY")
+                self.assertEqual(self._json(root, "drafts.json")["chapter-3"], "OLD_C3_BODY")
+                summary = "\n".join(item.value for item in (*page.warning, *page.error))
+                self.assertIn("1 not attempted" if locale == "en" else "未尝试 1 章", summary)
+
+    def test_scenario_8_bilingual_memory_failure_can_be_rebuilt_without_changing_saved_draft(self):
+        for locale in ("en", "zh"):
+            with self.subTest(locale=locale):
+                temporary, root, page = self._make_page(locale)
+                self.addCleanup(temporary.cleanup)
+                page.session_state["_rc3_memory_mode"] = "invalid"
+                page.run()
+                self._click(page, "gen_chapter-1")
+                saved_body = self._json(root, "drafts.json")["chapter-1"]
+                self.assertIn("NEW_CHAPTER_ONE_BODY_SENTINEL", saved_body)
+                self.assertTrue(page.session_state.get("chapter_memory_failure_chapter-1"))
+                page.session_state["_rc3_memory_mode"] = "normal"
+                page.run()
+                self._click(page, "chapter_memory_rebuild_chapter-1")
+                self.assertFalse(page.exception)
+                self.assertEqual(self._json(root, "drafts.json")["chapter-1"], saved_body)
+                state = chapter_memory_store.read_chapter_memory(root / "data", "chapter-1", saved_body)
+                self.assertEqual(state["status"], "current")
+                self.assertNotIn("chapter_memory_failure_chapter-1", page.session_state)
+
+    def test_bilingual_batch_summary_groups_pending_review_reasons(self):
+        for locale in ("en", "zh"):
+            with self.subTest(locale=locale):
+                temporary, _root, page = self._make_page(locale)
+                self.addCleanup(temporary.cleanup)
+                page.session_state["bchk_text_chapter-1"] = True
+                page.session_state["_rc3_review_mode"] = "invalid"
+                page.run()
+                label = "📝 Batch Generate Drafts (chapter by chapter)" if locale == "en" else "📝 批量生成正文（逐章循环）"
+                next(button for button in page.button if button.label == label).click().run()
+                summary = "\n".join(item.value for item in (*page.success, *page.warning, *page.error))
+                self.assertIn("review JSON invalid 1" if locale == "en" else "审阅 JSON 无效 1 章", summary)
+
+    def test_bilingual_batch_stops_after_transient_review_failure_but_keeps_candidate_pending(self):
+        for locale in ("en", "zh"):
+            with self.subTest(locale=locale):
+                temporary, root, page = self._make_page(locale)
+                self.addCleanup(temporary.cleanup)
+                page.session_state["bchk_text_chapter-1"] = True
+                page.session_state["bchk_text_chapter-2"] = True
+                page.session_state["_rc3_review_mode"] = "rate_limited"
+                page.run()
+                label = "📝 Batch Generate Drafts (chapter by chapter)" if locale == "en" else "📝 批量生成正文（逐章循环）"
+                next(button for button in page.button if button.label == label).click().run()
+                self.assertFalse(page.exception)
+                requests = page.session_state["_rc3_llm_requests"]
+                self.assertEqual(sum(row["kind"] == "generation" for row in requests), 1)
+                self.assertIn("chapter-1", page.session_state["pending_chapter_candidates"])
+                self.assertEqual(self._json(root, "drafts.json")["chapter-1"], "OLD_C1_BODY")
+                self.assertEqual(self._json(root, "drafts.json")["chapter-2"], "OLD_C2_BODY")
+                summary = "\n".join(item.value for item in (*page.success, *page.warning, *page.error))
+                self.assertIn("1 not attempted" if locale == "en" else "未尝试 1 章", summary)
+
+
+class PendingReviewReasonTests(unittest.TestCase):
+    def test_review_failure_reasons_are_distinguished(self):
+        cases = (
+            ({"completed": True, "status": "needs_review", "hard_conflicts": [{"code": "invalid_citation"}]}, "deterministic_reference_error"),
+            ({"completed": True, "status": "warning", "hard_conflicts": [], "issues": []}, "review_warning"),
+            ({"completed": False, "failure_code": "invalid_structured_output"}, "review_invalid_json"),
+            ({"completed": False, "failure_code": "truncated_output"}, "review_truncated"),
+            ({"completed": False, "failure_code": "timeout"}, "review_timeout"),
+            ({"completed": False, "failure_code": "rate_limited"}, "review_rate_limited"),
+            ({"completed": False, "failure_code": "review_context_too_large"}, "review_context_budget"),
+        )
+        for review, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(classify_pending_review_reason(review), expected)
+
+
+class LiteratureSingleRecordReanalysisAcceptanceTests(unittest.TestCase):
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _page(self, temp_dir, fail=False):
+        from streamlit.testing.v1 import AppTest
+
+        root = Path(temp_dir)
+        script = root / "reanalysis_ui.py"
+        script.write_text(
+            "import json, sys\n"
+            f"sys.path.insert(0, {str(self.ROOT)!r})\n"
+            "import streamlit as st\n"
+            "from literature_ui_support import render_legacy_reanalysis\n"
+            "source = {'id':'existing-lit', 'title':'Existing synthetic study', 'source':'Imported PDF', 'link':'https://example.invalid/source', 'file_path':'', 'analysis_status':'schema_validation_failure', 'rating':2, 'category':'Methods', 'analysis':{'summary':'OLD_PROFILE_SENTINEL'}}\n"
+            "source['chapter_bindings'] = ['chapter-1']\n"
+            "record = dict(source)\n"
+            "records = [record]\n"
+            "evidence = {'existing-lit':[{'literature_id':'existing-lit','claim':'OLD_CLAIM_SENTINEL','evidence_text':'OLD_EVIDENCE_SENTINEL'}]}\n"
+            "st.session_state.setdefault('_records', records)\n"
+            "st.session_state.setdefault('_evidence', evidence)\n"
+            "def llm(prompt, **kwargs):\n"
+            + ("    raise TimeoutError('synthetic provider timeout')\n" if fail else
+               "    if '[DOCUMENT SYNTHESIS]' in prompt: return json.dumps({'rating':'4','category':'Methods','summary':'RECOVERED_PROFILE_SENTINEL'})\n"
+               "    return json.dumps({'results':'RECOVERED_RESULT_SENTINEL','claims':[{'claim':'Recovered claim','evidence_text':'EXACT_REUPLOAD_QUOTE'}]})\n")
+            + "def save_records(value): st.session_state['_records'] = value; return True\n"
+            "def save_evidence(value): st.session_state['_evidence'] = value; return True\n"
+            f"render_legacy_reanalysis(st, record, records, evidence, {str(root / 'raw_files')!r}, lambda raw, _name: raw.decode('utf-8'), llm, save_records, save_evidence, 'en')\n",
+            encoding="utf-8",
+        )
+        page = AppTest.from_file(str(script), default_timeout=30).run()
+        return page
+
+    def test_failed_record_without_original_shows_targeted_reupload_and_preserves_state_on_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            page = self._page(temp_dir, fail=True)
+            self.assertFalse(page.exception)
+            self.assertEqual(len(page.file_uploader), 1)
+            page.file_uploader[0].set_value(("replacement.txt", b"Synthetic source EXACT_REUPLOAD_QUOTE", "text/plain")).run()
+            next(button for button in page.button if button.key == "literature_reanalyze_existing-lit").click().run()
+            self.assertFalse(page.exception)
+            record = page.session_state["_records"][0]
+            self.assertEqual(record["id"], "existing-lit")
+            self.assertEqual(record["analysis"]["summary"], "OLD_PROFILE_SENTINEL")
+            self.assertEqual(record["chapter_bindings"], ["chapter-1"])
+            self.assertEqual(page.session_state["_evidence"]["existing-lit"][0]["evidence_text"], "OLD_EVIDENCE_SENTINEL")
+            self.assertTrue(Path(record["file_path"]).is_file())
+            self.assertIn("_retry_", Path(record["file_path"]).name)
+
+    def test_failed_record_reupload_updates_same_identity_only_after_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            page = self._page(temp_dir, fail=False)
+            page.file_uploader[0].set_value(("replacement.txt", b"Synthetic source EXACT_REUPLOAD_QUOTE", "text/plain")).run()
+            next(button for button in page.button if button.key == "literature_reanalyze_existing-lit").click().run()
+            self.assertFalse(page.exception)
+            records = page.session_state["_records"]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["id"], "existing-lit")
+            self.assertEqual(records[0]["analysis"]["summary"], "RECOVERED_PROFILE_SENTINEL")
+            self.assertEqual(records[0]["chapter_bindings"], ["chapter-1"])
+            self.assertTrue(Path(records[0]["file_path"]).is_file())
+            self.assertEqual(page.session_state["_evidence"]["existing-lit"][0]["evidence_text"], "EXACT_REUPLOAD_QUOTE")
 
 
 

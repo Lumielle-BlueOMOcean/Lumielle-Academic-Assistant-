@@ -265,10 +265,31 @@ def _normalize_review(value):
 
 def review_semantic_consistency(candidate, context, llm_call, locale="en"):
     """Make one structured review request and at most one format-correction request."""
+    failure_code = "invalid_structured_output"
+    failure_metadata = {}
+
+    def failure(code, source=None):
+        result = {
+            "status": "needs_review", "completed": False,
+            "failure_code": code, "issues": [],
+        }
+        if isinstance(source, dict):
+            http_status = source.get("http_status")
+            if isinstance(http_status, int) and not isinstance(http_status, bool) and 100 <= http_status <= 599:
+                result["http_status"] = http_status
+            finish_reason = source.get("finish_reason")
+            if finish_reason in {"length", "content_filter", "stop", "aborted", "insufficient_system_resource"}:
+                result["finish_reason"] = finish_reason
+            for field in ("completion_tokens", "reasoning_tokens"):
+                value = source.get(field)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    result[field] = value
+        return result
+
     for attempt in range(2):
         prompt = _semantic_prompt(candidate, context, locale, correction=attempt == 1)
         if prompt is None:
-            return {"status": "needs_review", "completed": False, "failure_code": "review_context_too_large", "issues": []}
+            return failure("review_context_too_large")
         try:
             result = llm_call(
                 prompt,
@@ -276,22 +297,37 @@ def review_semantic_consistency(candidate, context, llm_call, locale="en"):
                 json_mode=True,
                 return_metadata=True,
             )
-        except Exception:
-            return {"status": "needs_review", "completed": False, "failure_code": "provider_error", "issues": []}
+        except Exception as exc:
+            code = getattr(exc, "error_code", None)
+            safe_codes = {"rate_limited", "timeout", "connection_error", "server_error", "provider_temporarily_unavailable", "insufficient_system_resource", "aborted", "authentication_failed", "insufficient_balance", "model_not_available", "invalid_request", "provider_error"}
+            metadata = {"http_status": getattr(exc, "http_status", None), "finish_reason": getattr(exc, "finish_reason", None),
+                        "completion_tokens": getattr(exc, "completion_tokens", None), "reasoning_tokens": getattr(exc, "reasoning_tokens", None)}
+            return failure(code if code in safe_codes else "provider_error", metadata)
         if not isinstance(result, dict) or result.get("error_code"):
-            return {
-                "status": "needs_review", "completed": False,
-                "failure_code": result.get("error_code", "incomplete_response") if isinstance(result, dict) else "incomplete_response",
-                "issues": [],
-            }
-        if result.get("finish_reason") != "stop":
-            return {"status": "needs_review", "completed": False, "failure_code": "incomplete_response", "issues": []}
+            raw_code = result.get("error_code", "incomplete_response") if isinstance(result, dict) else "incomplete_response"
+            safe_codes = {"rate_limited", "timeout", "connection_error", "server_error", "provider_temporarily_unavailable", "insufficient_system_resource", "aborted", "authentication_failed", "insufficient_balance", "model_not_available", "invalid_request", "provider_error", "truncated_output", "empty_content", "content_filtered", "incomplete_response"}
+            return failure(raw_code if raw_code in safe_codes else "provider_error", result if isinstance(result, dict) else None)
+        finish_reason = result.get("finish_reason")
+        if finish_reason == "length":
+            return failure("truncated_output", result)
+        if finish_reason == "content_filter":
+            return failure("content_filtered", result)
+        if finish_reason in {"aborted", "insufficient_system_resource"}:
+            return failure("provider_temporarily_unavailable", result)
+        if finish_reason != "stop":
+            return failure("incomplete_response", result)
         content = result.get("content")
-        value = parse_first_json_value(content) if isinstance(content, str) and content.strip() else None
+        if not isinstance(content, str) or not content.strip():
+            failure_code = "empty_review_output"
+            failure_metadata = result
+            continue
+        value = parse_first_json_value(content)
         normalized = _normalize_review(value)
         if normalized is not None:
             return {**normalized, "completed": True, "failure_code": None}
-    return {"status": "needs_review", "completed": False, "failure_code": "invalid_structured_output", "issues": []}
+        failure_code = "invalid_structured_output"
+        failure_metadata = result
+    return failure(failure_code, failure_metadata)
 
 
 def review_chapter_candidate(candidate, context, valid_reference_count, llm_call, locale="en", confirmed_items=()):
@@ -310,10 +346,55 @@ def review_chapter_candidate(candidate, context, valid_reference_count, llm_call
             "failure_code": None,
         }
     semantic = review_semantic_consistency(candidate, context, llm_call, locale=locale)
-    return {
+    result = {
         "status": semantic["status"],
         "completed": semantic["completed"],
         "hard_conflicts": [],
         "issues": semantic.get("issues", []),
         "failure_code": semantic.get("failure_code"),
     }
+    for field in ("http_status", "finish_reason", "completion_tokens", "reasoning_tokens"):
+        if field in semantic:
+            result[field] = semantic[field]
+    return result
+
+
+def classify_pending_review_reason(review):
+    """Map a candidate review result to a safe, user-facing reason category."""
+    review = review if isinstance(review, dict) else {}
+    conflicts = review.get("hard_conflicts", [])
+    if isinstance(conflicts, list) and conflicts:
+        if any(isinstance(item, dict) and item.get("code") == "invalid_citation" for item in conflicts):
+            return "deterministic_reference_error"
+        return "deterministic_fact_conflict"
+    if review.get("completed"):
+        return "review_warning" if review.get("status") in {"warning", "needs_review"} else "review_completed"
+    code = review.get("failure_code")
+    return {
+        "review_context_too_large": "review_context_budget",
+        "invalid_structured_output": "review_invalid_json",
+        "empty_review_output": "review_empty_output",
+        "truncated_output": "review_truncated",
+        "timeout": "review_timeout",
+        "rate_limited": "review_rate_limited",
+        "connection_error": "review_connection_error",
+        "server_error": "review_server_error",
+        "provider_temporarily_unavailable": "review_provider_unavailable",
+        "insufficient_system_resource": "review_provider_unavailable",
+        "aborted": "review_provider_unavailable",
+        "content_filtered": "review_content_filtered",
+        "provider_error": "review_provider_error",
+        "incomplete_response": "review_incomplete",
+    }.get(code, "review_incomplete")
+
+
+def review_pending_candidate(candidate, llm_call, locale="en"):
+    """Re-run only the consistency review for an existing pending candidate."""
+    candidate = candidate if isinstance(candidate, dict) else {}
+    context = candidate.get("review_context")
+    if not isinstance(context, dict):
+        return {"status": "needs_review", "completed": False, "hard_conflicts": [], "issues": [], "failure_code": "review_context_unavailable"}
+    return review_chapter_candidate(
+        candidate.get("text", ""), context, len(candidate.get("reference_ids", []) or []),
+        llm_call, locale=locale, confirmed_items=candidate.get("confirmed_memory_items", []),
+    )
